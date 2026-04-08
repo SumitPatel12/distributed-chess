@@ -1,3 +1,6 @@
+const std = @import("std");
+const terminal_io = @import("terminal_io.zig");
+
 // White: ♔ U+2654   ♕ U+2655   ♖ U+2656   ♗ U+2657   ♘ U+2658   ♙ U+2659
 // Black: ♚ U+265A   ♛ U+265B   ♜ U+265C   ♝ U+265D   ♞ U+265E   ♟ U+265F
 /// Enum for pieces, the board_state will make use of this to encode the board state.
@@ -19,7 +22,7 @@ const Piece = enum(i8) {
     BlackKing = -6,
 };
 
-const Board = struct {
+pub const Board = struct {
     // i8 because the board state needs to capture two things:
     //  1. Piece Position
     //  2. Piece Color
@@ -56,7 +59,36 @@ const Board = struct {
         .{0},
     };
 
-    fn init_board() Board {
+    pub fn init_board() Board {
         return Board{ .board_state = STARTING_BOARD_POSITION, .board_overlay = .{} };
+    }
+
+    pub fn draw_board(window_config: std.posix.winsize) !void {
+        _ = window_config;
+
+        const light = comptime terminal_io.EscapeSequences.bg_rgb(240, 217, 181);
+        const dark = comptime terminal_io.EscapeSequences.bg_rgb(181, 136, 99);
+        const reset = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
+
+        const buffer = comptime blk: {
+            var buf: []const u8 = "";
+            var rank: usize = 0;
+            while (rank < 8) : (rank += 1) {
+                var file: usize = 0;
+                var row: []const u8 = "";
+                while (file < 8) : (file += 1) {
+                    row = row ++ (if ((rank + file) % 2 == 0) light else dark) ** 3;
+                }
+
+                row = row ++ reset ++ "\r\n";
+                buf = buf ++ (row ** 3);
+            }
+            break :blk buf;
+        };
+
+        const result_code = std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
+        if (result_code == -1) {
+            std.debug.print("Failed to render to the terminal.", .{});
+        }
     }
 };
