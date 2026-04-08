@@ -10,8 +10,12 @@ pub const EscapeSequences = struct {
     pub const ERASE_TILL_BEGINNING_OF_LINE = "\x1b[1K";
     pub const ERASE_ENTIRE_LINE = "\x1b[2K";
 
-    pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) []const u8 {
-        return std.fmt.comptimePrint("\x1b[48;2;{d};{d};{d}m  ", .{ r, g, b });
+    pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8, comptime content: []const u8) []const u8 {
+        return std.fmt.comptimePrint("\x1b[48;2;{d};{d};{d}m{s}", .{ r, g, b, content });
+    }
+
+    pub fn fg_rgb(comptime r: u8, comptime g: u8, comptime b: u8, comptime content: []const u8) []const u8 {
+        return std.fmt.comptimePrint("\x1b[38;2;{d};{d};{d}m{s}", .{ r, g, b, content });
     }
 };
 
@@ -138,5 +142,9 @@ pub const TerminalIO = struct {
                 },
             }
         }
+    }
+
+    pub fn write(buffer: []const u8) isize {
+        return std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
     }
 };
