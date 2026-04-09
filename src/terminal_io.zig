@@ -10,12 +10,12 @@ pub const EscapeSequences = struct {
     pub const ERASE_TILL_BEGINNING_OF_LINE = "\x1b[1K";
     pub const ERASE_ENTIRE_LINE = "\x1b[2K";
 
-    pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8, comptime content: []const u8) []const u8 {
-        return std.fmt.comptimePrint("\x1b[48;2;{d};{d};{d}m{s}", .{ r, g, b, content });
+    pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) *const [19:0]u8 {
+        return std.fmt.comptimePrint("\x1b[48;2;{d:0>3};{d:0>3};{d:0>3}m", .{ r, g, b });
     }
 
-    pub fn fg_rgb(comptime r: u8, comptime g: u8, comptime b: u8, comptime content: []const u8) []const u8 {
-        return std.fmt.comptimePrint("\x1b[38;2;{d};{d};{d}m{s}", .{ r, g, b, content });
+    pub fn fg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) *const [19:0]u8 {
+        return std.fmt.comptimePrint("\x1b[38;2;{d:0>3};{d:0>3};{d:0>3}m", .{ r, g, b });
     }
 };
 
@@ -134,11 +134,8 @@ pub const TerminalIO = struct {
                     std.debug.print("Good Bye!", .{});
                     return;
                 },
-                '\x1b' => {
-                    std.debug.print("User Pressed Escape\r\n", .{});
-                },
                 else => {
-                    std.debug.print("Read the Character: {c}\r\n", .{c});
+                    continue;
                 },
             }
         }

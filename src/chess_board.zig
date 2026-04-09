@@ -1,8 +1,8 @@
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
 
-const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255, "");
-const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0, "");
+const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
+const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 
 // White: ♔ U+2654   ♕ U+2655   ♖ U+2656   ♗ U+2657   ♘ U+2658   ♙ U+2659
 // Black: ♚ U+265A   ♛ U+265B   ♜ U+265C   ♝ U+265D   ♞ U+265E   ♟ U+265F
@@ -64,7 +64,26 @@ pub const Board = struct {
     // This can likely be merged with board_state since it does have extra bits, that's an optimization I'll handle down the line.
     // 8x8 bits no need to waste so much space for this, each bit will represent whether that square is valid for that piece or not, at least that's what I'm aiming for.
     /// Will encode move hints when a piece is selected.
-    board_overlay: [8][8]u1,
+    board_overlay: [8]u1,
+
+    /// Width of a single cell in terminal character columns.
+    width: usize,
+
+    /// Height of a single cell in terminal character rows.
+    height: usize,
+
+    /// Render buffer writer owned by the board.
+    writer: BufWriter = .{},
+
+    // The bg_rgb and the fg_rgb always return 19 byte strings for convenience. If that changes we'll need to have two different variables to store each one.
+    const COLOR_SEQUENCE_LENGTH = 19;
+    const LIGHT_BG = terminal_io.EscapeSequences.bg_rgb(184, 201, 134);
+    const DARK_BG = terminal_io.EscapeSequences.bg_rgb(106, 138, 61);
+    const RESET = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
+
+    // TODO: Calculate a sane upper bound on this, right now it's too large. 256 KB is a lot.
+    /// Upper bound on the rendered buffer size. Sized abnormally large so we can use the buffer without an allocator.
+    const RENDER_BUFFER_SIZE: usize = 256 * 1024;
 
     /// The starting position for a classical game
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
@@ -78,65 +97,161 @@ pub const Board = struct {
         .{ .WhiteRook, .WhiteKnight, .WhiteBhishop, .WhiteQueen, .WhiteKing, .WhiteBhishop, .WhiteKnight, .WhiteRook },
     };
 
-    const EMPTY_OVERLAY: [8][8]u1 = .{.{0} ** 8} ** 8;
+    const EMPTY_OVERLAY: [8]u1 = .{0} ** 8;
 
-    pub fn init_board() Board {
-        return Board{ .board_state = STARTING_BOARD_POSITION, .board_overlay = EMPTY_OVERLAY };
+    /// Buffer writer to help draw the chess board on the terminal.
+    const BufWriter = struct {
+        buf: [RENDER_BUFFER_SIZE]u8 = undefined,
+        /// Number of bytes currently held in `buf`; also the position where
+        /// the next append will start.
+        len: usize = 0,
+
+        /// Resets the buffer length so it can be reused for the next draw.
+        fn reset_len(self: *BufWriter) void {
+            self.len = 0;
+        }
+
+        /// Appends bytes to the end of the buffer.
+        /// In case of overflow returns RenderBufferOverflow error.
+        fn write_all(self: *BufWriter, bytes: []const u8) !void {
+            if (self.len + bytes.len > self.buf.len) return error.RenderBufferOverflow;
+            @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
+            self.len += bytes.len;
+        }
+
+        /// Sets the next n bytes of the buffer to the provided byte value.
+        /// In case of overflow returns RenderBufferOverflow error.
+        fn write_byte_n(self: *BufWriter, byte: u8, n: usize) !void {
+            if (self.len + n > self.buf.len) return error.RenderBufferOverflow;
+            @memset(self.buf[self.len .. self.len + n], byte);
+            self.len += n;
+        }
+
+        /// Returns the contents stored in the buffer up to the current length.
+        fn written(self: *const BufWriter) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    /// Initialize the board with the starting position and an emtpy board overlay.
+    pub fn init_board(window_config: std.posix.winsize) !Board {
+        const dimensions = try compute_cell_dimensions(window_config);
+        return Board{
+            .board_state = STARTING_BOARD_POSITION,
+            .board_overlay = EMPTY_OVERLAY,
+            .width = @as(usize, dimensions.width),
+            .height = @as(usize, dimensions.height),
+        };
     }
 
-    pub fn draw_board(window_config: std.posix.winsize) !void {
-        _ = window_config;
+    /// Computes the per-cell width and height (in terminal character cells) for the largest chess board that fits in the current window.
+    /// The Width to height aspect ratio is 7:3.
+    /// Returns error.TerminalTooSmall if the window cannot fit the minimum 3x1 cell board.
+    fn compute_cell_dimensions(ws: std.posix.winsize) !struct { width: u16, height: u16 } {
+        // Horizontal overhead: 3-col rank margin on each side = 6 cols.
+        // Vertical overhead: 2 file-letter rows + 2 title rows + 2 spacer rows = 6 rows.
+        if (ws.col < 30 or ws.row < 14) return error.TerminalTooSmall;
 
-        const light_bg = comptime terminal_io.EscapeSequences.bg_rgb(184, 201, 134, "");
-        const dark_bg = comptime terminal_io.EscapeSequences.bg_rgb(106, 138, 61, "");
-        const reset = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
+        const avail_w: u16 = ws.col - 6;
+        const avail_h: u16 = ws.row - 6;
+        const max_w: u16 = avail_w / 8;
+        const max_h: u16 = avail_h / 8;
 
-        // Board row = 3-col side margin + 8 * 7-col cells = 59 cols wide.
-        // Centered 5-char label: (59 - 5) / 2 = 27 spaces of left padding.
-        const label_pad = " " ** 27;
-        const black_label = label_pad ++ "BLACK" ++ "\r\n";
-        const white_label = label_pad ++ "WHITE" ++ "\r\n";
+        // 7:3 cell aspect ratio (7 cols x 3 rows).
+        const h_from_w: u16 = (max_w * 3) / 7;
+        var h: u16 = if (max_h < h_from_w) max_h else h_from_w;
+        var w: u16 = (h * 7) / 3;
 
-        // File letters (a..h), one per 7-col cell, with a 3-col left margin
-        // to match the rank digit column.
-        const alphabetic_label = "      a      b      c      d      e      f      g      h   \r\n";
+        // Round down to odd so the single glyph row/column lands on center.
+        if (w % 2 == 0) w -= 1;
+        if (h % 2 == 0) h -= 1;
 
+        if (w < 3 or h < 1) return error.TerminalTooSmall;
+        return .{ .width = w, .height = h };
+    }
+
+    /// Taken in the rank and file and returns the cells width in bytes.
+    /// Used to offset into a certain cell and update the contents when moving from one position to another.
+    fn get_cell_width_bytes(self: *Board, rank: usize, file: usize) usize {
+        return switch (self.board_state[rank][file]) {
+            Piece.Empty => COLOR_SEQUENCE_LENGTH + self.width,
+            // It's got both bg and fg so 2xclr_sq_len, and it's got width - 1 padding and a 3 byte glyph
+            else => (COLOR_SEQUENCE_LENGTH * 2) + (self.width - 1) + 3,
+        };
+    }
+
+    /// Writes file letters (a..h) center aligned to cell width.
+    fn write_file_labels(self: *Board) !void {
+        try self.writer.write_all("   ");
+        const padding: usize = (self.width - 1) / 2;
+        const letters = "abcdefgh";
+        for (letters) |ch| {
+            try self.writer.write_byte_n(' ', padding);
+            try self.writer.write_all(&[_]u8{ch});
+            try self.writer.write_byte_n(' ', padding);
+        }
+        try self.writer.write_all("\r\n");
+    }
+
+    /// Draws the current board state to the terminal
+    pub fn draw(self: *Board) !void {
+        // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
+        // Centered 5-char label: (total - 5) / 2 spaces of left padding.
+        const total_width: usize = 6 + 8 * self.width;
+        const label_padding_len: usize = (total_width - 5) / 2;
+
+        try self.writer.write_byte_n(' ', label_padding_len);
+        try self.writer.write_all("BLACK\r\n\n\r");
+
+        try self.write_file_labels();
+
+        try self.write_rank_and_pieces();
+
+        try self.write_file_labels();
+
+        try self.writer.write_all("\r\n");
+        try self.writer.write_byte_n(' ', label_padding_len);
+        try self.writer.write_all("WHITE\r\n");
+
+        const result_code = terminal_io.TerminalIO.write(self.writer.written());
+        if (result_code == -1) {
+            std.debug.print("Failed to render to the terminal.", .{});
+        }
+    }
+
+    fn write_rank_and_pieces(self: *Board) !void {
         // Left-edge rank labels. Index 0 is the black back rank (chess rank 8).
         const rank_margins = [_][]const u8{ " 8 ", " 7 ", " 6 ", " 5 ", " 4 ", " 3 ", " 2 ", " 1 " };
 
-        // Initial position is always the same so we're going the comptime route.
-        const buffer = comptime blk: {
-            var buf: []const u8 = black_label ++ "\n\r" ++ alphabetic_label;
+        const mid_sub: usize = self.height / 2;
+        const padding: usize = (self.width - 1) / 2;
 
-            for (STARTING_BOARD_POSITION, 0..) |rank_row, rank| {
-                var sub_row: usize = 0;
-                while (sub_row < 3) : (sub_row += 1) {
-                    // Rank digit on the middle sub-row only, blank margin otherwise.
-                    const side_margin = if (sub_row == 1) rank_margins[rank] else "   ";
+        for (self.board_state, 0..) |rank_row, rank| {
+            var sub_row: usize = 0;
+            while (sub_row < self.height) : (sub_row += 1) {
+                // Rank digit on the middle sub-row only, blank margin otherwise.
+                const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
+                try self.writer.write_all(side_margin);
 
-                    var row: []const u8 = side_margin;
-                    for (rank_row, 0..) |piece, file| {
-                        const bg = if ((rank + file) % 2 == 0) light_bg else dark_bg;
-                        // Middle row holds the glyph with some padding to center it
-                        const content = if (sub_row == 1)
-                            "   " ++ piece.fg() ++ piece.glyph() ++ "   "
-                        else
-                            "       ";
-                        row = row ++ bg ++ content;
+                for (rank_row, 0..) |piece, file| {
+                    const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
+                    try self.writer.write_all(bg);
+                    // Middle row holds the glyph with some padding to center it
+                    if (sub_row == mid_sub) {
+                        try self.writer.write_byte_n(' ', padding);
+                        try self.writer.write_all(piece.fg());
+                        try self.writer.write_all(piece.glyph());
+                        try self.writer.write_byte_n(' ', padding);
+                    } else {
+                        try self.writer.write_byte_n(' ', self.width);
                     }
-
-                    // The labeling is on both sides.
-                    buf = buf ++ row ++ reset ++ side_margin ++ "\r\n";
                 }
+
+                // The labeling is on both sides.
+                try self.writer.write_all(RESET);
+                try self.writer.write_all(side_margin);
+                try self.writer.write_all("\r\n");
             }
-
-            buf = buf ++ alphabetic_label ++ "\r\n" ++ white_label;
-            break :blk buf;
-        };
-
-        const result_code = terminal_io.TerminalIO.write(buffer);
-        if (result_code == -1) {
-            std.debug.print("Failed to render to the terminal.", .{});
         }
     }
 };

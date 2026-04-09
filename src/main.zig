@@ -8,7 +8,8 @@ pub fn main() !void {
     try term.enable_raw_mode();
     defer term.restore_termios();
 
-    try chess_board.Board.draw_board(term.window_config);
+    var board = try chess_board.Board.init_board(term.window_config);
+    try board.draw();
 
     try term.start_input_loop();
 }
