@@ -56,6 +56,11 @@ pub const Piece = enum(i8) {
     }
 };
 
+pub const Position = struct {
+    rank: usize,
+    file: usize,
+};
+
 pub const Board = struct {
     /// Current State of the board with piece positions.
     /// Row 0 is black's back rank and row 7 is white's back rank.
@@ -174,7 +179,7 @@ pub const Board = struct {
     /// Used to offset into a certain cell and update the contents when moving from one position to another.
     fn get_cell_width_bytes(self: *Board, rank: usize, file: usize) usize {
         return switch (self.board_state[rank][file]) {
-            Piece.Empty => COLOR_SEQUENCE_LENGTH + self.width,
+            .Empty => COLOR_SEQUENCE_LENGTH + self.width,
             // It's got both bg and fg so 2xclr_sq_len, and it's got width - 1 padding and a 3 byte glyph
             else => (COLOR_SEQUENCE_LENGTH * 2) + (self.width - 1) + 3,
         };
@@ -211,6 +216,7 @@ pub const Board = struct {
 
     /// Draws the current board state to the terminal
     pub fn draw(self: *Board) !void {
+        self.writer.reset_len();
         const build_start = timestamp_ns();
 
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
@@ -285,5 +291,13 @@ pub const Board = struct {
                 try self.writer.write_all("\r\n");
             }
         }
+    }
+
+    pub fn move(self: *Board, old_position: Position, new_position: Position) void {
+        const piece = self.board_state[old_position.rank][old_position.file];
+        std.debug.assert(piece != .Empty);
+
+        self.board_state[old_position.rank][old_position.file] = .Empty;
+        self.board_state[new_position.rank][new_position.file] = piece;
     }
 };
