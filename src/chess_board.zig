@@ -193,13 +193,32 @@ pub const Board = struct {
         try self.writer.write_all("\r\n");
     }
 
+    /// Returns a monotonic timestamp in nanoseconds.
+    /// Uses std.c.clock_gettime which is Zig's cross-platform libc wrapper.
+    /// The clock choice adapts per OS: UPTIME_RAW on macOS, MONOTONIC on Linux.
+    fn timestamp_ns() u64 {
+        const clock = if (@hasField(std.c.CLOCK, "UPTIME_RAW")) .UPTIME_RAW else .MONOTONIC;
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(clock, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
+    fn format_duration(ns: u64) struct { value: u64, unit: []const u8 } {
+        if (ns >= 1_000_000) return .{ .value = ns / 1_000_000, .unit = "ms" };
+        if (ns >= 1_000) return .{ .value = ns / 1_000, .unit = "µs" };
+        return .{ .value = ns, .unit = "ns" };
+    }
+
     /// Draws the current board state to the terminal
     pub fn draw(self: *Board) !void {
+        const build_start = timestamp_ns();
+
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
         // Centered 5-char label: (total - 5) / 2 spaces of left padding.
         const total_width: usize = 6 + 8 * self.width;
         const label_padding_len: usize = (total_width - 5) / 2;
 
+        try self.writer.write_all(terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME);
         try self.writer.write_byte_n(' ', label_padding_len);
         try self.writer.write_all("BLACK\r\n\n\r");
 
@@ -213,10 +232,23 @@ pub const Board = struct {
         try self.writer.write_byte_n(' ', label_padding_len);
         try self.writer.write_all("WHITE\r\n");
 
+        const build_ns = timestamp_ns() - build_start;
+
+        const write_start = timestamp_ns();
         const result_code = terminal_io.TerminalIO.write(self.writer.written());
+        const write_ns = timestamp_ns() - write_start;
+
         if (result_code == -1) {
             std.debug.print("Failed to render to the terminal.", .{});
         }
+
+        const build = format_duration(build_ns);
+        const write = format_duration(write_ns);
+        const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
+        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | terminal write: {d} {s}\r\n", .{
+            build.value, build.unit, size_kb,
+            write.value, write.unit,
+        });
     }
 
     fn write_rank_and_pieces(self: *Board) !void {

@@ -4,11 +4,12 @@ pub const EscapeSequences = struct {
     pub const RESET_STYLE_AND_COLOR = "\x1b[0m";
     pub const ERASE_TILL_END_OF_SCREEN = "\x1b[0J";
     pub const ERASE_TILL_BEGINNING_OF_SCREEN = "\x1b[0J";
-    pub const ERASE_SCREEN = "\x1b[2J";
+    pub const CLEAR_SCREEN = "\x1b[2J";
 
     pub const ERASE_TILL_END_OF_LINE = "\x1b[0K";
     pub const ERASE_TILL_BEGINNING_OF_LINE = "\x1b[1K";
     pub const ERASE_ENTIRE_LINE = "\x1b[2K";
+    pub const SET_CURSOR_TO_HOME = "\x1b[H";
 
     pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) *const [19:0]u8 {
         return std.fmt.comptimePrint("\x1b[48;2;{d:0>3};{d:0>3};{d:0>3}m", .{ r, g, b });
