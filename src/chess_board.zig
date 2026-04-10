@@ -175,16 +175,6 @@ pub const Board = struct {
         return .{ .width = w, .height = h };
     }
 
-    /// Taken in the rank and file and returns the cells width in bytes.
-    /// Used to offset into a certain cell and update the contents when moving from one position to another.
-    fn get_cell_width_bytes(self: *Board, rank: usize, file: usize) usize {
-        return switch (self.board_state[rank][file]) {
-            .Empty => COLOR_SEQUENCE_LENGTH + self.width,
-            // It's got both bg and fg so 2xclr_sq_len, and it's got width - 1 padding and a 3 byte glyph
-            else => (COLOR_SEQUENCE_LENGTH * 2) + (self.width - 1) + 3,
-        };
-    }
-
     /// Writes file letters (a..h) center aligned to cell width.
     fn write_file_labels(self: *Board) !void {
         try self.writer.write_all("   ");
