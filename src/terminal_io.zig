@@ -41,7 +41,12 @@ pub const TerminalIO = struct {
         const original_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
 
         var window_config: std.posix.winsize = undefined;
-        const return_code = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, &window_config);
+        const return_code = std.posix.system.ioctl(
+            std.posix.STDOUT_FILENO,
+            std.posix.T.IOCGWINSZ,
+            &window_config,
+        );
+
         if (return_code == -1) {
             return error.WindowSizeUnavailable;
         }
@@ -119,7 +124,11 @@ pub const TerminalIO = struct {
         raw_mode_termios.lflag.ISIG = false;
         raw_mode_termios.lflag.IEXTEN = false;
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, raw_mode_termios);
+        try std.posix.tcsetattr(
+            std.posix.STDIN_FILENO,
+            std.posix.TCSA.FLUSH,
+            raw_mode_termios,
+        );
         self.raw_mode_enabled = true;
 
         std.debug.assert(self.raw_mode_enabled);
@@ -127,7 +136,11 @@ pub const TerminalIO = struct {
 
     /// Restore the termios setting to the original termios settings.
     pub fn restore_termios(self: *TerminalIO) void {
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, self.original_termios) catch {
+        std.posix.tcsetattr(
+            std.posix.STDIN_FILENO,
+            std.posix.TCSA.FLUSH,
+            self.original_termios,
+        ) catch {
             std.debug.print("Error resetting the termios settings.", .{});
             // Nothing we can do, the user will have to re-open the terminal.
         };
@@ -145,10 +158,14 @@ pub const TerminalIO = struct {
 
         while (true) {
             var c: u8 = 0;
-            const nread = std.posix.read(std.posix.STDIN_FILENO, (&c)[0..1]) catch |err| switch (err) {
+            const nread = std.posix.read(
+                std.posix.STDIN_FILENO,
+                (&c)[0..1],
+            ) catch |err| switch (err) {
                 error.WouldBlock => continue,
                 else => {
-                    // std.process.exit(x) doesn't let zig cleanup run before the program terminates, effectively leaving the calling terminal window in raw mode,
+                    // std.process.exit(x) doesn't let zig cleanup run before the program terminates
+                    // effectively leaving the calling terminal window in raw mode,
                     // so we're not gonna use that.
                     std.debug.print("Error encountered while reading from STDIN_FILENO", .{});
                     return;

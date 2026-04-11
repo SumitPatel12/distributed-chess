@@ -10,10 +10,12 @@ const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 // i8 because the board state needs to capture two things:
 //  1. Piece Position
 //  2. Piece Color
-// Positive would be white and negative would be black. And since we only have 6 unique pieces i8 is more than enough.
+// Positive would be white and negative would be black. And since we only have 6 unique pieces i8 is
+// more than enough.
 /// Enum for pieces, the board_state will make use of this to encode the board state.
 pub const Piece = enum(i8) {
-    // I'll see if the bishops need to be segregated into light_squared and dark_squared. For now I'll trust that the state_machine (or the move logic) eliminates the need for that.
+    // I'll see if the bishops need to be segregated into light_squared and dark_squared. For now
+    // I'll trust that the state_machine (or the move logic) eliminates the need for that.
     // I think this will be convenient, may be counterintuitive.
     empty = 0,
     white_pawn = 1,
@@ -50,8 +52,20 @@ pub const Piece = enum(i8) {
     pub fn fg(self: Piece) []const u8 {
         return switch (self) {
             .empty => "",
-            .white_pawn, .white_knight, .white_bishop, .white_rook, .white_queen, .white_king => WHITE_PIECE_FG,
-            .black_pawn, .black_knight, .black_bishop, .black_rook, .black_queen, .black_king => BLACK_PIECE_FG,
+            .white_pawn,
+            .white_knight,
+            .white_bishop,
+            .white_rook,
+            .white_queen,
+            .white_king,
+            => WHITE_PIECE_FG,
+            .black_pawn,
+            .black_knight,
+            .black_bishop,
+            .black_rook,
+            .black_queen,
+            .black_king,
+            => BLACK_PIECE_FG,
         };
     }
 };
@@ -71,16 +85,20 @@ pub const Position = struct {
     file: u3,
 };
 
-// The height and width of the cells are required to calculate the padding needed to apply to each cell when rendering, otherwise the pieces won't be centered.
+// The height and width of the cells are required to calculate the padding needed to apply to each
+// cell when rendering, otherwise the pieces won't be centered.
 /// Encodes the current board.
-/// Keeps track of the board state, overlays if any. Also keeps track of the current boards cell width and height in terms of terminal cells.
+/// Keeps track of the board state, overlays if any. Also keeps track of the current boards cell
+/// width and height in terms of terminal cells.
 pub const Board = struct {
     /// Current State of the board with piece positions.
     /// Row 0 is black's back rank and row 7 is white's back rank.
     board_state: [8][8]Piece,
 
-    // This can likely be merged with board_state since it does have extra bits, that's an optimization I'll handle down the line.
-    // 8x8 bits no need to waste so much space for this, each bit will represent whether that square is valid for that piece or not, at least that's what I'm aiming for.
+    // This can likely be merged with board_state since it does have extra bits, that's an
+    // optimization I'll handle down the line.
+    // 8x8 bits no need to waste so much space for this, each bit will represent whether that square
+    // is valid for that piece or not, at least that's what I'm aiming for.
     /// Highlights legal moves/squares once a piece is selected
     board_overlay: u64,
 
@@ -90,7 +108,8 @@ pub const Board = struct {
     /// Height of a single cell in terminal character rows.
     height: u16,
 
-    /// The board state buffer writer owned by the board. Takes care of storing the byte sequence of the current board used to render it to the terminal.
+    /// The board state buffer writer owned by the board. Takes care of storing the byte sequence of
+    /// the current board used to render it to the terminal.
     writer: BufWriter = .{},
 
     /// The perspective from which the board will be rendered. Defaults to White
@@ -101,15 +120,16 @@ pub const Board = struct {
     const RESET = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
 
     // TODO: Calculate a sane upper bound on this, right now it's too large. 256 KB is a lot.
-    /// Upper bound on the rendered buffer size. Sized abnormally large so we can use the buffer without an allocator.
+    /// Upper bound on the rendered buffer size. Sized abnormally large so we can use the buffer
+    /// without an allocator.
     const RENDER_BUFFER_SIZE: usize = 256 * 1024;
 
     // Chess board anatomy:
     //
-    // Files run a..h left to right, ranks run 1..8 from white's side up to black's. A square is named
-    // <file><rank> — e.g. the white king starts on e1, the black king on e8, and the move "e4" points at
-    // the square shown in the middle of the diagram below. The bottom right corner of the board is always
-    // a light square, irrespective of which players perspective you see from.
+    // Files run a..h left to right, ranks run 1..8 from white's side up to black's. A square is
+    // named <file><rank> — e.g. the white king starts on e1, the black king on e8, and the move
+    // "e4" points at the square shown in the middle of the diagram below. The bottom right corner
+    // of the board is always a light square, irrespective of which players perspective you see from
     //
     //                             BLACK
     //             a     b     c     d     e     f     g     h
@@ -133,17 +153,17 @@ pub const Board = struct {
     //             a     b     c     d     e     f     g     h
     //                             WHITE
     //
-    // board_state is indexed as board_state[rank_idx][file_idx], with rank_idx 0 mapping to chess rank 1
-    // (white's back rank) and rank_idx 7 to chess rank 8 (black's back rank). The array layout is flipped
-    // vertically relative to the anatomy diagram above, so "e4" translates directly to board_state[3][4] —
-    // no mental flip, rank_idx and chess rank line up exactly.
+    // board_state is indexed as board_state[rank_idx][file_idx], with rank_idx 0 mapping to chess
+    // rank 1 (white's back rank) and rank_idx 7 to chess rank 8 (black's back rank). The array
+    // layout is flipped vertically relative to the anatomy diagram above, so "e4" translates
+    // directly to board_state[3][4] — no mental flip, rank_idx and chess rank line up exactly.
     //
-    // I initially had this encoded as we see in the anatomy diagram above: for the 2D array, white sat at
-    // the bottom (high rank_idx) and black at the top (low rank_idx). That inverted every rank lookup —
-    // a pawn push from e2 -> e4 read as board_state[6][4] -> board_state[4][4] instead of the natural
-    // board_state[1][4] -> board_state[3][4]. I'd be paying that translation cost at every call site for
-    // white's position, and moves are what the whole game is built on, so I flipped the convention once
-    // here rather than forever at every access.
+    // I initially had this encoded as we see in the anatomy diagram above: for the 2D array, white
+    // sat at the bottom (high rank_idx) and black at the top (low rank_idx). That inverted every
+    // rank lookup — a pawn push from e2 -> e4 read as board_state[6][4] -> board_state[4][4]
+    // instead of the natural board_state[1][4] -> board_state[3][4]. I'd be paying that translation
+    // cost at every call site for white's position, and moves are what the whole game is built on,
+    // so I flipped the convention once here rather than forever at every access.
     //
     // The two layouts, drawn as the 2D array sees them (rank_idx 0 on top, the way memory reads):
     //
@@ -171,21 +191,27 @@ pub const Board = struct {
     //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
     //                              WHITE                                                         BLACK
     //
-    // Note how in BEFORE the array "looks right" (black on top, white on bottom like you'd set up a real
-    // board) but rank_idx 0 = rank 8 and rank_idx 7 = rank 1 — every piece of move logic has to do
-    // `8 - rank` to index white. In NOW the array is upside down compared to the physical board, but
-    // rank_idx == (chess rank - 1), so the translation vanishes.
+    // Note how in BEFORE the array "looks right" (black on top, white on bottom like you'd set up a
+    // real board) but rank_idx 0 = rank 8 and rank_idx 7 = rank 1 — every piece of move logic has
+    // to do `8 - rank` to index white. In NOW the array is upside down compared to the physical
+    // board, but rank_idx == (chess rank - 1), so the translation vanishes.
     //
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
-        .{ .white_rook, .white_knight, .white_bishop, .white_queen, .white_king, .white_bishop, .white_knight, .white_rook },
+        .{
+            .white_rook,  .white_knight, .white_bishop, .white_queen,
+            .white_king,  .white_bishop, .white_knight, .white_rook,
+        },
         .{.white_pawn} ** 8,
         .{.empty} ** 8,
         .{.empty} ** 8,
         .{.empty} ** 8,
         .{.empty} ** 8,
         .{.black_pawn} ** 8,
-        .{ .black_rook, .black_knight, .black_bishop, .black_queen, .black_king, .black_bishop, .black_knight, .black_rook },
+        .{
+            .black_rook,  .black_knight, .black_bishop, .black_queen,
+            .black_king,  .black_bishop, .black_knight, .black_rook,
+        },
     };
 
     /// Buffer writer to help draw the chess board on the terminal.
@@ -276,8 +302,8 @@ pub const Board = struct {
         };
     }
 
-    /// Computes the per-cell width and height (in terminal character cells) for the largest chess board that fits in the current window.
-    /// The Width to height aspect ratio is 7:3.
+    /// Computes the per-cell width and height (in terminal character cells) for the largest chess
+    /// board that fits in the current window. The Width to height aspect ratio is 7:3.
     /// Returns error.TerminalTooSmall if the window cannot fit the minimum 3x1 cell board.
     fn compute_cell_dimensions(ws: std.posix.winsize) !CellDimensions {
         // Horizontal overhead: 3-col rank margin on each side = 6 cols.
@@ -341,13 +367,16 @@ pub const Board = struct {
 
     /// Draws the current board state to the terminal
     pub fn draw(self: *Board) !void {
-        // The buffer will be build anew for each move, reset len just resets the current index/cursor of the buffer writer.
-        // I thought this would not be good for performance, turns out I was wrong. The average times for writing the the buffer writer and rendering it to the screen are as below:
-        // These values are of-course based on my machine which is a base M3 Pro.
+        // The buffer will be build anew for each move, reset len just resets the current
+        // index/cursor of the buffer writer. I thought this would not be good for performance,
+        // turns out I was wrong. The average times for writing the the buffer writer and rendering
+        // it to the screen are as below, these values are of-course based on my machine which is a
+        // base M3 Pro.
         //      Buffer Write Time      : 65 µs
         //      Render To Terminal Time: 500 µs
         //
-        // Sub milisecond times are not detectable by human eye. If you can, I think you're in the wrong career. You shouldn't be reading this code heh.
+        // Sub milisecond times are not detectable by human eye. If you can, I think you're in the
+        // wrong career. You shouldn't be reading this code heh.
         self.writer.reset_len();
         std.debug.assert(self.writer.len == 0);
 
@@ -366,7 +395,11 @@ pub const Board = struct {
         // CLEAR_SCREEN — printing them before the write would put them on screen just long
         // enough to get wiped by the clear.
         const build = format_duration(build_stats.ns);
-        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | ", .{ build.value, build.unit, build_stats.size_kb });
+        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | ", .{
+            build.value,
+            build.unit,
+            build_stats.size_kb,
+        });
         const write = format_duration(write_ns);
         std.debug.print("terminal write: {d} {s}\r\n", .{ write.value, write.unit });
     }
@@ -393,7 +426,9 @@ pub const Board = struct {
             .black => "BLACK\r\n",
         };
 
-        try self.writer.write_all(terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME);
+        const clear_and_home = terminal_io.EscapeSequences.CLEAR_SCREEN ++
+            terminal_io.EscapeSequences.SET_CURSOR_TO_HOME;
+        try self.writer.write_all(clear_and_home);
         try self.writer.write_byte_n(' ', label_padding_len);
         try self.writer.write_all(top_label);
 
@@ -424,7 +459,16 @@ pub const Board = struct {
         std.debug.assert(self.width >= 3);
         std.debug.assert(self.height >= 1);
 
-        const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
+        const rank_margins = [_][]const u8{
+            " 1 ",
+            " 2 ",
+            " 3 ",
+            " 4 ",
+            " 5 ",
+            " 6 ",
+            " 7 ",
+            " 8 ",
+        };
 
         const mid_sub: usize = self.height / 2;
         const padding: usize = (self.width - 1) / 2;
@@ -439,6 +483,7 @@ pub const Board = struct {
             while (sub_row < self.height) : (sub_row += 1) {
                 // Rank digit on the middle sub-row only, blank margin otherwise.
                 const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
+
                 try self.writer.write_all(side_margin);
 
                 for (0..8) |col_draw| {
