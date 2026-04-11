@@ -23,7 +23,7 @@ pub fn main() !void {
     };
 
     for (moves) |move| {
-        _ = std.c.nanosleep(&.{ .sec = 3, .nsec = 0 }, null);
+        _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
         try board.play_turn(move[0], move[1]);
     }
 

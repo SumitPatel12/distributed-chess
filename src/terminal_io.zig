@@ -45,6 +45,7 @@ pub const TerminalIO = struct {
         if (return_code == -1) {
             return error.WindowSizeUnavailable;
         }
+        std.debug.assert(window_config.row > 0 and window_config.col > 0);
 
         return .{
             .original_termios = original_termios,
@@ -55,6 +56,8 @@ pub const TerminalIO = struct {
 
     /// Enables raw mode input processing.
     pub fn enable_raw_mode(self: *TerminalIO) !void {
+        std.debug.assert(!self.raw_mode_enabled);
+
         var raw_mode_termios: std.posix.termios = self.original_termios;
 
         // IXON: Disables Ctrl-S and Ctrl-Q. Ctrl-S stops data from being transmitted
@@ -118,6 +121,8 @@ pub const TerminalIO = struct {
 
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, raw_mode_termios);
         self.raw_mode_enabled = true;
+
+        std.debug.assert(self.raw_mode_enabled);
     }
 
     /// Restore the termios setting to the original termios settings.
@@ -128,6 +133,7 @@ pub const TerminalIO = struct {
         };
 
         self.raw_mode_enabled = false;
+        std.debug.assert(!self.raw_mode_enabled);
     }
 
     /// Starts an infinite loop of input reading. Reads character by character until the user
@@ -149,6 +155,8 @@ pub const TerminalIO = struct {
                 },
             };
 
+            std.debug.assert(nread <= 1);
+
             // VMIN=0, VTIME=1 (set in enable_raw_mode) make read return after ~0.1s with or
             // without data. If nothing arrived we loop back and poll again.
             if (nread == 0) {
@@ -169,6 +177,7 @@ pub const TerminalIO = struct {
 
     /// Write out given buffer to the terminal.
     pub fn write(buffer: []const u8) isize {
+        std.debug.assert(buffer.len > 0);
         return std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
     }
 };

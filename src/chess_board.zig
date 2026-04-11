@@ -85,10 +85,10 @@ pub const Board = struct {
     board_overlay: u64,
 
     /// Width of a single cell in terminal character columns.
-    width: usize,
+    width: u16,
 
     /// Height of a single cell in terminal character rows.
-    height: usize,
+    height: u16,
 
     /// The board state buffer writer owned by the board. Takes care of storing the byte sequence of the current board used to render it to the terminal.
     writer: BufWriter = .{},
@@ -206,6 +206,7 @@ pub const Board = struct {
             if (self.len + bytes.len > self.buf.len) return error.RenderBufferOverflow;
             @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
             self.len += bytes.len;
+            std.debug.assert(self.len <= self.buf.len);
         }
 
         /// Sets the next n bytes of the buffer to the provided byte value.
@@ -214,10 +215,12 @@ pub const Board = struct {
             if (self.len + n > self.buf.len) return error.RenderBufferOverflow;
             @memset(self.buf[self.len .. self.len + n], byte);
             self.len += n;
+            std.debug.assert(self.len <= self.buf.len);
         }
 
         /// Returns the contents stored in the buffer up to the current length.
         fn written(self: *const BufWriter) []const u8 {
+            std.debug.assert(self.len <= self.buf.len);
             return self.buf[0..self.len];
         }
     };
@@ -231,14 +234,17 @@ pub const Board = struct {
         self.* = .{
             .board_state = STARTING_BOARD_POSITION,
             .board_overlay = 0,
-            .width = @as(usize, dimensions.width),
-            .height = @as(usize, dimensions.height),
+            .width = dimensions.width,
+            .height = dimensions.height,
             .writer = .{},
             .perspective = .white,
         };
 
         std.debug.assert(self.width >= 3);
         std.debug.assert(self.height >= 1);
+        std.debug.assert(self.perspective == .white);
+        std.debug.assert(self.board_overlay == 0);
+        std.debug.assert(self.writer.len == 0);
     }
 
     /// Flips the perspective of the board. Doesn't redraw.
@@ -275,11 +281,15 @@ pub const Board = struct {
         if (h % 2 == 0) h -= 1;
 
         if (w < 3 or h < 1) return error.TerminalTooSmall;
+        std.debug.assert(w >= 3 and h >= 1);
+        std.debug.assert(w % 2 == 1 and h % 2 == 1);
         return .{ .width = w, .height = h };
     }
 
     /// Writes file letters (a..h) center aligned to cell width.
     fn write_file_labels(self: *Board) !void {
+        std.debug.assert(self.width >= 3);
+
         try self.writer.write_all("   ");
         const padding: usize = (self.width - 1) / 2;
         const letters = switch (self.perspective) {
@@ -321,8 +331,10 @@ pub const Board = struct {
         //
         // Sub milisecond times are not detectable by human eye. If you can, I think you're in the wrong career. You shouldn't be reading this code heh.
         self.writer.reset_len();
+        std.debug.assert(self.writer.len == 0);
 
         const build_stats = try self.create_board_buffer();
+        std.debug.assert(self.writer.len > 0);
 
         const write_start = timestamp_ns();
         const result_code = terminal_io.TerminalIO.write(self.writer.written());
@@ -342,12 +354,18 @@ pub const Board = struct {
     }
 
     fn create_board_buffer(self: *Board) !struct { ns: u64, size_kb: f64 } {
+        std.debug.assert(self.width >= 3);
+        std.debug.assert(self.height >= 1);
+
         const build_start = timestamp_ns();
 
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
         // Centered 5-char label: (total - 5) / 2 spaces of left padding.
         const total_width: usize = 6 + 8 * self.width;
+        // Min width is 3 so 6 + 8 * 3 = 30, at a bare minimun it's going to be 30
+        std.debug.assert(total_width >= 30);
         const label_padding_len: usize = (total_width - 5) / 2;
+        std.debug.assert(label_padding_len < total_width);
         const top_label = switch (self.perspective) {
             .white => "BLACK\r\n\r\n",
             .black => "WHITE\r\n\r\n",
@@ -385,6 +403,9 @@ pub const Board = struct {
     ///   White: rank = 7 - row_draw, file = col_draw      (rank 8 on top, file a on left)
     ///   Black: rank = row_draw,     file = 7 - col_draw  (rank 1 on top, file h on left)
     fn write_rank_and_pieces(self: *Board) !void {
+        std.debug.assert(self.width >= 3);
+        std.debug.assert(self.height >= 1);
+
         const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
 
         const mid_sub: usize = self.height / 2;
@@ -446,6 +467,9 @@ pub const Board = struct {
 
         self.board_state[from.rank][from.file] = .empty;
         self.board_state[to.rank][to.file] = piece;
+
+        std.debug.assert(self.board_state[from.rank][from.file] == .empty);
+        std.debug.assert(self.board_state[to.rank][to.file] == piece);
     }
 
     /// Mutates the board state, moves a piece from `from` to `to`. Flips the perspective and
