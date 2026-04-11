@@ -56,11 +56,24 @@ pub const Piece = enum(i8) {
     }
 };
 
+/// Perspective that drives how the board will be rendered on the screen.
+/// Whichever is selected will be rendered towards the user, i.e. if perspective was white then
+/// black would be on the top of the screen and white would be on the bottom, and vice-versa for
+/// when the perspective is black.
+pub const Perspective = enum {
+    White,
+    Black,
+};
+
+/// Position of a piece on the board (rank, file).
 pub const Position = struct {
     rank: usize,
     file: usize,
 };
 
+// The height and width of the cells are required to calculate the padding needed to apply to each cell when rendering, otherwise the pieces won't be centered.
+/// Encodes the current board.
+/// Keeps track of the board state, overlays if any. Also keeps track of the current boards cell widht and height in terms of terminal cells.
 pub const Board = struct {
     /// Current State of the board with piece positions.
     /// Row 0 is black's back rank and row 7 is white's back rank.
@@ -77,8 +90,11 @@ pub const Board = struct {
     /// Height of a single cell in terminal character rows.
     height: usize,
 
-    /// Render buffer writer owned by the board.
+    /// The board state buffer writer owned by the board. Takes care of storing the byte sequence of the current board used to render it to the terminal.
     writer: BufWriter = .{},
+
+    /// The perspective from which the board will be rendered. Defaults to White
+    perspective: Perspective = .White,
 
     // The bg_rgb and the fg_rgb always return 19 byte strings for convenience. If that changes we'll need to have two different variables to store each one.
     const COLOR_SEQUENCE_LENGTH = 19;
@@ -90,16 +106,88 @@ pub const Board = struct {
     /// Upper bound on the rendered buffer size. Sized abnormally large so we can use the buffer without an allocator.
     const RENDER_BUFFER_SIZE: usize = 256 * 1024;
 
-    /// The starting position for a classical game
+    // Chess board anatomy:
+    //
+    // Files run a..h left to right, ranks run 1..8 from white's side up to black's. A square is named
+    // <file><rank> — e.g. the white king starts on e1, the black king on e8, and the move "e4" points at
+    // the square shown in the middle of the diagram below. The bottm right corner of the board is always
+    // a light square, irrespective of which players perspective you see from.
+    //
+    //                             BLACK
+    //             a     b     c     d     e     f     g     h
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        8 | a8  | b8  | c8  | d8  | e8  | f8  | g8  | h8  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        7 | a7  | b7  | c7  | d7  | e7  | f7  | g7  | h7  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        6 | a6  | b6  | c6  | d6  | e6  | f6  | g6  | h6  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        5 | a5  | b5  | c5  | d5  | e5  | f5  | g5  | h5  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        4 | a4  | b4  | c4  | d4  | e4  | f4  | g4  | h4  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        3 | a3  | b3  | c3  | d3  | e3  | f3  | g3  | h3  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        2 | a2  | b2  | c2  | d2  | e2  | f2  | g2  | h2  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //        1 | a1  | b1  | c1  | d1  | e1  | f1  | g1  | h1  |
+    //          +-----+-----+-----+-----+-----+-----+-----+-----+
+    //             a     b     c     d     e     f     g     h
+    //                             WHITE
+    //
+    // board_state is indexed as board_state[rank_idx][file_idx], with rank_idx 0 mapping to chess rank 1
+    // (white's back rank) and rank_idx 7 to chess rank 8 (black's back rank). The array layout is flipped
+    // vertically relative to the anatomy diagram above, so "e4" translates directly to board_state[3][4] —
+    // no mental flip, rank_idx and chess rank line up exactly.
+    //
+    // I initially had this encoded as we see in the anatomy diagram above: for the 2D array, white sat at
+    // the bottom (high rank_idx) and black at the top (low rank_idx). That inverted every rank lookup —
+    // a pawn push from e2 -> e4 read as board_state[6][4] -> board_state[4][4] instead of the natural
+    // board_state[1][4] -> board_state[3][4]. I'd be paying that translation cost at every call site for
+    // white's position, and moves are what the whole game is built on, so I flipped the convention once
+    // here rather than forever at every access.
+    //
+    // The two layouts, drawn as the 2D array sees them (rank_idx 0 on top, the way memory reads):
+    //
+    //              BEFORE (array matches the anatomy diagram,                     NOW (array is flipped — rank_idx lines
+    //              but rank_idx is inverted vs chess rank):                       up with chess rank directly):
+    //
+    //                               BLACK                                                         WHITE
+    //                a    b    c    d    e    f    g    h                         a    b    c    d    e    f    g    h
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 0 | a8 | b8 | c8 | d8 | e8 | f8 | g8 | h8 |          rank_idx 0 | a1 | b1 | c1 | d1 | e1 | f1 | g1 | h1 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 1 | a7 | b7 | c7 | d7 | e7 | f7 | g7 | h7 |          rank_idx 1 | a2 | b2 | c2 | d2 | e2 | f2 | g2 | h2 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 2 | a6 | b6 | c6 | d6 | e6 | f6 | g6 | h6 |          rank_idx 2 | a3 | b3 | c3 | d3 | e3 | f3 | g3 | h3 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 3 | a5 | b5 | c5 | d5 | e5 | f5 | g5 | h5 |          rank_idx 3 | a4 | b4 | c4 | d4 | e4 | f4 | g4 | h4 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 4 | a4 | b4 | c4 | d4 | e4 | f4 | g4 | h4 |          rank_idx 4 | a5 | b5 | c5 | d5 | e5 | f5 | g5 | h5 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 5 | a3 | b3 | c3 | d3 | e3 | f3 | g3 | h3 |          rank_idx 5 | a6 | b6 | c6 | d6 | e6 | f6 | g6 | h6 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 6 | a2 | b2 | c2 | d2 | e2 | f2 | g2 | h2 |          rank_idx 6 | a7 | b7 | c7 | d7 | e7 | f7 | g7 | h7 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //   rank_idx 7 | a1 | b1 | c1 | d1 | e1 | f1 | g1 | h1 |          rank_idx 7 | a8 | b8 | c8 | d8 | e8 | f8 | g8 | h8 |
+    //              +----+----+----+----+----+----+----+----+                     +----+----+----+----+----+----+----+----+
+    //                              WHITE                                                         BLACK
+    //
+    // Note how in BEFORE the array "looks right" (black on top, white on bottom like you'd set up a real
+    // board) but rank_idx 0 = rank 8 and rank_idx 7 = rank 1 — every piece of move logic has to do
+    // `8 - rank` to index white. In NOW the array is upside down compared to the physical board, but
+    // rank_idx == (chess rank - 1), so the translation vanishes.
+    //
+    /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
-        .{ .BlackRook, .BlackKnight, .BlackBhishop, .BlackQueen, .BlackKing, .BlackBhishop, .BlackKnight, .BlackRook },
-        .{.BlackPawn} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.WhitePawn} ** 8,
         .{ .WhiteRook, .WhiteKnight, .WhiteBhishop, .WhiteQueen, .WhiteKing, .WhiteBhishop, .WhiteKnight, .WhiteRook },
+        .{.WhitePawn} ** 8,
+        .{.Empty} ** 8,
+        .{.Empty} ** 8,
+        .{.Empty} ** 8,
+        .{.Empty} ** 8,
+        .{.BlackPawn} ** 8,
+        .{ .BlackRook, .BlackKnight, .BlackBhishop, .BlackQueen, .BlackKing, .BlackBhishop, .BlackKnight, .BlackRook },
     };
 
     const EMPTY_OVERLAY: [8]u1 = .{0} ** 8;
@@ -149,6 +237,16 @@ pub const Board = struct {
         };
     }
 
+    /// Flips the perspective of the board, and re-draws it.
+    pub fn flip_perspective(self: *Board) !void {
+        self.perspective = switch (self.perspective) {
+            .White => .Black,
+            .Black => .White,
+        };
+
+        try self.draw();
+    }
+
     /// Computes the per-cell width and height (in terminal character cells) for the largest chess board that fits in the current window.
     /// The Width to height aspect ratio is 7:3.
     /// Returns error.TerminalTooSmall if the window cannot fit the minimum 3x1 cell board.
@@ -179,7 +277,11 @@ pub const Board = struct {
     fn write_file_labels(self: *Board) !void {
         try self.writer.write_all("   ");
         const padding: usize = (self.width - 1) / 2;
-        const letters = "abcdefgh";
+        const letters = switch (self.perspective) {
+            .White => "abcdefgh",
+            .Black => "hgfedcba",
+        };
+
         for (letters) |ch| {
             try self.writer.write_byte_n(' ', padding);
             try self.writer.write_all(&[_]u8{ch});
@@ -206,29 +308,16 @@ pub const Board = struct {
 
     /// Draws the current board state to the terminal
     pub fn draw(self: *Board) !void {
+        // The buffer will be build anew for each move, reset len just resets the current index/cursor of the buffer writer.
+        // I thought this would not be good for performance, turns out I was wrong. The average times for writing the the buffer writer and rendering it to the screen are as below:
+        // These values are of-course based on my machine which is a base M3 Pro.
+        //      Buffer Write Time      : 65 µs
+        //      Render To Terminal Time: 500 µs
+        //
+        // Sub milisecond times are not detectable by human eye. If you can, I think you're in the wrong career. You shouldn't be reading this code heh.
         self.writer.reset_len();
-        const build_start = timestamp_ns();
 
-        // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
-        // Centered 5-char label: (total - 5) / 2 spaces of left padding.
-        const total_width: usize = 6 + 8 * self.width;
-        const label_padding_len: usize = (total_width - 5) / 2;
-
-        try self.writer.write_all(terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME);
-        try self.writer.write_byte_n(' ', label_padding_len);
-        try self.writer.write_all("BLACK\r\n\n\r");
-
-        try self.write_file_labels();
-
-        try self.write_rank_and_pieces();
-
-        try self.write_file_labels();
-
-        try self.writer.write_all("\r\n");
-        try self.writer.write_byte_n(' ', label_padding_len);
-        try self.writer.write_all("WHITE\r\n");
-
-        const build_ns = timestamp_ns() - build_start;
+        const build_stats = try self.create_board_buffer();
 
         const write_start = timestamp_ns();
         const result_code = terminal_io.TerminalIO.write(self.writer.written());
@@ -238,30 +327,75 @@ pub const Board = struct {
             std.debug.print("Failed to render to the terminal.", .{});
         }
 
-        const build = format_duration(build_ns);
+        // These prints must come after the terminal write, because the buffer begins with
+        // CLEAR_SCREEN — printing them before the write would put them on screen just long
+        // enough to get wiped by the clear.
+        const build = format_duration(build_stats.ns);
+        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | ", .{ build.value, build.unit, build_stats.size_kb });
         const write = format_duration(write_ns);
-        const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
-        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | terminal write: {d} {s}\r\n", .{
-            build.value, build.unit, size_kb,
-            write.value, write.unit,
-        });
+        std.debug.print("terminal write: {d} {s}\r\n", .{ write.value, write.unit });
     }
 
-    fn write_rank_and_pieces(self: *Board) !void {
-        // Left-edge rank labels. Index 0 is the black back rank (chess rank 8).
-        const rank_margins = [_][]const u8{ " 8 ", " 7 ", " 6 ", " 5 ", " 4 ", " 3 ", " 2 ", " 1 " };
+    fn create_board_buffer(self: *Board) !struct { ns: u64, size_kb: f64 } {
+        const build_start = timestamp_ns();
+
+        // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
+        // Centered 5-char label: (total - 5) / 2 spaces of left padding.
+        const total_width: usize = 6 + 8 * self.width;
+        const label_padding_len: usize = (total_width - 5) / 2;
+        const top_label = switch (self.perspective) {
+            .White => "BLACK\r\n\r\n",
+            .Black => "WHITE\r\n\r\n",
+        };
+        const bottom_lable = switch (self.perspective) {
+            .White => "WHITE\r\n",
+            .Black => "BLACK\r\n",
+        };
+
+        try self.writer.write_all(terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME);
+        try self.writer.write_byte_n(' ', label_padding_len);
+        try self.writer.write_all(top_label);
+
+        try self.write_file_labels();
+
+        switch (self.perspective) {
+            .White => try self.write_white_perspective_rank_and_pieces(),
+            .Black => try self.write_black_perspective_rank_and_pieces(),
+        }
+
+        try self.write_file_labels();
+
+        try self.writer.write_all("\r\n");
+        try self.writer.write_byte_n(' ', label_padding_len);
+        try self.writer.write_all(bottom_lable);
+
+        const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
+        const build_ns = timestamp_ns() - build_start;
+        return .{ .ns = build_ns, .size_kb = size_kb };
+    }
+
+    /// Writes out the rank label/legends to the buffer from the perspective of the white player.
+    /// Rank labels are the numbers 1 through 8 you see on the physical boards.
+    fn write_white_perspective_rank_and_pieces(self: *Board) !void {
+        const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
 
         const mid_sub: usize = self.height / 2;
         const padding: usize = (self.width - 1) / 2;
 
-        for (self.board_state, 0..) |rank_row, rank| {
+        // Index of the last row
+        // To from the perspective of white we need to print our board state in reverse order of rows.
+        var rank: usize = 8;
+        while (rank > 0) {
+            // We need to do this cause file is a usie and if we use something like while (rank >= 0) : (rank -= 1), it'll wrap the usize
+            // creating an infinite loop.
+            rank -= 1;
             var sub_row: usize = 0;
             while (sub_row < self.height) : (sub_row += 1) {
                 // Rank digit on the middle sub-row only, blank margin otherwise.
                 const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
                 try self.writer.write_all(side_margin);
 
-                for (rank_row, 0..) |piece, file| {
+                for (self.board_state[rank], 0..) |piece, file| {
                     const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
                     try self.writer.write_all(bg);
                     // Middle row holds the glyph with some padding to center it
@@ -283,11 +417,55 @@ pub const Board = struct {
         }
     }
 
-    pub fn move(self: *Board, old_position: Position, new_position: Position) void {
+    /// Writes out the rank label/legends to the buffer from the perspective of the black player.
+    /// Rank labels are the numbers 1 through 8 you see on the physical boards.
+    fn write_black_perspective_rank_and_pieces(self: *Board) !void {
+        const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
+
+        const mid_sub: usize = self.height / 2;
+        const padding: usize = (self.width - 1) / 2;
+
+        for (self.board_state, 0..) |rank_row, rank| {
+            var sub_row: usize = 0;
+            while (sub_row < self.height) : (sub_row += 1) {
+                // Rank digit on the middle sub-row only, blank margin otherwise.
+                const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
+                try self.writer.write_all(side_margin);
+
+                // For black we'd need to resverse each row individual row to form the correct perspective.
+                var file: usize = 8;
+                while (file > 0) {
+                    // We need to do this cause file is a usie and if we use something like while (file >= 0) : (file -= 1), it'll wrap the usize
+                    // creating an infinite loop.
+                    file -= 1;
+                    const piece = rank_row[file];
+                    const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
+                    try self.writer.write_all(bg);
+                    // Middle row holds the glyph with some padding to center it
+                    if (sub_row == mid_sub) {
+                        try self.writer.write_byte_n(' ', padding);
+                        try self.writer.write_all(piece.fg());
+                        try self.writer.write_all(piece.glyph());
+                        try self.writer.write_byte_n(' ', padding);
+                    } else {
+                        try self.writer.write_byte_n(' ', self.width);
+                    }
+                }
+
+                // The labeling is on both sides.
+                try self.writer.write_all(RESET);
+                try self.writer.write_all(side_margin);
+                try self.writer.write_all("\r\n");
+            }
+        }
+    }
+
+    pub fn move(self: *Board, old_position: Position, new_position: Position) !void {
         const piece = self.board_state[old_position.rank][old_position.file];
         std.debug.assert(piece != .Empty);
 
         self.board_state[old_position.rank][old_position.file] = .Empty;
         self.board_state[new_position.rank][new_position.file] = piece;
+        try self.flip_perspective();
     }
 };

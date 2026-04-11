@@ -1,5 +1,7 @@
 const std = @import("std");
 
+/// Struct containing the most common Escape Sequences for terminal commands.
+/// Eg: Clear screen, erase line, set cursor to home and more.
 pub const EscapeSequences = struct {
     pub const RESET_STYLE_AND_COLOR = "\x1b[0m";
     pub const ERASE_TILL_END_OF_SCREEN = "\x1b[0J";
@@ -11,19 +13,27 @@ pub const EscapeSequences = struct {
     pub const ERASE_ENTIRE_LINE = "\x1b[2K";
     pub const SET_CURSOR_TO_HOME = "\x1b[H";
 
+    /// Returns an escape sequence that sets the background color to the provided rgb color.
     pub fn bg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) *const [19:0]u8 {
         return std.fmt.comptimePrint("\x1b[48;2;{d:0>3};{d:0>3};{d:0>3}m", .{ r, g, b });
     }
 
+    /// Returns an escape sequence that sets the foreground color to the provided rgb color.
     pub fn fg_rgb(comptime r: u8, comptime g: u8, comptime b: u8) *const [19:0]u8 {
         return std.fmt.comptimePrint("\x1b[38;2;{d:0>3};{d:0>3};{d:0>3}m", .{ r, g, b });
     }
 };
 
+/// Struct to control terminal io.
+/// Holds the current window config and the original termios setting to reset back to.
 pub const TerminalIO = struct {
+    /// The termios settings of the terminal at the time of initializing the TerminalIO struct.
     original_termios: std.posix.termios,
+
+    /// The window configuration of the terminal at the time of initializing the TerminalIO struct.
     window_config: std.posix.winsize,
 
+    /// Returns a TerminalIO struct with the current termios and window config.
     pub fn init() !TerminalIO {
         const original_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
 
@@ -36,6 +46,7 @@ pub const TerminalIO = struct {
         return .{ .original_termios = original_termios, .window_config = window_config };
     }
 
+    /// Enables raw mode input processing.
     pub fn enable_raw_mode(self: *const TerminalIO) !void {
         var raw_mode_termios: std.posix.termios = self.original_termios;
 
@@ -101,6 +112,7 @@ pub const TerminalIO = struct {
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, raw_mode_termios);
     }
 
+    /// Restore the termios setting to the original termios settings.
     pub fn restore_termios(self: *const TerminalIO) void {
         std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, self.original_termios) catch {
             std.debug.print("Error resetting the termios settings.", .{});
@@ -108,7 +120,10 @@ pub const TerminalIO = struct {
         };
     }
 
+    /// Starts an infinite loop of input reading.
+    /// Reads character by character until the user input q upon which the loop is terminated.
     pub fn start_input_loop(self: *TerminalIO) !void {
+        // I think terminalIo.start_input_loop make more sense than something like TerminalIO.start_input_loop.
         _ = self;
         // Not particularly useful right now but will be used when we render the board and start accepting user input.
         // This will likely move out of this file into it's own thing at some point.
@@ -142,6 +157,7 @@ pub const TerminalIO = struct {
         }
     }
 
+    /// Write out given buffer to the terminal.
     pub fn write(buffer: []const u8) isize {
         return std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
     }
