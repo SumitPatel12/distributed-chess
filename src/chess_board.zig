@@ -179,12 +179,12 @@ pub const Board = struct {
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
         .{ .white_rook, .white_knight, .white_bishop, .white_queen, .white_king, .white_bishop, .white_knight, .white_rook },
-        .{.WhitePawn} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.Empty} ** 8,
-        .{.BlackPawn} ** 8,
+        .{.white_pawn} ** 8,
+        .{.empty} ** 8,
+        .{.empty} ** 8,
+        .{.empty} ** 8,
+        .{.empty} ** 8,
+        .{.black_pawn} ** 8,
         .{ .black_rook, .black_knight, .black_bishop, .black_queen, .black_king, .black_bishop, .black_knight, .black_rook },
     };
 
@@ -225,7 +225,7 @@ pub const Board = struct {
     };
 
     /// Initialize the board with the starting position and an emtpy board overlay.
-    pub fn init_board(window_config: std.posix.winsize) !Board {
+    pub fn init(window_config: std.posix.winsize) !Board {
         const dimensions = try compute_cell_dimensions(window_config);
         return Board{
             .board_state = STARTING_BOARD_POSITION,
@@ -359,10 +359,7 @@ pub const Board = struct {
 
         try self.write_file_labels();
 
-        switch (self.perspective) {
-            .white => try self.write_white_perspective_rank_and_pieces(),
-            .black => try self.write_black_perspective_rank_and_pieces(),
-        }
+        try self.write_rank_and_pieces();
 
         try self.write_file_labels();
 
@@ -375,71 +372,39 @@ pub const Board = struct {
         return .{ .ns = build_ns, .size_kb = size_kb };
     }
 
-    /// Writes out the rank label/legends to the buffer from the perspective of the white player.
-    /// Rank labels are the numbers 1 through 8 you see on the physical boards.
-    fn write_white_perspective_rank_and_pieces(self: *Board) !void {
+    /// Writes the rank labels and piece cells for the entire board, honoring the current
+    /// perspective. Rank labels are the numbers 1 through 8 you see on the physical boards.
+    ///
+    /// The loop walks the board in *visual* order — (row_draw, col_draw) starts at the top-left
+    /// of what the user sees and sweeps right-then-down. The mapping from visual position to
+    /// board coordinates is the only thing that depends on perspective:
+    ///   White: rank = 7 - row_draw, file = col_draw      (rank 8 on top, file a on left)
+    ///   Black: rank = row_draw,     file = 7 - col_draw  (rank 1 on top, file h on left)
+    fn write_rank_and_pieces(self: *Board) !void {
         const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
 
         const mid_sub: usize = self.height / 2;
         const padding: usize = (self.width - 1) / 2;
 
-        // Index of the last row
-        // To from the perspective of white we need to print our board state in reverse order of rows.
-        var rank: usize = 8;
-        while (rank > 0) {
-            // We need to do this cause file is a usie and if we use something like while (rank >= 0) : (rank -= 1), it'll wrap the usize
-            // creating an infinite loop.
-            rank -= 1;
+        for (0..8) |row_draw| {
+            const rank: usize = switch (self.perspective) {
+                .white => 7 - row_draw,
+                .black => row_draw,
+            };
+
             var sub_row: usize = 0;
             while (sub_row < self.height) : (sub_row += 1) {
                 // Rank digit on the middle sub-row only, blank margin otherwise.
                 const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
                 try self.writer.write_all(side_margin);
 
-                for (self.board_state[rank], 0..) |piece, file| {
-                    const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
-                    try self.writer.write_all(bg);
-                    // Middle row holds the glyph with some padding to center it
-                    if (sub_row == mid_sub) {
-                        try self.writer.write_byte_n(' ', padding);
-                        try self.writer.write_all(piece.fg());
-                        try self.writer.write_all(piece.glyph());
-                        try self.writer.write_byte_n(' ', padding);
-                    } else {
-                        try self.writer.write_byte_n(' ', self.width);
-                    }
-                }
+                for (0..8) |col_draw| {
+                    const file: usize = switch (self.perspective) {
+                        .white => col_draw,
+                        .black => 7 - col_draw,
+                    };
 
-                // The labeling is on both sides.
-                try self.writer.write_all(RESET);
-                try self.writer.write_all(side_margin);
-                try self.writer.write_all("\r\n");
-            }
-        }
-    }
-
-    /// Writes out the rank label/legends to the buffer from the perspective of the black player.
-    /// Rank labels are the numbers 1 through 8 you see on the physical boards.
-    fn write_black_perspective_rank_and_pieces(self: *Board) !void {
-        const rank_margins = [_][]const u8{ " 1 ", " 2 ", " 3 ", " 4 ", " 5 ", " 6 ", " 7 ", " 8 " };
-
-        const mid_sub: usize = self.height / 2;
-        const padding: usize = (self.width - 1) / 2;
-
-        for (self.board_state, 0..) |rank_row, rank| {
-            var sub_row: usize = 0;
-            while (sub_row < self.height) : (sub_row += 1) {
-                // Rank digit on the middle sub-row only, blank margin otherwise.
-                const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
-                try self.writer.write_all(side_margin);
-
-                // For black we'd need to resverse each row individual row to form the correct perspective.
-                var file: usize = 8;
-                while (file > 0) {
-                    // We need to do this cause file is a usie and if we use something like while (file >= 0) : (file -= 1), it'll wrap the usize
-                    // creating an infinite loop.
-                    file -= 1;
-                    const piece = rank_row[file];
+                    const piece = self.board_state[rank][file];
                     const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
                     try self.writer.write_all(bg);
                     // Middle row holds the glyph with some padding to center it

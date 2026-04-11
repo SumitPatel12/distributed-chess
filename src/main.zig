@@ -9,7 +9,7 @@ pub fn main() !void {
     try term.enable_raw_mode();
     defer term.restore_termios();
 
-    var board = try chess_board.Board.init_board(term.window_config);
+    var board = try chess_board.Board.init(term.window_config);
     try board.draw();
 
     const moves = [_][2]Position{
@@ -22,8 +22,7 @@ pub fn main() !void {
     };
 
     for (moves) |move| {
-        // Sleep for 1 second before making each move.
-        _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
+        _ = std.c.nanosleep(&.{ .sec = 3, .nsec = 0 }, null);
         try board.play_turn(move[0], move[1]);
     }
 
