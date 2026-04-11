@@ -13,7 +13,7 @@ const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 // Positive would be white and negative would be black. And since we only have 6 unique pieces i8 is more than enough.
 /// Enum for pieces, the board_state will make use of this to encode the board state.
 pub const Piece = enum(i8) {
-    // I'll see if the bhishops need to be segregated into light_squared and dark_squared. For now I'll trust that the state_machine (or the move logic) eliminates the need for that.
+    // I'll see if the bishops need to be segregated into light_squared and dark_squared. For now I'll trust that the state_machine (or the move logic) eliminates the need for that.
     // I think this will be convenient, may be counterintuitive.
     empty = 0,
     white_pawn = 1,
@@ -225,6 +225,24 @@ pub const Board = struct {
         }
     };
 
+    /// Per-cell dimensions in terminal character cells, as computed from the current window.
+    const CellDimensions = struct {
+        width: u16,
+        height: u16,
+    };
+
+    /// A duration split into a human-friendly magnitude and its unit string ("ns", "µs", "ms").
+    const Duration = struct {
+        value: u64,
+        unit: []const u8,
+    };
+
+    /// Stats captured while building the render buffer for a single frame.
+    const BuildStats = struct {
+        ns: u64,
+        size_kb: f64,
+    };
+
     // NOTE: Since this is initialized in-place make sure that all of the things that it calls
     // during the init also support in-place initialization.
     /// Initialize the board with the starting position and an empty board overlay.
@@ -261,7 +279,7 @@ pub const Board = struct {
     /// Computes the per-cell width and height (in terminal character cells) for the largest chess board that fits in the current window.
     /// The Width to height aspect ratio is 7:3.
     /// Returns error.TerminalTooSmall if the window cannot fit the minimum 3x1 cell board.
-    fn compute_cell_dimensions(ws: std.posix.winsize) !struct { width: u16, height: u16 } {
+    fn compute_cell_dimensions(ws: std.posix.winsize) !CellDimensions {
         // Horizontal overhead: 3-col rank margin on each side = 6 cols.
         // Vertical overhead: 2 file-letter rows + 2 title rows + 2 spacer rows = 6 rows.
         if (ws.col < 30 or ws.row < 14) return error.TerminalTooSmall;
@@ -315,7 +333,7 @@ pub const Board = struct {
         return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
 
-    fn format_duration(ns: u64) struct { value: u64, unit: []const u8 } {
+    fn format_duration(ns: u64) Duration {
         if (ns >= 1_000_000) return .{ .value = ns / 1_000_000, .unit = "ms" };
         if (ns >= 1_000) return .{ .value = ns / 1_000, .unit = "µs" };
         return .{ .value = ns, .unit = "ns" };
@@ -353,7 +371,7 @@ pub const Board = struct {
         std.debug.print("terminal write: {d} {s}\r\n", .{ write.value, write.unit });
     }
 
-    fn create_board_buffer(self: *Board) !struct { ns: u64, size_kb: f64 } {
+    fn create_board_buffer(self: *Board) !BuildStats {
         std.debug.assert(self.width >= 3);
         std.debug.assert(self.height >= 1);
 
