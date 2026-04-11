@@ -5,11 +5,12 @@ const chess_board = @import("chess_board.zig");
 const Position = chess_board.Position;
 
 pub fn main() !void {
-    var term = try terminal_io.TerminalIO.init();
-    try term.enable_raw_mode();
-    defer term.restore_termios();
+    var io = try terminal_io.TerminalIO.init();
+    try io.enable_raw_mode();
+    defer io.restore_termios();
 
-    var board = try chess_board.Board.init(term.window_config);
+    var board: chess_board.Board = undefined;
+    try board.init(io.window_config);
     try board.draw();
 
     const moves = [_][2]Position{
@@ -26,5 +27,5 @@ pub fn main() !void {
         try board.play_turn(move[0], move[1]);
     }
 
-    try term.start_input_loop();
+    try io.start_input_loop();
 }

@@ -67,13 +67,13 @@ pub const Perspective = enum {
 
 /// Position of a piece on the board (rank, file).
 pub const Position = struct {
-    rank: usize,
-    file: usize,
+    rank: u3,
+    file: u3,
 };
 
 // The height and width of the cells are required to calculate the padding needed to apply to each cell when rendering, otherwise the pieces won't be centered.
 /// Encodes the current board.
-/// Keeps track of the board state, overlays if any. Also keeps track of the current boards cell widht and height in terms of terminal cells.
+/// Keeps track of the board state, overlays if any. Also keeps track of the current boards cell width and height in terms of terminal cells.
 pub const Board = struct {
     /// Current State of the board with piece positions.
     /// Row 0 is black's back rank and row 7 is white's back rank.
@@ -108,7 +108,7 @@ pub const Board = struct {
     //
     // Files run a..h left to right, ranks run 1..8 from white's side up to black's. A square is named
     // <file><rank> — e.g. the white king starts on e1, the black king on e8, and the move "e4" points at
-    // the square shown in the middle of the diagram below. The bottm right corner of the board is always
+    // the square shown in the middle of the diagram below. The bottom right corner of the board is always
     // a light square, irrespective of which players perspective you see from.
     //
     //                             BLACK
@@ -188,8 +188,6 @@ pub const Board = struct {
         .{ .black_rook, .black_knight, .black_bishop, .black_queen, .black_king, .black_bishop, .black_knight, .black_rook },
     };
 
-    const EMPTY_OVERLAY: u64 = 0;
-
     /// Buffer writer to help draw the chess board on the terminal.
     const BufWriter = struct {
         buf: [RENDER_BUFFER_SIZE]u8 = undefined,
@@ -224,17 +222,23 @@ pub const Board = struct {
         }
     };
 
-    /// Initialize the board with the starting position and an emtpy board overlay.
-    pub fn init(window_config: std.posix.winsize) !Board {
+    // NOTE: Since this is initialized in-place make sure that all of the things that it calls
+    // during the init also support in-place initialization.
+    /// Initialize the board with the starting position and an empty board overlay.
+    /// Initialization takes place in-place
+    pub fn init(self: *Board, window_config: std.posix.winsize) !void {
         const dimensions = try compute_cell_dimensions(window_config);
-        return Board{
+        self.* = .{
             .board_state = STARTING_BOARD_POSITION,
-            .board_overlay = EMPTY_OVERLAY,
+            .board_overlay = 0,
             .width = @as(usize, dimensions.width),
             .height = @as(usize, dimensions.height),
             .writer = .{},
             .perspective = .white,
         };
+
+        std.debug.assert(self.width >= 3);
+        std.debug.assert(self.height >= 1);
     }
 
     /// Flips the perspective of the board. Doesn't redraw.
@@ -348,7 +352,7 @@ pub const Board = struct {
             .white => "BLACK\r\n\r\n",
             .black => "WHITE\r\n\r\n",
         };
-        const bottom_lable = switch (self.perspective) {
+        const bottom_label = switch (self.perspective) {
             .white => "WHITE\r\n",
             .black => "BLACK\r\n",
         };
@@ -365,7 +369,7 @@ pub const Board = struct {
 
         try self.writer.write_all("\r\n");
         try self.writer.write_byte_n(' ', label_padding_len);
-        try self.writer.write_all(bottom_lable);
+        try self.writer.write_all(bottom_label);
 
         const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
         const build_ns = timestamp_ns() - build_start;

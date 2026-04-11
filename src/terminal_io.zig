@@ -33,6 +33,9 @@ pub const TerminalIO = struct {
     /// The window configuration of the terminal at the time of initializing the TerminalIO struct.
     window_config: std.posix.winsize,
 
+    /// Tracks whether or not this session is operating in raw mode or not.
+    raw_mode_enabled: bool = false,
+
     /// Returns a TerminalIO struct with the current termios and window config.
     pub fn init() !TerminalIO {
         const original_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
@@ -43,11 +46,15 @@ pub const TerminalIO = struct {
             return error.WindowSizeUnavailable;
         }
 
-        return .{ .original_termios = original_termios, .window_config = window_config };
+        return .{
+            .original_termios = original_termios,
+            .window_config = window_config,
+            .raw_mode_enabled = false,
+        };
     }
 
     /// Enables raw mode input processing.
-    pub fn enable_raw_mode(self: *const TerminalIO) !void {
+    pub fn enable_raw_mode(self: *TerminalIO) !void {
         var raw_mode_termios: std.posix.termios = self.original_termios;
 
         // IXON: Disables Ctrl-S and Ctrl-Q. Ctrl-S stops data from being transmitted
@@ -57,7 +64,7 @@ pub const TerminalIO = struct {
         // terminal translates any carriage returns (13, '\r') inputted by the user
         // into newlines (10, '\n').
         //
-        // IBRKINT: Break conditons cause SIGINT
+        // IBRKINT: Break conditions cause SIGINT
         //
         // INPCK: Enables parity checking, mostly doesn't apply to modern computers.
         //
@@ -94,9 +101,9 @@ pub const TerminalIO = struct {
         //
         // ECHO: Causes each key press to be printed to the terminal, it's good for
         // when you're in canonical mode, but in raw mode you don't want the user's
-        // input echoed since you're gonig to be handling that.
+        // input echoed since you're going to be handling that.
         //
-        // ICANON is for canonical mode. In that mode, inupt is made visible line by
+        // ICANON is for canonical mode. In that mode, input is made visible line by
         // line.
         //
         // ISIG: When any of the characters INTR, QUIT, SUSP, or DSUSP are received,
@@ -110,39 +117,42 @@ pub const TerminalIO = struct {
         raw_mode_termios.lflag.IEXTEN = false;
 
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, raw_mode_termios);
+        self.raw_mode_enabled = true;
     }
 
     /// Restore the termios setting to the original termios settings.
-    pub fn restore_termios(self: *const TerminalIO) void {
+    pub fn restore_termios(self: *TerminalIO) void {
         std.posix.tcsetattr(std.posix.STDIN_FILENO, std.posix.TCSA.FLUSH, self.original_termios) catch {
             std.debug.print("Error resetting the termios settings.", .{});
             // Nothing we can do, the user will have to re-open the terminal.
         };
+
+        self.raw_mode_enabled = false;
     }
 
-    /// Starts an infinite loop of input reading.
-    /// Reads character by character until the user input q upon which the loop is terminated.
+    /// Starts an infinite loop of input reading. Reads character by character until the user
+    /// inputs 'q', at which point the loop terminates.
+    ///
+    /// Requires the terminal to be in raw mode for this to work.
     pub fn start_input_loop(self: *TerminalIO) !void {
-        // I think terminalIo.start_input_loop make more sense than something like TerminalIO.start_input_loop.
-        _ = self;
-        // Not particularly useful right now but will be used when we render the board and start accepting user input.
-        // This will likely move out of this file into it's own thing at some point.
+        std.debug.assert(self.raw_mode_enabled);
+
         while (true) {
             var c: u8 = 0;
-            while (true) {
-                const nread = std.posix.read(std.posix.STDIN_FILENO, (&c)[0..1]) catch |err| switch (err) {
-                    error.WouldBlock => continue,
-                    else => {
-                        // std.process.exit(x) doesn't let zig cleanup run before the program terminates, effectively leaving the calling terminal window in raw mode,
-                        // so we're not gonna use that.
-                        std.debug.print("Error encountered while reading from STDIN_FILENO", .{});
-                        return;
-                    },
-                };
+            const nread = std.posix.read(std.posix.STDIN_FILENO, (&c)[0..1]) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => {
+                    // std.process.exit(x) doesn't let zig cleanup run before the program terminates, effectively leaving the calling terminal window in raw mode,
+                    // so we're not gonna use that.
+                    std.debug.print("Error encountered while reading from STDIN_FILENO", .{});
+                    return;
+                },
+            };
 
-                if (nread == 1) {
-                    break;
-                }
+            // VMIN=0, VTIME=1 (set in enable_raw_mode) make read return after ~0.1s with or
+            // without data. If nothing arrived we loop back and poll again.
+            if (nread == 0) {
+                continue;
             }
 
             switch (c) {
