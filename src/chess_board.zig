@@ -15,19 +15,19 @@ const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 pub const Piece = enum(i8) {
     // I'll see if the bhishops need to be segregated into light_squared and dark_squared. For now I'll trust that the state_machine (or the move logic) eliminates the need for that.
     // I think this will be convenient, may be counterintuitive.
-    Empty = 0,
-    WhitePawn = 1,
-    WhiteKnight = 2,
-    WhiteBhishop = 3,
-    WhiteRook = 4,
-    WhiteQueen = 5,
-    WhiteKing = 6,
-    BlackPawn = -1,
-    BlackKnight = -2,
-    BlackBhishop = -3,
-    BlackRook = -4,
-    BlackQueen = -5,
-    BlackKing = -6,
+    empty = 0,
+    white_pawn = 1,
+    white_knight = 2,
+    white_bishop = 3,
+    white_rook = 4,
+    white_queen = 5,
+    white_king = 6,
+    black_pawn = -1,
+    black_knight = -2,
+    black_bishop = -3,
+    black_rook = -4,
+    black_queen = -5,
+    black_king = -6,
 
     /// Returns the UTF-8 glyph for this piece. Both colors use the filled
     /// (solid) glyph set — the U+265A..F range — and colors are distinguished
@@ -35,13 +35,13 @@ pub const Piece = enum(i8) {
     /// space so it can be dropped into the render buffer directly.
     pub fn glyph(self: Piece) []const u8 {
         return switch (self) {
-            .Empty => " ",
-            .WhitePawn, .BlackPawn => "\u{265F}",
-            .WhiteKnight, .BlackKnight => "\u{265E}",
-            .WhiteBhishop, .BlackBhishop => "\u{265D}",
-            .WhiteRook, .BlackRook => "\u{265C}",
-            .WhiteQueen, .BlackQueen => "\u{265B}",
-            .WhiteKing, .BlackKing => "\u{265A}",
+            .empty => " ",
+            .white_pawn, .black_pawn => "\u{265F}",
+            .white_knight, .black_knight => "\u{265E}",
+            .white_bishop, .black_bishop => "\u{265D}",
+            .white_rook, .black_rook => "\u{265C}",
+            .white_queen, .black_queen => "\u{265B}",
+            .white_king, .black_king => "\u{265A}",
         };
     }
 
@@ -49,9 +49,9 @@ pub const Piece = enum(i8) {
     /// this piece. Empty returns "" since nothing is drawn.
     pub fn fg(self: Piece) []const u8 {
         return switch (self) {
-            .Empty => "",
-            .WhitePawn, .WhiteKnight, .WhiteBhishop, .WhiteRook, .WhiteQueen, .WhiteKing => WHITE_PIECE_FG,
-            .BlackPawn, .BlackKnight, .BlackBhishop, .BlackRook, .BlackQueen, .BlackKing => BLACK_PIECE_FG,
+            .empty => "",
+            .white_pawn, .white_knight, .white_bishop, .white_rook, .white_queen, .white_king => WHITE_PIECE_FG,
+            .black_pawn, .black_knight, .black_bishop, .black_rook, .black_queen, .black_king => BLACK_PIECE_FG,
         };
     }
 };
@@ -61,8 +61,8 @@ pub const Piece = enum(i8) {
 /// black would be on the top of the screen and white would be on the bottom, and vice-versa for
 /// when the perspective is black.
 pub const Perspective = enum {
-    White,
-    Black,
+    white,
+    black,
 };
 
 /// Position of a piece on the board (rank, file).
@@ -81,8 +81,8 @@ pub const Board = struct {
 
     // This can likely be merged with board_state since it does have extra bits, that's an optimization I'll handle down the line.
     // 8x8 bits no need to waste so much space for this, each bit will represent whether that square is valid for that piece or not, at least that's what I'm aiming for.
-    /// Will encode move hints when a piece is selected.
-    board_overlay: [8]u1,
+    /// Highlights legal moves/squares once a piece is selected
+    board_overlay: u64,
 
     /// Width of a single cell in terminal character columns.
     width: usize,
@@ -94,10 +94,8 @@ pub const Board = struct {
     writer: BufWriter = .{},
 
     /// The perspective from which the board will be rendered. Defaults to White
-    perspective: Perspective = .White,
+    perspective: Perspective = .white,
 
-    // The bg_rgb and the fg_rgb always return 19 byte strings for convenience. If that changes we'll need to have two different variables to store each one.
-    const COLOR_SEQUENCE_LENGTH = 19;
     const LIGHT_BG = terminal_io.EscapeSequences.bg_rgb(184, 201, 134);
     const DARK_BG = terminal_io.EscapeSequences.bg_rgb(106, 138, 61);
     const RESET = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
@@ -180,17 +178,17 @@ pub const Board = struct {
     //
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
-        .{ .WhiteRook, .WhiteKnight, .WhiteBhishop, .WhiteQueen, .WhiteKing, .WhiteBhishop, .WhiteKnight, .WhiteRook },
+        .{ .white_rook, .white_knight, .white_bishop, .white_queen, .white_king, .white_bishop, .white_knight, .white_rook },
         .{.WhitePawn} ** 8,
         .{.Empty} ** 8,
         .{.Empty} ** 8,
         .{.Empty} ** 8,
         .{.Empty} ** 8,
         .{.BlackPawn} ** 8,
-        .{ .BlackRook, .BlackKnight, .BlackBhishop, .BlackQueen, .BlackKing, .BlackBhishop, .BlackKnight, .BlackRook },
+        .{ .black_rook, .black_knight, .black_bishop, .black_queen, .black_king, .black_bishop, .black_knight, .black_rook },
     };
 
-    const EMPTY_OVERLAY: [8]u1 = .{0} ** 8;
+    const EMPTY_OVERLAY: u64 = 0;
 
     /// Buffer writer to help draw the chess board on the terminal.
     const BufWriter = struct {
@@ -234,17 +232,20 @@ pub const Board = struct {
             .board_overlay = EMPTY_OVERLAY,
             .width = @as(usize, dimensions.width),
             .height = @as(usize, dimensions.height),
+            .writer = .{},
+            .perspective = .white,
         };
     }
 
-    /// Flips the perspective of the board, and re-draws it.
-    pub fn flip_perspective(self: *Board) !void {
+    /// Flips the perspective of the board. Doesn't redraw.
+    /// Call `draw` after if you want the change to be immediately available. Generally piped
+    /// with move, you'd move flip perspective and draw, so we batch two mutations.
+    /// See `play_turn` for the common composite.
+    pub fn flip_perspective(self: *Board) void {
         self.perspective = switch (self.perspective) {
-            .White => .Black,
-            .Black => .White,
+            .white => .black,
+            .black => .white,
         };
-
-        try self.draw();
     }
 
     /// Computes the per-cell width and height (in terminal character cells) for the largest chess board that fits in the current window.
@@ -278,8 +279,8 @@ pub const Board = struct {
         try self.writer.write_all("   ");
         const padding: usize = (self.width - 1) / 2;
         const letters = switch (self.perspective) {
-            .White => "abcdefgh",
-            .Black => "hgfedcba",
+            .white => "abcdefgh",
+            .black => "hgfedcba",
         };
 
         for (letters) |ch| {
@@ -344,12 +345,12 @@ pub const Board = struct {
         const total_width: usize = 6 + 8 * self.width;
         const label_padding_len: usize = (total_width - 5) / 2;
         const top_label = switch (self.perspective) {
-            .White => "BLACK\r\n\r\n",
-            .Black => "WHITE\r\n\r\n",
+            .white => "BLACK\r\n\r\n",
+            .black => "WHITE\r\n\r\n",
         };
         const bottom_lable = switch (self.perspective) {
-            .White => "WHITE\r\n",
-            .Black => "BLACK\r\n",
+            .white => "WHITE\r\n",
+            .black => "BLACK\r\n",
         };
 
         try self.writer.write_all(terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME);
@@ -359,8 +360,8 @@ pub const Board = struct {
         try self.write_file_labels();
 
         switch (self.perspective) {
-            .White => try self.write_white_perspective_rank_and_pieces(),
-            .Black => try self.write_black_perspective_rank_and_pieces(),
+            .white => try self.write_white_perspective_rank_and_pieces(),
+            .black => try self.write_black_perspective_rank_and_pieces(),
         }
 
         try self.write_file_labels();
@@ -460,12 +461,29 @@ pub const Board = struct {
         }
     }
 
-    pub fn move(self: *Board, old_position: Position, new_position: Position) !void {
-        const piece = self.board_state[old_position.rank][old_position.file];
-        std.debug.assert(piece != .Empty);
+    /// Mutates `board_state` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
+    /// new state to be visible call the redraw function.
+    /// See `play_turn` for the common composite.
+    pub fn move(self: *Board, from: Position, to: Position) void {
+        // Positions must refer to real squares on the board.
+        std.debug.assert(from.rank < 8 and from.file < 8);
+        std.debug.assert(to.rank < 8 and to.file < 8);
+        // A move that doesn't change the square is not a move.
+        std.debug.assert(from.rank != to.rank or from.file != to.file);
 
-        self.board_state[old_position.rank][old_position.file] = .Empty;
-        self.board_state[new_position.rank][new_position.file] = piece;
-        try self.flip_perspective();
+        const piece = self.board_state[from.rank][from.file];
+        // Can't move a piece that isn't there.
+        std.debug.assert(piece != .empty);
+
+        self.board_state[from.rank][from.file] = .empty;
+        self.board_state[to.rank][to.file] = piece;
+    }
+
+    /// Mutates the board state, moves a piece from `from` to `to`. Flips the perspective and
+    /// re-draws the board.
+    pub fn play_turn(self: *Board, from: Position, to: Position) !void {
+        self.move(from, to);
+        self.flip_perspective();
+        try self.draw();
     }
 };

@@ -22,9 +22,9 @@ pub fn main() !void {
     };
 
     for (moves) |move| {
-        // Sleep for 3 seconds before making each move.
+        // Sleep for 1 second before making each move.
         _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
-        try board.move(move[0], move[1]);
+        try board.play_turn(move[0], move[1]);
     }
 
     try term.start_input_loop();
