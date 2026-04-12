@@ -1,7 +1,8 @@
 const std = @import("std");
 const terminal_io = @import("terminal_io");
-const chess_board = @import("chess_board");
-const Position = chess_board.Position;
+const board_mod = @import("board");
+const board_renderer = @import("board_renderer");
+const Position = board_mod.Position;
 
 const ITERATIONS = 1000;
 
@@ -195,12 +196,16 @@ fn write_results_file(path: [*:0]const u8, data: []const u8) void {
 }
 
 pub fn main() !void {
-    var io = try terminal_io.TerminalIO.init();
+    var io: terminal_io.TerminalIO = undefined;
+    try io.init();
     try io.enable_raw_mode();
     defer io.restore_termios();
 
-    var board: chess_board.Board = undefined;
-    try board.init(io.window_config);
+    var board: board_mod.Board = undefined;
+    board.init();
+
+    var renderer: board_renderer.BoardRenderer = undefined;
+    try renderer.init(io.window_config);
 
     // Per-iteration nanosecond timings, filled during the loop and fed to
     // compute_stats afterwards. build = buffer construction, write = terminal
@@ -213,6 +218,9 @@ pub fn main() !void {
     // Should equal ITERATIONS if all frames were delivered to the pty buffer.
     var successful_writes: u32 = 0;
 
+    // Track the last frame's buffer size for reporting.
+    var last_frame_size: usize = 0;
+
     const move_count = moves.len;
     const wall_start = timestamp_ns();
 
@@ -221,26 +229,31 @@ pub fn main() !void {
 
         // Reset to starting position at the beginning of each cycle so every
         // set of moves is applied to a valid board. The reset is deliberately
-        // outside the timed region (draw captures its own metrics).
+        // outside the timed region.
         if (move_idx == 0) {
-            try board.init(io.window_config);
+            board.init();
         }
 
         const m = moves[move_idx];
         board.move(m[0], m[1]);
-        board.flip_perspective();
+        renderer.flip_perspective();
 
-        try board.draw();
+        const build_start = timestamp_ns();
+        const buffer = try renderer.draw(&board);
+        const build_ns = timestamp_ns() - build_start;
 
-        const metrics = board.frame_metrics.?;
-        build_samples[i] = metrics.build_ns;
-        write_samples[i] = metrics.write_ns;
-        total_samples[i] = metrics.build_ns + metrics.write_ns;
+        const write_start = timestamp_ns();
+        const write_result = terminal_io.TerminalIO.write(buffer);
+        const write_ns = timestamp_ns() - write_start;
+
+        build_samples[i] = build_ns;
+        write_samples[i] = write_ns;
+        total_samples[i] = build_ns + write_ns;
+
+        last_frame_size = buffer.len;
 
         // Track whether the write syscall succeeded (returned a positive byte count).
-        // draw() writes to stdout via TerminalIO.write which returns the result of the
-        // underlying write() syscall — positive means bytes were accepted by the pty.
-        if (metrics.write_ns > 0) successful_writes += 1;
+        if (write_result > 0) successful_writes += 1;
 
         // Sleep between frames so the terminal actually renders each one and
         // CPU caches cool down, giving realistic per-frame latency numbers.
@@ -257,7 +270,7 @@ pub fn main() !void {
         terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME,
     );
 
-    const size_kb = board.frame_metrics.?.size_kb;
+    const size_kb = @as(f64, @floatFromInt(last_frame_size)) / 1024.0;
     const elapsed = format_duration(wall_elapsed_ns);
     const delay_ms = @as(f64, @floatFromInt(FRAME_DELAY_NS)) / 1_000_000.0;
 

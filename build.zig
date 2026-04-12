@@ -58,16 +58,6 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
 
-    const enable_timing = b.option(
-        bool,
-        "enable_timing",
-        "Print per-frame build/write timing in draw(). Default: false.",
-    ) orelse false;
-
-    const options = b.addOptions();
-    options.addOption(bool, "enable_timing", enable_timing);
-    const options_mod = options.createModule();
-
     const exe = b.addExecutable(.{
         .name = "state_machines",
         .root_module = b.createModule(.{
@@ -90,7 +80,6 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "state_machines", .module = mod },
-                .{ .name = "build_options", .module = options_mod },
             },
         }),
     });
@@ -168,11 +157,7 @@ pub fn build(b: *std.Build) void {
 
     // Benchmark executable — runs 1000 draw/move/render iterations in real raw-mode terminal
     // and reports min/max/avg/p50/p99/stddev. Invoke with `zig build bench`.
-    const bench_options = b.addOptions();
-    bench_options.addOption(bool, "enable_timing", true);
-    const bench_options_mod = bench_options.createModule();
-
-    // chess_board.zig internally does @import("build_options") and @import("terminal_io.zig").
+    // board.zig internally does @import("terminal_io.zig").
     // When used as a named module root (rather than a relative import from main.zig), those
     // need to be wired as explicit named imports.
     const bench_terminal_io_mod = b.createModule(.{
@@ -181,13 +166,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const bench_chess_board_mod = b.createModule(.{
-        .root_source_file = b.path("src/chess_board.zig"),
+    const bench_board_mod = b.createModule(.{
+        .root_source_file = b.path("src/board.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "build_options", .module = bench_options_mod },
             .{ .name = "terminal_io.zig", .module = bench_terminal_io_mod },
+        },
+    });
+
+    const bench_board_renderer_mod = b.createModule(.{
+        .root_source_file = b.path("src/board_renderer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "terminal_io.zig", .module = bench_terminal_io_mod },
+            .{ .name = "board.zig", .module = bench_board_mod },
         },
     });
 
@@ -198,9 +192,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "build_options", .module = bench_options_mod },
                 .{ .name = "terminal_io", .module = bench_terminal_io_mod },
-                .{ .name = "chess_board", .module = bench_chess_board_mod },
+                .{ .name = "board", .module = bench_board_mod },
+                .{ .name = "board_renderer", .module = bench_board_renderer_mod },
             },
         }),
     });

@@ -7,6 +7,7 @@ pub const EscapeSequences = struct {
     pub const ERASE_TILL_END_OF_SCREEN = "\x1b[0J";
     pub const ERASE_TILL_BEGINNING_OF_SCREEN = "\x1b[1J";
     pub const CLEAR_SCREEN = "\x1b[2J";
+    pub const CLEAR_SCROLLBACK = "\x1b[3J";
 
     pub const ERASE_TILL_END_OF_LINE = "\x1b[0K";
     pub const ERASE_TILL_BEGINNING_OF_LINE = "\x1b[1K";
@@ -24,6 +25,38 @@ pub const EscapeSequences = struct {
     }
 };
 
+/// File-scope pointer to the TerminalIO instance's resize_pending flag.
+/// Signal handlers are callconv(.c) and cannot access struct fields directly, so we bridge through
+/// this pointer. Set during init(), cleared during restore_termios().
+var resize_pending_ptr: ?*std.atomic.Value(bool) = null;
+
+/// SIGWINCH handler sets a flag indicating resize is required.
+fn handle_sigwinch(_: std.posix.SIG) callconv(.c) void {
+    if (resize_pending_ptr) |ptr| {
+        ptr.store(true, .release);
+    }
+}
+
+/// Query current terminal window size via ioctl.
+/// Returns null if the ioctl fails or returns zero dimensions.
+fn query_winsize() ?std.posix.winsize {
+    var ws: std.posix.winsize = undefined;
+    const rc = std.posix.system.ioctl(
+        std.posix.STDOUT_FILENO,
+        std.posix.T.IOCGWINSZ,
+        &ws,
+    );
+    if (rc == -1) {
+        return null;
+    }
+
+    if (ws.row == 0 or ws.col == 0) {
+        return null;
+    }
+
+    return ws;
+}
+
 /// Struct to control terminal io.
 /// Holds the current window config and the original termios setting to reset back to.
 pub const TerminalIO = struct {
@@ -36,27 +69,35 @@ pub const TerminalIO = struct {
     /// Tracks whether or not this session is operating in raw mode or not.
     raw_mode_enabled: bool = false,
 
-    /// Returns a TerminalIO struct with the current termios and window config.
-    pub fn init() !TerminalIO {
+    /// Atomic flag set by the SIGWINCH handler when the terminal is resized.
+    resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Initializes the TerminalIO struct in-place with the current termios and window config.
+    /// Registers the SIGWINCH handler for terminal resize detection.
+    pub fn init(self: *TerminalIO) !void {
         const original_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        const window_config = query_winsize() orelse return error.WindowSizeUnavailable;
 
-        var window_config: std.posix.winsize = undefined;
-        const return_code = std.posix.system.ioctl(
-            std.posix.STDOUT_FILENO,
-            std.posix.T.IOCGWINSZ,
-            &window_config,
-        );
-
-        if (return_code == -1) {
-            return error.WindowSizeUnavailable;
-        }
-        std.debug.assert(window_config.row > 0 and window_config.col > 0);
-
-        return .{
+        self.* = .{
             .original_termios = original_termios,
             .window_config = window_config,
             .raw_mode_enabled = false,
         };
+
+        std.debug.assert(self.window_config.row > 0 and self.window_config.col > 0);
+        std.debug.assert(!self.raw_mode_enabled);
+
+        // Wire up the file-scope pointer so the signal handler can reach our flag.
+        resize_pending_ptr = &self.resize_pending;
+
+        // SA.RESTART: auto-restart interrupted syscalls (e.g., read in the input loop)
+        // after the signal, avoiding spurious EINTR handling.
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = handle_sigwinch },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.WINCH, &act, null);
     }
 
     /// Enables raw mode input processing.
@@ -135,7 +176,17 @@ pub const TerminalIO = struct {
     }
 
     /// Restore the termios setting to the original termios settings.
+    /// Deregisters the SIGWINCH handler.
     pub fn restore_termios(self: *TerminalIO) void {
+        // Restore default SIGWINCH handling.
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.WINCH, &act, null);
+        resize_pending_ptr = null;
+
         std.posix.tcsetattr(
             std.posix.STDIN_FILENO,
             std.posix.TCSA.FLUSH,
@@ -149,14 +200,40 @@ pub const TerminalIO = struct {
         std.debug.assert(!self.raw_mode_enabled);
     }
 
+    /// Checks if a terminal resize occurred since the last check. If so, re-queries the window size
+    /// and updates window_config. Returns the new winsize, or null if no resize happened.
+    pub fn check_resize(self: *TerminalIO) ?std.posix.winsize {
+        // Atomically read and clear the flag in one operation, preventing a race where a second
+        // SIGWINCH arrives between a separate load and store.
+        if (self.resize_pending.swap(false, .acquire)) {
+            if (query_winsize()) |ws| {
+                self.window_config = ws;
+                return ws;
+            }
+        }
+        return null;
+    }
+
+    /// Callback invoked when the terminal is resized. Receives the new window size.
+    pub const ResizeCallback = *const fn (std.posix.winsize) void;
+
     /// Starts an infinite loop of input reading. Reads character by character until the user
     /// inputs 'q', at which point the loop terminates.
     ///
+    /// If `on_resize` is provided, it will be called whenever a terminal resize is detected,
+    /// passing the new window dimensions.
+    ///
     /// Requires the terminal to be in raw mode for this to work.
-    pub fn start_input_loop(self: *TerminalIO) !void {
+    pub fn start_input_loop(self: *TerminalIO, on_resize: ?ResizeCallback) !void {
         std.debug.assert(self.raw_mode_enabled);
 
         while (true) {
+            if (self.check_resize()) |new_ws| {
+                if (on_resize) |callback| {
+                    callback(new_ws);
+                }
+            }
+
             var c: u8 = 0;
             const nread = std.posix.read(
                 std.posix.STDIN_FILENO,

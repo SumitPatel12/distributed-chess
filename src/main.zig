@@ -1,17 +1,30 @@
 const std = @import("std");
 const state_machines = @import("state_machines");
 const terminal_io = @import("terminal_io.zig");
-const chess_board = @import("chess_board.zig");
-const Position = chess_board.Position;
+const board_mod = @import("board.zig");
+const board_renderer = @import("board_renderer.zig");
+const Position = board_mod.Position;
+
+var board: board_mod.Board = undefined;
+var renderer: board_renderer.BoardRenderer = undefined;
+
+fn handle_resize(new_ws: std.posix.winsize) void {
+    renderer.resize(new_ws) catch return;
+    const buf = renderer.draw(&board) catch return;
+    _ = terminal_io.TerminalIO.write(buf);
+}
 
 pub fn main() !void {
-    var io = try terminal_io.TerminalIO.init();
+    var io: terminal_io.TerminalIO = undefined;
+    try io.init();
     try io.enable_raw_mode();
     defer io.restore_termios();
 
-    var board: chess_board.Board = undefined;
-    try board.init(io.window_config);
-    try board.draw();
+    board.init();
+    try renderer.init(io.window_config);
+
+    const buffer = try renderer.draw(&board);
+    _ = terminal_io.TerminalIO.write(buffer);
 
     const moves = [_][2]Position{
         .{ .{ .rank = 1, .file = 3 }, .{ .rank = 3, .file = 3 } },
@@ -24,8 +37,11 @@ pub fn main() !void {
 
     for (moves) |move| {
         _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
-        try board.play_turn(move[0], move[1]);
+        board.move(move[0], move[1]);
+        renderer.flip_perspective();
+        const buf = try renderer.draw(&board);
+        _ = terminal_io.TerminalIO.write(buf);
     }
 
-    try io.start_input_loop();
+    try io.start_input_loop(handle_resize);
 }
