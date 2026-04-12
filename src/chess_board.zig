@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const terminal_io = @import("terminal_io.zig");
 
 const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
@@ -80,6 +81,8 @@ pub const Perspective = enum {
 };
 
 /// Position of a piece on the board (rank, file).
+/// Is encoded as u3 max value of 7 matching the rank and file max of 8. Indexing starts from 0 so 7
+/// is sufficient.
 pub const Position = struct {
     rank: u3,
     file: u3,
@@ -114,6 +117,9 @@ pub const Board = struct {
 
     /// The perspective from which the board will be rendered. Defaults to White
     perspective: Perspective = .white,
+
+    /// Per-frame timing metrics, populated after each draw() when enable_timing is set.
+    frame_metrics: ?FrameMetrics = null,
 
     const LIGHT_BG = terminal_io.EscapeSequences.bg_rgb(184, 201, 134);
     const DARK_BG = terminal_io.EscapeSequences.bg_rgb(106, 138, 61);
@@ -199,8 +205,8 @@ pub const Board = struct {
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
         .{
-            .white_rook,  .white_knight, .white_bishop, .white_queen,
-            .white_king,  .white_bishop, .white_knight, .white_rook,
+            .white_rook, .white_knight, .white_bishop, .white_queen,
+            .white_king, .white_bishop, .white_knight, .white_rook,
         },
         .{.white_pawn} ** 8,
         .{.empty} ** 8,
@@ -209,8 +215,8 @@ pub const Board = struct {
         .{.empty} ** 8,
         .{.black_pawn} ** 8,
         .{
-            .black_rook,  .black_knight, .black_bishop, .black_queen,
-            .black_king,  .black_bishop, .black_knight, .black_rook,
+            .black_rook, .black_knight, .black_bishop, .black_queen,
+            .black_king, .black_bishop, .black_knight, .black_rook,
         },
     };
 
@@ -263,9 +269,11 @@ pub const Board = struct {
         unit: []const u8,
     };
 
-    /// Stats captured while building the render buffer for a single frame.
-    const BuildStats = struct {
-        ns: u64,
+    /// Timing and size metrics captured for a single frame. Only populated when the
+    /// build_options.enable_timing flag is set.
+    pub const FrameMetrics = struct {
+        build_ns: u64,
+        write_ns: u64,
         size_kb: f64,
     };
 
@@ -367,48 +375,62 @@ pub const Board = struct {
 
     /// Draws the current board state to the terminal
     pub fn draw(self: *Board) !void {
-        // The buffer will be build anew for each move, reset len just resets the current
-        // index/cursor of the buffer writer. I thought this would not be good for performance,
-        // turns out I was wrong. The average times for writing the the buffer writer and rendering
-        // it to the screen are as below, these values are of-course based on my machine which is a
-        // base M3 Pro.
-        //      Buffer Write Time      : 65 µs
-        //      Render To Terminal Time: 500 µs
+        // The buffer is built anew for each move, reset_len just resets the cursor of the buffer
+        // writer. I thought this would not be good for performance, turns out I was wrong.
         //
-        // Sub milisecond times are not detectable by human eye. If you can, I think you're in the
+        // Benchmark results (Apple M3 Pro, 18 GB, 500 iterations, 16 ms inter-frame delay,
+        // 5.82 KB/frame):
+        //      Buffer Build Time       : avg ~50 µs   (p99 ~92 µs)
+        //      Terminal Write Time     : avg ~306 µs  (p99 ~587 µs)
+        //      Total (build + write)   : avg ~356 µs  (p99 ~626 µs)
+        //
+        // The ~306 µs write cost is the real terminal I/O — pushing ~5.8 KB of escape sequences
+        // through the pty. We run the benchmark with a 16ms delay in a loop to ensure each frame
+        // does indeed get rendered. At least that's what I was hoping for.
+        //
+        // Sub millisecond times are not detectable by human eye. If you can, I think you're in the
         // wrong career. You shouldn't be reading this code heh.
         self.writer.reset_len();
         std.debug.assert(self.writer.len == 0);
 
-        const build_stats = try self.create_board_buffer();
+        const build_start = if (build_options.enable_timing) timestamp_ns() else 0;
+        try self.create_board_buffer();
+        const build_ns = if (build_options.enable_timing) timestamp_ns() - build_start else 0;
         std.debug.assert(self.writer.len > 0);
 
-        const write_start = timestamp_ns();
+        const write_start = if (build_options.enable_timing) timestamp_ns() else 0;
         const result_code = terminal_io.TerminalIO.write(self.writer.written());
-        const write_ns = timestamp_ns() - write_start;
+        const write_ns = if (build_options.enable_timing) timestamp_ns() - write_start else 0;
 
         if (result_code == -1) {
             std.debug.print("Failed to render to the terminal.", .{});
         }
 
-        // These prints must come after the terminal write, because the buffer begins with
-        // CLEAR_SCREEN — printing them before the write would put them on screen just long
-        // enough to get wiped by the clear.
-        const build = format_duration(build_stats.ns);
-        std.debug.print("buffer build: {d} {s} ({d:.2} KB) | ", .{
-            build.value,
-            build.unit,
-            build_stats.size_kb,
-        });
-        const write = format_duration(write_ns);
-        std.debug.print("terminal write: {d} {s}\r\n", .{ write.value, write.unit });
+        if (build_options.enable_timing) {
+            const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
+            self.frame_metrics = .{
+                .build_ns = build_ns,
+                .write_ns = write_ns,
+                .size_kb = size_kb,
+            };
+
+            // These prints must come after the terminal write, because the buffer begins with
+            // CLEAR_SCREEN — printing them before the write would put them on screen just long
+            // enough to get wiped by the clear.
+            const build = format_duration(build_ns);
+            std.debug.print("buffer build: {d} {s} ({d:.2} KB) | ", .{
+                build.value,
+                build.unit,
+                size_kb,
+            });
+            const write = format_duration(write_ns);
+            std.debug.print("terminal write: {d} {s}\r\n", .{ write.value, write.unit });
+        }
     }
 
-    fn create_board_buffer(self: *Board) !BuildStats {
+    fn create_board_buffer(self: *Board) !void {
         std.debug.assert(self.width >= 3);
         std.debug.assert(self.height >= 1);
-
-        const build_start = timestamp_ns();
 
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
         // Centered 5-char label: (total - 5) / 2 spaces of left padding.
@@ -441,10 +463,6 @@ pub const Board = struct {
         try self.writer.write_all("\r\n");
         try self.writer.write_byte_n(' ', label_padding_len);
         try self.writer.write_all(bottom_label);
-
-        const size_kb = @as(f64, @floatFromInt(self.writer.len)) / 1024.0;
-        const build_ns = timestamp_ns() - build_start;
-        return .{ .ns = build_ns, .size_kb = size_kb };
     }
 
     /// Writes the rank labels and piece cells for the entire board, honoring the current
