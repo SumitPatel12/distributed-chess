@@ -1,3 +1,21 @@
+// I think this benchmark is an accurate representation of what I want but I'm not a 100% sure.
+//
+// So what it's aiming to time is:
+//  1. How long does it take the build the buffer arrya in bytes. (The byte sequence we send to the
+//     terminal for rendering the board). That I'm confident it measures correctly cause it's just one
+//     function and wrapping with time metrics should do the trick.
+//
+//  2. Timing how long the terminal takes to draw it. This one's a bit trickier cause I don't konw
+//     if the write calls returns after the terminal is done rendering or just returns as soon as
+//     it's queued the thing.
+//     I suspect it's the 2nd because when I tried it without sleep of 16ms a lot of frames were
+//     lost or so it seemed to me.
+//
+// So take this benchmark with a fistful of salt for the w and b+w times.
+//
+// TODO: Find out a better way to test the render times.
+//
+
 const std = @import("std");
 const terminal_io = @import("terminal_io");
 const board_mod = @import("board");
