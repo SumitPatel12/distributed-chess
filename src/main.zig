@@ -3,7 +3,7 @@ const state_machines = @import("state_machines");
 const terminal_io = @import("terminal_io.zig");
 const board_mod = @import("board.zig");
 const board_renderer = @import("board_renderer.zig");
-const Position = board_mod.Position;
+const Position = @import("shared.zig").Position;
 
 var board: board_mod.Board = undefined;
 var renderer: board_renderer.BoardRenderer = undefined;

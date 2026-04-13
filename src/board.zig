@@ -1,5 +1,8 @@
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
+const shared = @import("shared.zig");
+const Color = shared.Color;
+const Position = shared.Position;
 
 const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
 const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
@@ -30,6 +33,23 @@ pub const Piece = enum(i8) {
     black_rook = -4,
     black_queen = -5,
     black_king = -6,
+
+    pub fn color(self: Piece) ?Color {
+        const int_value = @intFromEnum(self);
+        std.debug.assert(int_value >= -6 and int_value <= 6);
+
+        if (int_value == 0) {
+            return null;
+        }
+
+        if (int_value > 0) {
+            return .white;
+        }
+
+        if (int_value < 0) {
+            return .black;
+        }
+    }
 
     /// Returns the UTF-8 glyph for this piece. Both colors use the filled
     /// (solid) glyph set — the U+265A..F range — and colors are distinguished
@@ -68,14 +88,6 @@ pub const Piece = enum(i8) {
             => BLACK_PIECE_FG,
         };
     }
-};
-
-/// Position of a piece on the board (rank, file).
-/// Is encoded as u3 max value of 7 matching the rank and file max of 8. Indexing starts from 0 so 7
-/// is sufficient.
-pub const Position = struct {
-    rank: u3,
-    file: u3,
 };
 
 /// Encodes the current board.
@@ -185,6 +197,12 @@ pub const Board = struct {
         };
     }
 
+    // Move doesn't consider any rule logic because I've decided to leave that up to the game
+    // struct. I wanted to keep the board as just a dumb array that would make the moves its told.
+    // Additionally move history captures, etc would live on the game struct and not the board, and
+    // then move would have to return captured pieces, encode en-passant, castling and that gets
+    // difficult fast. At least that's what I imagine, hence the dumb state board.
+    //
     /// Mutates `board_state` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
     /// new state to be visible call the redraw function.
     pub fn move(self: *Board, from: Position, to: Position) void {

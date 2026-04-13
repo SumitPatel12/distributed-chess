@@ -20,7 +20,7 @@ const std = @import("std");
 const terminal_io = @import("terminal_io");
 const board_mod = @import("board");
 const board_renderer = @import("board_renderer");
-const Position = board_mod.Position;
+const Position = @import("shared.zig").Position;
 
 const ITERATIONS = 1000;
 

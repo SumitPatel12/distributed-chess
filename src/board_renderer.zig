@@ -3,15 +3,8 @@ const terminal_io = @import("terminal_io.zig");
 const board_mod = @import("board.zig");
 const Piece = board_mod.Piece;
 const Board = board_mod.Board;
-
-/// Perspective that drives how the board will be rendered on the screen.
-/// Whichever is selected will be rendered towards the user, i.e. if perspective was white then
-/// black would be on the top of the screen and white would be on the bottom, and vice-versa for
-/// when the perspective is black.
-pub const Perspective = enum {
-    white,
-    black,
-};
+const Color = @import("shared.zig").Color;
+const BoundedArray = @import("bounded_array.zig").BoundedArray;
 
 pub const BoardRenderer = struct {
     // 8x8 bits, each bit represents whether that square is valid for the selected piece or not.
@@ -24,12 +17,13 @@ pub const BoardRenderer = struct {
     /// Height of a single cell in terminal character rows.
     height: u16,
 
-    /// Buffer writer for building the rendered board frame. Takes care of storing the byte sequence
+    /// Buffer for building the rendered board frame. Takes care of storing the byte sequence
     /// used to render the board to the terminal.
-    writer: BufWriter = .{},
+    writer: BoundedArray(u8, RENDER_BUFFER_SIZE) = .{},
 
-    /// The perspective from which the board will be rendered. Defaults to White
-    perspective: Perspective = .white,
+    /// The perspective from which the board will be rendered. Defaults to White.
+    /// Whichever is selected will be drawn on the lower side of the screen.
+    perspective: Color = .white,
 
     const LIGHT_BG = terminal_io.EscapeSequences.bg_rgb(184, 201, 134);
     const DARK_BG = terminal_io.EscapeSequences.bg_rgb(106, 138, 61);
@@ -46,43 +40,6 @@ pub const BoardRenderer = struct {
         .{ .width = 11, .height = 5 },
         .{ .width = 7, .height = 3 },
         .{ .width = 3, .height = 1 },
-    };
-
-    /// Buffer writer to help draw the chess board on the terminal.
-    const BufWriter = struct {
-        buf: [RENDER_BUFFER_SIZE]u8 = undefined,
-        /// Number of bytes currently held in `buf`; also the position where
-        /// the next append will start.
-        len: usize = 0,
-
-        /// Resets the buffer length so it can be reused for the next draw.
-        fn reset_len(self: *BufWriter) void {
-            self.len = 0;
-        }
-
-        /// Appends bytes to the end of the buffer.
-        /// In case of overflow returns RenderBufferOverflow error.
-        fn write_all(self: *BufWriter, bytes: []const u8) !void {
-            if (self.len + bytes.len > self.buf.len) return error.RenderBufferOverflow;
-            @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
-            self.len += bytes.len;
-            std.debug.assert(self.len <= self.buf.len);
-        }
-
-        /// Sets the next n bytes of the buffer to the provided byte value.
-        /// In case of overflow returns RenderBufferOverflow error.
-        fn write_byte_n(self: *BufWriter, byte: u8, n: usize) !void {
-            if (self.len + n > self.buf.len) return error.RenderBufferOverflow;
-            @memset(self.buf[self.len .. self.len + n], byte);
-            self.len += n;
-            std.debug.assert(self.len <= self.buf.len);
-        }
-
-        /// Returns the contents stored in the buffer up to the current length.
-        fn written(self: *const BufWriter) []const u8 {
-            std.debug.assert(self.len <= self.buf.len);
-            return self.buf[0..self.len];
-        }
     };
 
     /// Per-cell dimensions in terminal character cells, as computed from the current window.
@@ -153,7 +110,7 @@ pub const BoardRenderer = struct {
     fn write_file_labels(self: *BoardRenderer) !void {
         std.debug.assert(self.width >= 3);
 
-        try self.writer.write_all("   ");
+        try self.writer.append_slice("   ");
         const padding: usize = (self.width - 1) / 2;
         const letters = switch (self.perspective) {
             .white => "abcdefgh",
@@ -161,11 +118,11 @@ pub const BoardRenderer = struct {
         };
 
         for (letters) |ch| {
-            try self.writer.write_byte_n(' ', padding);
-            try self.writer.write_all(&[_]u8{ch});
-            try self.writer.write_byte_n(' ', padding);
+            try self.writer.append_n_times(' ', padding);
+            try self.writer.append_slice(&[_]u8{ch});
+            try self.writer.append_n_times(' ', padding);
         }
-        try self.writer.write_all("\r\n");
+        try self.writer.append_slice("\r\n");
     }
 
     /// Builds the rendered board buffer and returns it. Caller writes it to the terminal.
@@ -185,12 +142,12 @@ pub const BoardRenderer = struct {
         //
         // Sub millisecond times are not detectable by human eye. If you can, I think you're in the
         // wrong career. You shouldn't be reading this code heh.
-        self.writer.reset_len();
+        self.writer.reset();
         std.debug.assert(self.writer.len == 0);
 
         try self.create_board_buffer(board);
         std.debug.assert(self.writer.len > 0);
-        return self.writer.written();
+        return self.writer.slice();
     }
 
     fn create_board_buffer(self: *BoardRenderer, board: *const Board) !void {
@@ -218,9 +175,9 @@ pub const BoardRenderer = struct {
         const clear_and_home = terminal_io.EscapeSequences.CLEAR_SCREEN ++
             terminal_io.EscapeSequences.CLEAR_SCROLLBACK ++
             terminal_io.EscapeSequences.SET_CURSOR_TO_HOME;
-        try self.writer.write_all(clear_and_home);
-        try self.writer.write_byte_n(' ', label_padding_len);
-        try self.writer.write_all(top_label);
+        try self.writer.append_slice(clear_and_home);
+        try self.writer.append_n_times(' ', label_padding_len);
+        try self.writer.append_slice(top_label);
 
         try self.write_file_labels();
 
@@ -228,9 +185,9 @@ pub const BoardRenderer = struct {
 
         try self.write_file_labels();
 
-        try self.writer.write_all("\r\n");
-        try self.writer.write_byte_n(' ', label_padding_len);
-        try self.writer.write_all(bottom_label);
+        try self.writer.append_slice("\r\n");
+        try self.writer.append_n_times(' ', label_padding_len);
+        try self.writer.append_slice(bottom_label);
     }
 
     /// Writes the rank labels and piece cells for the entire board, honoring the current
@@ -270,7 +227,7 @@ pub const BoardRenderer = struct {
                 // Rank digit on the middle sub-row only, blank margin otherwise.
                 const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
 
-                try self.writer.write_all(side_margin);
+                try self.writer.append_slice(side_margin);
 
                 for (0..8) |col_draw| {
                     const file: usize = switch (self.perspective) {
@@ -280,22 +237,22 @@ pub const BoardRenderer = struct {
 
                     const piece = board.board_state[rank][file];
                     const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
-                    try self.writer.write_all(bg);
+                    try self.writer.append_slice(bg);
                     // Middle row holds the glyph with some padding to center it
                     if (sub_row == mid_sub) {
-                        try self.writer.write_byte_n(' ', padding);
-                        try self.writer.write_all(piece.fg());
-                        try self.writer.write_all(piece.glyph());
-                        try self.writer.write_byte_n(' ', padding);
+                        try self.writer.append_n_times(' ', padding);
+                        try self.writer.append_slice(piece.fg());
+                        try self.writer.append_slice(piece.glyph());
+                        try self.writer.append_n_times(' ', padding);
                     } else {
-                        try self.writer.write_byte_n(' ', self.width);
+                        try self.writer.append_n_times(' ', self.width);
                     }
                 }
 
                 // The labeling is on both sides.
-                try self.writer.write_all(RESET);
-                try self.writer.write_all(side_margin);
-                try self.writer.write_all("\r\n");
+                try self.writer.append_slice(RESET);
+                try self.writer.append_slice(side_margin);
+                try self.writer.append_slice("\r\n");
             }
         }
     }

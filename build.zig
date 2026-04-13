@@ -166,12 +166,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const bench_shared_mod = b.createModule(.{
+        .root_source_file = b.path("src/shared.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const bench_bounded_array_mod = b.createModule(.{
+        .root_source_file = b.path("src/bounded_array.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const bench_board_mod = b.createModule(.{
         .root_source_file = b.path("src/board.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "terminal_io.zig", .module = bench_terminal_io_mod },
+            .{ .name = "shared.zig", .module = bench_shared_mod },
         },
     });
 
@@ -182,6 +195,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "terminal_io.zig", .module = bench_terminal_io_mod },
             .{ .name = "board.zig", .module = bench_board_mod },
+            .{ .name = "shared.zig", .module = bench_shared_mod },
+            .{ .name = "bounded_array.zig", .module = bench_bounded_array_mod },
         },
     });
 
@@ -195,6 +210,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "terminal_io", .module = bench_terminal_io_mod },
                 .{ .name = "board", .module = bench_board_mod },
                 .{ .name = "board_renderer", .module = bench_board_renderer_mod },
+                .{ .name = "shared.zig", .module = bench_shared_mod },
             },
         }),
     });
