@@ -1,9 +1,13 @@
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
+const shared = @import("shared.zig");
+const game_mod = @import("game.zig");
+
 const board_mod = @import("board.zig");
-const Piece = board_mod.Piece;
 const Board = board_mod.Board;
-const Color = @import("shared.zig").Color;
+const Piece = board_mod.Piece;
+const Game = game_mod.Game;
+const Color = shared.Color;
 const BoundedArray = @import("bounded_array.zig").BoundedArray;
 
 pub const BoardRenderer = struct {
@@ -126,7 +130,8 @@ pub const BoardRenderer = struct {
     }
 
     /// Builds the rendered board buffer and returns it. Caller writes it to the terminal.
-    pub fn draw(self: *BoardRenderer, board: *const Board) ![]const u8 {
+    pub fn draw(self: *BoardRenderer, game: *const Game) ![]const u8 {
+        const board = &game.board;
         // The buffer is built anew for each move, reset_len just resets the cursor of the buffer
         // writer. I thought this would not be good for performance, turns out I was wrong.
         //

@@ -270,7 +270,8 @@ pub const TerminalIO = struct {
     }
 
     /// Write out given buffer to the terminal.
-    pub fn write(buffer: []const u8) isize {
+    pub fn write(self: *const TerminalIO, buffer: []const u8) isize {
+        _ = self;
         std.debug.assert(buffer.len > 0);
         return std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
     }
