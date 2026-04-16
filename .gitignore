@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 tmp/
+.obsidian/
 
 # OS
 .DS_Store
