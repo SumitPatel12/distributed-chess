@@ -1,3 +1,5 @@
+//! Holds the shared structures that are required across multiple modules.
+
 pub const Color = enum {
     white,
     black,

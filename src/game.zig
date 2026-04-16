@@ -1,3 +1,6 @@
+//! The top level game structure that keeps track of the complete game state, including players,
+//! board, game result, and any other things related to the game.
+
 const std = @import("std");
 const board_mod = @import("board.zig");
 const BoundedArray = @import("bounded_array.zig").BoundedArray;

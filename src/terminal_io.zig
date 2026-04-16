@@ -1,3 +1,9 @@
+//! Sets the terminal in raw mode, keeps track of original termios settings, and declares the most
+//! commonly used escape sequences. It also registers a window change call that helps re-render the
+//! board when the window is resized.
+//!
+//! Also handles writing to the terminal as well.
+
 const std = @import("std");
 
 /// Struct containing the most common Escape Sequences for terminal commands.

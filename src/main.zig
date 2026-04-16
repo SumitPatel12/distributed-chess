@@ -1,3 +1,6 @@
+//! Handles creating the game, running the input loop and orchestrating the side-effects from the
+//! state machine that is the game.
+
 const std = @import("std");
 const state_machines = @import("state_machines");
 const terminal_io = @import("terminal_io.zig");

@@ -1,3 +1,6 @@
+//! Benchmark to check how fast the game can apply rules and spit out the byte sequence for the
+//! board state.
+
 // TODO: Update/Fix the benchmark once the complete loop setup is in place.
 //
 // I think this benchmark is an accurate representation of what I want but I'm not a 100% sure.

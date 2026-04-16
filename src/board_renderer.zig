@@ -1,3 +1,6 @@
+//! Takes in the Game struct and returns the byte sequence representing the current state of the
+//! board.
+
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
 const shared = @import("shared.zig");

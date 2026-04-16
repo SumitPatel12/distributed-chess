@@ -1,3 +1,6 @@
+//! Fixed capacity comptime array with no dynamic allocation. Tracks current size and errors out
+//! when you try to write beyond the initially declared capacity.
+
 /// A fixed-capacity array that tracks how many elements have been written.
 /// No allocator needed — the buffer lives inline at comptime-known size.
 pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {

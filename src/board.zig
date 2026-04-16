@@ -1,3 +1,6 @@
+//! Tracks the piece placement on the board, doesn't apply any ruled logic. This is just a dumb
+//! state.
+
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
 const shared = @import("shared.zig");
