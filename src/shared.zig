@@ -1,15 +1,19 @@
 //! Holds the shared structures that are required across multiple modules.
 
+const std = @import("std");
+
 pub const Color = enum {
     white,
     black,
 
     pub fn opponent(self: Color) Color {
-        if (self == .white) {
-            return .black;
-        } else {
-            return .white;
-        }
+        const result: Color = switch (self) {
+            .white => .black,
+            .black => .white,
+        };
+
+        std.debug.assert(result != self);
+        return result;
     }
 };
 

@@ -252,10 +252,15 @@ pub const Game = struct {
 
     /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
-        switch (color) {
-            .white => return GameState{ .playing = .{ .local_turn = .idle } },
-            .black => return GameState{ .playing = .{ .remote_turn = .waiting } },
-        }
+        const state: GameState = switch (color) {
+            .white => GameState{ .playing = .{ .local_turn = .idle } },
+            .black => GameState{ .playing = .{ .remote_turn = .waiting } },
+        };
+
+        std.debug.assert(state == .playing);
+        std.debug.assert((color == .white) == (state.playing == .local_turn));
+
+        return state;
     }
 
     /// Initializes the Game struct in place.
@@ -289,6 +294,9 @@ pub const Game = struct {
     /// For now invalid events will end in panic, will be handled down the line.
     pub fn tick(self: *Game, event: GameEvent) BoundedArray(GameEffect, MAX_EFFECTS) {
         // TODO: Wire up logic for each event
+        std.debug.assert(self.expected_seq >= 1);
+        std.debug.assert(self.position_hash.len <= MAX_LOG);
+
         _ = event;
         const effects: BoundedArray(GameEffect, MAX_EFFECTS) = .{};
 
