@@ -322,5 +322,5 @@ pub fn main() void {}
 //     std.debug.print("{s}", .{results.contents()});
 
 //     // Also persist to file for later reference.
-//     write_results_file("tmp/bench_results.txt", results.contents());
+//     write_results_file("tmp/bench/bench_results.txt", results.contents());
 // }

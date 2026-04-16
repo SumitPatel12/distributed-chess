@@ -222,4 +222,9 @@ pub const Board = struct {
         std.debug.assert(self.board_state[from.rank][from.file] == .empty);
         std.debug.assert(self.board_state[to.rank][to.file] == piece);
     }
+
+    /// Set's the given position to empty. Will be required for en-passant.
+    pub fn clear(self: *Board, position: Position) void {
+        self.board_state[position.rank][position.file] = .empty;
+    }
 };

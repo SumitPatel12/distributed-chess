@@ -5,6 +5,7 @@ const shared = @import("shared.zig");
 const Color = shared.Color;
 const Board = board_mod.Board;
 const Move = shared.Move;
+const Position = shared.Position;
 const Piece = board_mod.Piece;
 
 pub const GameResult = enum {
@@ -17,7 +18,6 @@ pub const GameResult = enum {
     /// One of the players resigned.
     resignation,
 
-    // I'm not sure if I store who offered the draw, maybe a tagged enum?
     /// A player proposed a draw and the opponent accepted.
     draw_by_agreement,
 
@@ -32,12 +32,15 @@ pub const GameResult = enum {
     /// materials on the board.
     draw_insufficient_material,
 
+    /// Flag-fall: one player's clock hit zero. The connected player wins.
+    timeout,
+
     /// Awards the player a win if the opponent disconnected and didn't reconnect for a certain
     /// period of time.
-    disconnected,
+    disconnect,
 
     /// Both players disconnected and failed to reconnect, we declare that as a draw.
-    disconnected_both,
+    disconnect_both,
 };
 
 /// It's this players turn.
@@ -58,6 +61,18 @@ pub const RemoteTurn = enum {
 pub const Playing = union(enum) {
     local_turn: LocalTurn,
     remote_turn: RemoteTurn,
+
+    /// A draw has been offered and we're waiting on the other side to accept/decline.
+    /// `offered_by` is the color that sent the offer — either side can be the offerer
+    /// (both replicas enter this state on the same command, differing only in local_color).
+    /// Any move by the offerer implicitly withdraws the offer; any move by the other side
+    /// implicitly declines.
+    awaiting_draw_response: struct { offered_by: Color },
+};
+
+pub const PausedDisconnected = struct {
+    was: Playing,
+    deadline_ms: u32,
 };
 
 /// The state of the game. Can be playing, ended, or disconnected.
@@ -66,10 +81,13 @@ const GameState = union(enum) {
     playing: Playing,
 
     /// One of the players is disconnected.
-    paused_disconnected,
+    paused_disconnected: PausedDisconnected,
 
-    /// Game is over with the result stored in the enum.
-    game_over: GameResult,
+    /// Game is over with the result stored in the enum. `final_seq` pins the exact RSM
+    /// command that ended the game — used for rematch setup (start from final_seq + 1), for
+    /// persistence, and for disambiguating commands that share a move_number (e.g. a move
+    /// and a resignation both issued during move 30 are distinct commands, distinct seqs).
+    game_over: struct { result: GameResult, winner: ?Color, final_seq: u32 },
 };
 
 pub const DrawClaim = enum {
@@ -120,6 +138,10 @@ pub const LogEntry = struct {
 pub const NackReason = enum {
     illegal_move,
     out_of_turn,
+
+    /// Receiver's state diverged from sender's — the command was valid on the sender's view
+    /// but not on the receiver's. Triggers the resync recovery path (request_resync effect,
+    /// transition to paused_disconnected). Not a bug — a distributed-systems runtime condition.
     state_desync,
 };
 
@@ -153,6 +175,8 @@ pub const GameEvent = union(enum) {
 
     peer_disconnected,
     peer_reconnected,
+    disconnect_timer_expired,
+    proposal_timeout,
 };
 
 pub const GameEffect = union(enum) {
@@ -166,6 +190,9 @@ pub const GameEffect = union(enum) {
     /// the win if the opponent fails to reconnect within a certain time period.
     start_disconnect_timer: u32,
 };
+
+// TODO: After understanding what is requied a bit more populate this struct.
+const CastlingRights = struct {};
 
 /// Represents the game being played. Holds the complete data of the game including players move
 /// history, game state, the log for the RSM.
@@ -198,9 +225,27 @@ pub const Game = struct {
     /// Pieces black has captured from white. Same bound and reasoning as captures_by_white.
     captures_by_black: BoundedArray(Piece, 15),
 
-    // TODO: Castling, en_passant, RSM Log
+    /// Position has that tracks if the position has been repeated, required for three-fold
+    /// repetition draw rule.
+    position_hash: BoundedArray(u64, MAX_LOG),
 
-    const MAX_EFFECTS = 8;
+    /// The next expected sequence number.
+    expected_seq: u32,
+
+    /// Castling Rights, whether a player has them or not.
+    castling_rights: CastlingRights,
+
+    /// The square an opposing pawn could capture to, if the last move was a two-square pawn
+    /// advance. Cleared on every move that doesn't create a new en-passant target.
+    en_passant_square: ?Position,
+
+    /// Upper bound on effects emitted by a single tick(). 16 leaves headroom for paths that
+    /// stack multiple effects (e.g. send_ack + apply + render + game_ended + start_*_timer).
+    const MAX_EFFECTS = 16;
+
+    /// Upper bound on command-log and position-hash entries. 512 is ample for a real chess
+    /// game (longest practical games run ~300 half-moves; the fifty-move rule caps growth).
+    const MAX_LOG = 512;
 
     /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
@@ -221,11 +266,18 @@ pub const Game = struct {
             .player_color = player_color,
             .captures_by_white = .{},
             .captures_by_black = .{},
+            .position_hash = .{},
+            .expected_seq = 1,
+            .castling_rights = .{},
+            .en_passant_square = null,
         };
         self.board.init();
         std.debug.assert(self.current_turn == .white);
         std.debug.assert(self.captures_by_black.len == 0);
         std.debug.assert(self.captures_by_white.len == 0);
+        std.debug.assert(self.position_hash.len == 0);
+        std.debug.assert(self.en_passant_square == null);
+        std.debug.assert(self.expected_seq == 1);
     }
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
@@ -246,6 +298,7 @@ pub const Game = struct {
                 .remote_turn => |rt| switch (rt) {
                     .waiting => {},
                 },
+                .awaiting_draw_response => {},
             },
             .paused_disconnected => {},
             .game_over => {},
