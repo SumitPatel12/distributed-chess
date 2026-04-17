@@ -54,6 +54,22 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
             std.debug.assert(self.len <= capacity);
         }
 
+        /// Appends a slice of elements. Caller has already proven capacity (e.g. via a budget
+        /// check at the top of a render), so an overflow here is a programmer bug and we assert
+        /// rather than returning an error.
+        pub fn append_slice_assume_capacity(self: *Self, items: []const T) void {
+            std.debug.assert(self.len + items.len <= capacity);
+            @memcpy(self.buf[self.len .. self.len + items.len], items);
+            self.len += items.len;
+        }
+
+        /// Appends `n` copies of `value`. Capacity is a caller-proven precondition.
+        pub fn append_n_times_assume_capacity(self: *Self, value: T, n: usize) void {
+            std.debug.assert(self.len + n <= capacity);
+            @memset(self.buf[self.len .. self.len + n], value);
+            self.len += n;
+        }
+
         /// Returns the populated portion of the array.
         pub fn slice(self: *const Self) []const T {
             std.debug.assert(self.len <= capacity);
