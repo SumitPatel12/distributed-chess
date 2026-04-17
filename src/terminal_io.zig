@@ -282,3 +282,25 @@ pub const TerminalIO = struct {
         return std.c.write(std.posix.STDOUT_FILENO, buffer.ptr, buffer.len);
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+test "check_resize returns null when no resize pending and consumes the flag on read" {
+    // We can test the pure atomic-flag logic by constructing a TerminalIO with
+    // zeroed fields — check_resize only touches resize_pending and window_config,
+    // both of which we set up here. No pty required.
+    var io: TerminalIO = undefined;
+    io.resize_pending = std.atomic.Value(bool).init(false);
+    io.window_config = std.mem.zeroes(std.posix.winsize);
+
+    // No resize pending → null.
+    try std.testing.expectEqual(@as(?std.posix.winsize, null), io.check_resize());
+
+    // Set the flag to simulate a SIGWINCH.
+    io.resize_pending.store(true, .release);
+
+    // check_resize will try query_winsize() which may fail in test (no tty), but the
+    // flag must be consumed regardless. After this call it should be false.
+    _ = io.check_resize();
+    try std.testing.expectEqual(false, io.resize_pending.load(.acquire));
+}

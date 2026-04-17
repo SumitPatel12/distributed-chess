@@ -318,3 +318,66 @@ pub const Game = struct {
         return effects;
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+test "intial state white returns local turn idle" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    try std.testing.expectEqual(GameState{ .playing = .{ .local_turn = .idle } }, game.state);
+}
+
+test "intial state black returns remote turn waiting" {
+    var game: Game = undefined;
+    game.init(.black);
+
+    try std.testing.expectEqual(GameState{ .playing = .{ .remote_turn = .waiting } }, game.state);
+}
+
+test "init sets board state to initial board state" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    const b = game.board.board_state;
+
+    // White back rank (rank 1 = index 0)
+    try std.testing.expectEqual(.white_rook, b[0][0]);
+    try std.testing.expectEqual(.white_knight, b[0][1]);
+    try std.testing.expectEqual(.white_bishop, b[0][2]);
+    try std.testing.expectEqual(.white_queen, b[0][3]);
+    try std.testing.expectEqual(.white_king, b[0][4]);
+    try std.testing.expectEqual(.white_bishop, b[0][5]);
+    try std.testing.expectEqual(.white_knight, b[0][6]);
+    try std.testing.expectEqual(.white_rook, b[0][7]);
+
+    // White pawns (rank 2 = index 1)
+    for (b[1]) |p| try std.testing.expectEqual(.white_pawn, p);
+
+    // Empty middle (ranks 3–6 = indices 2–5)
+    for (b[2..6]) |rank| for (rank) |p| try std.testing.expectEqual(.empty, p);
+
+    // Black pawns (rank 7 = index 6)
+    for (b[6]) |p| try std.testing.expectEqual(.black_pawn, p);
+
+    // Black back rank (rank 8 = index 7)
+    try std.testing.expectEqual(.black_rook, b[7][0]);
+    try std.testing.expectEqual(.black_knight, b[7][1]);
+    try std.testing.expectEqual(.black_bishop, b[7][2]);
+    try std.testing.expectEqual(.black_queen, b[7][3]);
+    try std.testing.expectEqual(.black_king, b[7][4]);
+    try std.testing.expectEqual(.black_bishop, b[7][5]);
+    try std.testing.expectEqual(.black_knight, b[7][6]);
+    try std.testing.expectEqual(.black_rook, b[7][7]);
+}
+
+test "inti sets the correct seq number, captures, and position hash" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    try std.testing.expectEqual(game.expected_seq, 1);
+    try std.testing.expectEqual(game.en_passant_square, null);
+    try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
+    try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
+    try std.testing.expectEqual(@as(usize, 0), game.position_hash.len);
+}

@@ -26,3 +26,10 @@ pub const Move = struct {
     from: Position,
     to: Position,
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+test "Color.opponent is symmetric" {
+    try std.testing.expectEqual(Color.black, Color.white.opponent());
+    try std.testing.expectEqual(Color.white, Color.black.opponent());
+}

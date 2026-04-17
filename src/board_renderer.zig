@@ -332,3 +332,83 @@ pub const BoardRenderer = struct {
         }
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn make_winsize(cols: u16, rows: u16) std.posix.winsize {
+    return .{ .col = cols, .row = rows, .xpixel = 0, .ypixel = 0 };
+}
+
+test "compute_cell_dimensions returns null when window too small" {
+    try testing.expectEqual(
+        @as(?BoardRenderer.CellDimensions, null),
+        BoardRenderer.compute_cell_dimensions(make_winsize(10, 10)),
+    );
+    try testing.expectEqual(
+        @as(?BoardRenderer.CellDimensions, null),
+        BoardRenderer.compute_cell_dimensions(make_winsize(29, 14)),
+    );
+    try testing.expectEqual(
+        @as(?BoardRenderer.CellDimensions, null),
+        BoardRenderer.compute_cell_dimensions(make_winsize(30, 13)),
+    );
+}
+
+test "compute_cell_dimensions returns non-null above threshold" {
+    const dims = BoardRenderer.compute_cell_dimensions(make_winsize(30, 14));
+    try testing.expect(dims != null);
+    try testing.expectEqual(@as(u16, 3), dims.?.width);
+    try testing.expectEqual(@as(u16, 1), dims.?.height);
+}
+
+test "compute_cell_dimensions picks largest fitting size" {
+    // 6 + 8*11 = 94 cols, 6 + 8*5 = 46 rows → should pick 11x5
+    const dims = BoardRenderer.compute_cell_dimensions(make_winsize(94, 46));
+    try testing.expect(dims != null);
+    try testing.expectEqual(@as(u16, 11), dims.?.width);
+    try testing.expectEqual(@as(u16, 5), dims.?.height);
+}
+
+test "centered_col(80, 10) == 36" {
+    // (80 - 10) / 2 + 1 = 36
+    try testing.expectEqual(@as(u16, 36), BoardRenderer.centered_col(80, 10));
+}
+
+test "centered_col returns 1 when content wider than window" {
+    try testing.expectEqual(@as(u16, 1), BoardRenderer.centered_col(5, 10));
+    try testing.expectEqual(@as(u16, 1), BoardRenderer.centered_col(10, 10));
+}
+
+test "resolve_state transitions between ok and too_small at the boundary" {
+    const too_small = BoardRenderer.resolve_state(make_winsize(10, 10));
+    try testing.expect(too_small == .too_small);
+
+    const ok = BoardRenderer.resolve_state(make_winsize(30, 14));
+    try testing.expect(ok == .ok);
+}
+
+test "flip_perspective toggles and round-trips" {
+    var renderer: BoardRenderer = undefined;
+    renderer.init(make_winsize(80, 24));
+
+    try testing.expectEqual(Color.white, renderer.perspective);
+    renderer.flip_perspective();
+    try testing.expectEqual(Color.black, renderer.perspective);
+    renderer.flip_perspective();
+    try testing.expectEqual(Color.white, renderer.perspective);
+}
+
+test "draw produces non-empty output and begins with expected ANSI prelude" {
+    var renderer: BoardRenderer = undefined;
+    renderer.init(make_winsize(80, 24));
+
+    var game: Game = undefined;
+    game.init(.white);
+
+    const output = renderer.draw(&game);
+    try testing.expect(output.len > 0);
+    // Output should start with the clear-screen escape sequence.
+    try testing.expect(std.mem.startsWith(u8, output, terminal_io.EscapeSequences.CLEAR_SCREEN));
+}

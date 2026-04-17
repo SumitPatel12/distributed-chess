@@ -813,3 +813,23 @@ test "zobrist TABLE has Polyglot-canonical 781 entries in four named segments" {
     try std.testing.expectEqual(@as(usize, 4), EP_FILE_BASE - CASTLING_BASE);
     try std.testing.expectEqual(@as(usize, 8), SIDE_TO_MOVE_INDEX - EP_FILE_BASE);
 }
+
+test "all 781 entries are non-zero" {
+    for (TABLE, 0..) |entry, i| {
+        if (entry == 0) {
+            std.debug.print("zero entry at index {d}\n", .{i});
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "no duplicate entries in TABLE" {
+    for (0..TABLE.len) |i| {
+        for (i + 1..TABLE.len) |j| {
+            if (TABLE[i] == TABLE[j]) {
+                std.debug.print("duplicate at indices {d} and {d}: 0x{x:0>16}\n", .{ i, j, TABLE[i] });
+                try std.testing.expect(false);
+            }
+        }
+    }
+}

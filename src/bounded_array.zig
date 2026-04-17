@@ -79,3 +79,137 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
         }
     };
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+test "append_slice returns overflow when appending items would exceed capacity" {
+    var array: BoundedArray(u8, 4) = .{};
+    try std.testing.expectError(error.Overflow, array.append_slice(&.{ 1, 2, 3, 4, 5 }));
+}
+
+test "append_slice returns void when appending items that fit into the capacity" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_slice(&.{ 1, 2, 3, 4, 5 });
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+}
+
+test "append_slice chained calls update the buffer correctly" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_slice(&.{ 1, 2 });
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, array.slice());
+
+    try array.append_slice(&.{ 3, 4 });
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, array.slice());
+
+    try array.append_slice(&.{5});
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+}
+
+test "append_slice chained calls update the buffer correctly until capacity overflow is reached" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_slice(&.{ 1, 2 });
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, array.slice());
+
+    try array.append_slice(&.{ 3, 4 });
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, array.slice());
+
+    try array.append_slice(&.{5});
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+
+    try std.testing.expectError(error.Overflow, array.append_slice(&.{ 6, 7 }));
+
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+}
+
+test "append_n_times returns overflow when appending items would exceed capacity" {
+    var array: BoundedArray(u8, 4) = .{};
+    try std.testing.expectError(error.Overflow, array.append_n_times(4, 5));
+}
+
+test "append_n_times returns void when appending items that fit into the capacity" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_n_times(5, 5);
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 5, 5, 5 }, array.slice());
+}
+
+test "append_n_time chained calls update buffer correctly" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_n_times(5, 2);
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5 }, array.slice());
+
+    try array.append_n_times(2, 2);
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 2 }, array.slice());
+
+    try array.append_n_times(3, 1);
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 2, 3 }, array.slice());
+}
+
+test "append_n_time chained calls update buffer correctly and keeps the buffer state if overflow occurs" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_n_times(5, 2);
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5 }, array.slice());
+
+    try array.append_n_times(2, 2);
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 2 }, array.slice());
+
+    try array.append_n_times(3, 1);
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 2, 3 }, array.slice());
+
+    try std.testing.expectError(error.Overflow, array.append_n_times(4, 3));
+
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 2, 3 }, array.slice());
+}
+
+test "reset restes the len back to 0 after append_n_times" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_n_times(5, 5);
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 5, 5, 5 }, array.slice());
+    array.reset();
+    try std.testing.expectEqual(@as(usize, 0), array.len);
+}
+
+test "reset resets the len back to 0 after append_slice" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_slice(&.{ 1, 2, 3, 4, 5 });
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+    array.reset();
+    try std.testing.expectEqual(@as(usize, 0), array.len);
+}
+
+test "reset keeps the buffer for reuse" {
+    var array: BoundedArray(u8, 6) = .{};
+    try array.append_slice(&.{ 1, 2, 3, 4, 5 });
+    try std.testing.expectEqual(@as(usize, 5), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
+    array.reset();
+    try std.testing.expectEqual(@as(usize, 0), array.len);
+
+    try array.append_n_times(5, 2);
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5 }, array.slice());
+
+    try array.append_slice(&.{ 2, 4 });
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 2, 4 }, array.slice());
+
+    array.reset();
+    try std.testing.expectEqual(@as(usize, 0), array.len);
+}

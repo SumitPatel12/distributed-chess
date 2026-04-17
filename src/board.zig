@@ -232,3 +232,100 @@ pub const Board = struct {
         std.debug.assert(self.board_state[position.rank][position.file] == .empty);
     }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "move applies piece from source to destination and clears source" {
+    var board: Board = undefined;
+    board.init();
+
+    // Move white pawn e2 -> e4 (rank 1 file 4 -> rank 3 file 4)
+    const from = Position{ .rank = 1, .file = 4 };
+    const to = Position{ .rank = 3, .file = 4 };
+
+    try testing.expectEqual(Piece.white_pawn, board.board_state[from.rank][from.file]);
+    try testing.expectEqual(Piece.empty, board.board_state[to.rank][to.file]);
+
+    board.move(from, to);
+
+    try testing.expectEqual(Piece.empty, board.board_state[from.rank][from.file]);
+    try testing.expectEqual(Piece.white_pawn, board.board_state[to.rank][to.file]);
+}
+
+test "clear zeroes target square and leaves adjacent squares untouched" {
+    var board: Board = undefined;
+    board.init();
+
+    const target = Position{ .rank = 0, .file = 4 }; // white king at e1
+
+    // Snapshot neighbours before clearing.
+    const left = board.board_state[0][3]; // d1 queen
+    const right = board.board_state[0][5]; // f1 bishop
+
+    board.clear(target);
+
+    try testing.expectEqual(Piece.empty, board.board_state[target.rank][target.file]);
+    try testing.expectEqual(left, board.board_state[0][3]);
+    try testing.expectEqual(right, board.board_state[0][5]);
+}
+
+test "move preserves board integrity under a scripted sequence" {
+    var board: Board = undefined;
+    board.init();
+
+    // Count non-empty pieces at the start — should be 32.
+    const initial_count = countPieces(&board);
+    try testing.expectEqual(@as(usize, 32), initial_count);
+
+    // Play a short scripted sequence (no captures).
+    const moves = [_][2]Position{
+        .{ .{ .rank = 1, .file = 4 }, .{ .rank = 3, .file = 4 } }, // e2-e4
+        .{ .{ .rank = 6, .file = 4 }, .{ .rank = 4, .file = 4 } }, // e7-e5
+        .{ .{ .rank = 0, .file = 6 }, .{ .rank = 2, .file = 5 } }, // Ng1-f3
+        .{ .{ .rank = 7, .file = 1 }, .{ .rank = 5, .file = 2 } }, // Nb8-c6
+    };
+
+    for (moves) |m| {
+        board.move(m[0], m[1]);
+    }
+
+    // No captures — piece count must still be 32.
+    try testing.expectEqual(@as(usize, 32), countPieces(&board));
+}
+
+test "Piece.glyph returns distinct non-empty UTF-8 for each piece variant" {
+    const fields = @typeInfo(Piece).@"enum".fields;
+    // 13 variants: empty + 6 white + 6 black
+    try testing.expectEqual(@as(usize, 13), fields.len);
+
+    inline for (fields) |f| {
+        const piece: Piece = @enumFromInt(f.value);
+        const g = piece.glyph();
+        try testing.expect(g.len > 0);
+    }
+
+    // Glyphs for same role but different colour should be identical (both use filled set).
+    try testing.expectEqualStrings(Piece.white_king.glyph(), Piece.black_king.glyph());
+    try testing.expectEqualStrings(Piece.white_queen.glyph(), Piece.black_queen.glyph());
+}
+
+test "Piece.fg differs for white vs black same-role pieces" {
+    // White and black pieces must receive different foreground SGR sequences.
+    try testing.expect(!std.mem.eql(u8, Piece.white_pawn.fg(), Piece.black_pawn.fg()));
+    try testing.expect(!std.mem.eql(u8, Piece.white_king.fg(), Piece.black_king.fg()));
+
+    // Empty piece should have an empty fg string.
+    try testing.expectEqual(@as(usize, 0), Piece.empty.fg().len);
+}
+
+fn countPieces(board: *const Board) usize {
+    var count: usize = 0;
+    for (board.board_state) |rank| {
+        for (rank) |square| {
+            if (square != .empty) count += 1;
+        }
+    }
+    return count;
+}

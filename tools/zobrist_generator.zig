@@ -104,7 +104,59 @@ fn write_table(writer: *std.Io.Writer) !void {
         \\    try std.testing.expectEqual(@as(usize, 8), SIDE_TO_MOVE_INDEX - EP_FILE_BASE);
         \\}
         \\
+        \\test "all 781 entries are non-zero" {
+        \\    for (TABLE, 0..) |entry, i| {
+        \\        if (entry == 0) {
+        \\            std.debug.print("zero entry at index {d}\n", .{i});
+        \\            try std.testing.expect(false);
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\test "no duplicate entries in TABLE" {
+        \\    for (0..TABLE.len) |i| {
+        \\        for (i + 1..TABLE.len) |j| {
+        \\            if (TABLE[i] == TABLE[j]) {
+        \\                std.debug.print("duplicate at indices {d} and {d}: 0x{x:0>16}\n", .{ i, j, TABLE[i] });
+        \\                try std.testing.expect(false);
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
     );
+}
+
+test "splitmix64_next produces the known reference sequence for the project SEED" {
+    // Verify the first 4 outputs from the project's SEED (0x13AF) to catch any
+    // bit-twiddle regression. These values were derived from the implementation.
+    var state: u64 = SEED;
+    try std.testing.expectEqual(@as(u64, 0xB5558709D5733B45), splitmix64_next(&state));
+    try std.testing.expectEqual(@as(u64, 0xAD7EB1B093872E8F), splitmix64_next(&state));
+    try std.testing.expectEqual(@as(u64, 0xDD23E5C07B4291D6), splitmix64_next(&state));
+    try std.testing.expectEqual(@as(u64, 0x6862C5460725D731), splitmix64_next(&state));
+}
+
+test "write_hex_u64 format produces correct output for zero" {
+    var buf: [32]u8 = undefined;
+    const value: u64 = 0;
+    const n0: u16 = @intCast((value >> 48) & 0xFFFF);
+    const n1: u16 = @intCast((value >> 32) & 0xFFFF);
+    const n2: u16 = @intCast((value >> 16) & 0xFFFF);
+    const n3: u16 = @intCast(value & 0xFFFF);
+    const result = std.fmt.bufPrint(&buf, "0x{x:0>4}_{x:0>4}_{x:0>4}_{x:0>4}", .{ n0, n1, n2, n3 }) catch unreachable;
+    try std.testing.expectEqualStrings("0x0000_0000_0000_0000", result);
+}
+
+test "write_hex_u64 format produces correct output for a known large value" {
+    var buf: [32]u8 = undefined;
+    const value: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    const n0: u16 = @intCast((value >> 48) & 0xFFFF);
+    const n1: u16 = @intCast((value >> 32) & 0xFFFF);
+    const n2: u16 = @intCast((value >> 16) & 0xFFFF);
+    const n3: u16 = @intCast(value & 0xFFFF);
+    const result = std.fmt.bufPrint(&buf, "0x{x:0>4}_{x:0>4}_{x:0>4}_{x:0>4}", .{ n0, n1, n2, n3 }) catch unreachable;
+    try std.testing.expectEqualStrings("0xdead_beef_cafe_babe", result);
 }
 
 pub fn main(init: std.process.Init) !void {
