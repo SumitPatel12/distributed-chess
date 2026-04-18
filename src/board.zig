@@ -20,26 +20,25 @@ const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 // more than enough.
 /// Enum for pieces, the board_state will make use of this to encode the board state.
 pub const Piece = enum(i8) {
-    // I'll see if the bishops need to be segregated into light_squared and dark_squared. For now
-    // I'll trust that the state_machine (or the move logic) eliminates the need for that.
-    // I think this will be convenient, may be counterintuitive.
     empty = 0,
     white_pawn = 1,
     white_knight = 2,
-    white_bishop = 3,
-    white_rook = 4,
-    white_queen = 5,
-    white_king = 6,
+    white_bishop_light = 3,
+    white_bishop_dark = 4,
+    white_rook = 5,
+    white_queen = 6,
+    white_king = 7,
     black_pawn = -1,
     black_knight = -2,
-    black_bishop = -3,
-    black_rook = -4,
-    black_queen = -5,
-    black_king = -6,
+    black_bishop_light = -3,
+    black_bishop_dark = -4,
+    black_rook = -5,
+    black_queen = -6,
+    black_king = -7,
 
     pub fn color(self: Piece) ?Color {
         const int_value = @intFromEnum(self);
-        std.debug.assert(int_value >= -6 and int_value <= 6);
+        std.debug.assert(int_value >= -7 and int_value <= 7);
 
         if (int_value == 0) {
             return null;
@@ -63,7 +62,11 @@ pub const Piece = enum(i8) {
             .empty => " ",
             .white_pawn, .black_pawn => "\u{265F}",
             .white_knight, .black_knight => "\u{265E}",
-            .white_bishop, .black_bishop => "\u{265D}",
+            .white_bishop_light,
+            .white_bishop_dark,
+            .black_bishop_light,
+            .black_bishop_dark,
+            => "\u{265D}",
             .white_rook, .black_rook => "\u{265C}",
             .white_queen, .black_queen => "\u{265B}",
             .white_king, .black_king => "\u{265A}",
@@ -77,14 +80,16 @@ pub const Piece = enum(i8) {
             .empty => "",
             .white_pawn,
             .white_knight,
-            .white_bishop,
+            .white_bishop_light,
+            .white_bishop_dark,
             .white_rook,
             .white_queen,
             .white_king,
             => WHITE_PIECE_FG,
             .black_pawn,
             .black_knight,
-            .black_bishop,
+            .black_bishop_light,
+            .black_bishop_dark,
             .black_rook,
             .black_queen,
             .black_king,
@@ -175,8 +180,8 @@ pub const Board = struct {
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
         .{
-            .white_rook, .white_knight, .white_bishop, .white_queen,
-            .white_king, .white_bishop, .white_knight, .white_rook,
+            .white_rook, .white_knight, .white_bishop_dark, .white_queen,
+            .white_king, .white_bishop_light, .white_knight, .white_rook,
         },
         .{.white_pawn} ** 8,
         .{.empty} ** 8,
@@ -185,8 +190,8 @@ pub const Board = struct {
         .{.empty} ** 8,
         .{.black_pawn} ** 8,
         .{
-            .black_rook, .black_knight, .black_bishop, .black_queen,
-            .black_king, .black_bishop, .black_knight, .black_rook,
+            .black_rook, .black_knight, .black_bishop_light, .black_queen,
+            .black_king, .black_bishop_dark, .black_knight, .black_rook,
         },
     };
 
@@ -297,8 +302,8 @@ test "move preserves board integrity under a scripted sequence" {
 
 test "Piece.glyph returns distinct non-empty UTF-8 for each piece variant" {
     const fields = @typeInfo(Piece).@"enum".fields;
-    // 13 variants: empty + 6 white + 6 black
-    try testing.expectEqual(@as(usize, 13), fields.len);
+    // 15 variants: empty + 7 white + 7 black (bishops split into light/dark squared)
+    try testing.expectEqual(@as(usize, 15), fields.len);
 
     inline for (fields) |f| {
         const piece: Piece = @enumFromInt(f.value);

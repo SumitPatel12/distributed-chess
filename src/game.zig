@@ -344,10 +344,10 @@ test "init sets board state to initial board state" {
     // White back rank (rank 1 = index 0)
     try std.testing.expectEqual(.white_rook, b[0][0]);
     try std.testing.expectEqual(.white_knight, b[0][1]);
-    try std.testing.expectEqual(.white_bishop, b[0][2]);
+    try std.testing.expectEqual(.white_bishop_dark, b[0][2]);
     try std.testing.expectEqual(.white_queen, b[0][3]);
     try std.testing.expectEqual(.white_king, b[0][4]);
-    try std.testing.expectEqual(.white_bishop, b[0][5]);
+    try std.testing.expectEqual(.white_bishop_light, b[0][5]);
     try std.testing.expectEqual(.white_knight, b[0][6]);
     try std.testing.expectEqual(.white_rook, b[0][7]);
 
@@ -363,10 +363,10 @@ test "init sets board state to initial board state" {
     // Black back rank (rank 8 = index 7)
     try std.testing.expectEqual(.black_rook, b[7][0]);
     try std.testing.expectEqual(.black_knight, b[7][1]);
-    try std.testing.expectEqual(.black_bishop, b[7][2]);
+    try std.testing.expectEqual(.black_bishop_light, b[7][2]);
     try std.testing.expectEqual(.black_queen, b[7][3]);
     try std.testing.expectEqual(.black_king, b[7][4]);
-    try std.testing.expectEqual(.black_bishop, b[7][5]);
+    try std.testing.expectEqual(.black_bishop_dark, b[7][5]);
     try std.testing.expectEqual(.black_knight, b[7][6]);
     try std.testing.expectEqual(.black_rook, b[7][7]);
 }
