@@ -4,12 +4,14 @@
 const std = @import("std");
 const board_mod = @import("board.zig");
 const BoundedArray = @import("bounded_array.zig").BoundedArray;
+const Board = board_mod.Board;
 const shared = @import("shared.zig");
 const Color = shared.Color;
-const Board = board_mod.Board;
 const Move = shared.Move;
 const Position = shared.Position;
+const CastlingRights = shared.CastlingRights;
 const Piece = board_mod.Piece;
+const rules_engine = @import("rule_engine/rules.zig");
 
 pub const GameResult = enum {
     /// One of the players won by checkmating.
@@ -27,6 +29,9 @@ pub const GameResult = enum {
     /// Represents a draw for when no player has moved a pawn or has captured any piece for 50 full
     /// moves
     draw_fifty_moves,
+
+    /// Represents an automatic draw when 75 full moves go on without any pawn moves or capture.
+    draw_seventy_five_moves,
 
     /// Draw by three fold repetition, i.e. when the same position is reached thrice.
     draw_threefold_repetition,
@@ -194,9 +199,6 @@ pub const GameEffect = union(enum) {
     start_disconnect_timer: u32,
 };
 
-// TODO: After understanding what is requied a bit more populate this struct.
-const CastlingRights = struct {};
-
 /// Represents the game being played. Holds the complete data of the game including players move
 /// history, game state, the log for the RSM.
 pub const Game = struct {
@@ -252,15 +254,10 @@ pub const Game = struct {
 
     /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
-        const state: GameState = switch (color) {
+        return switch (color) {
             .white => GameState{ .playing = .{ .local_turn = .idle } },
             .black => GameState{ .playing = .{ .remote_turn = .waiting } },
         };
-
-        std.debug.assert(state == .playing);
-        std.debug.assert((color == .white) == (state.playing == .local_turn));
-
-        return state;
     }
 
     /// Initializes the Game struct in place.
@@ -280,12 +277,6 @@ pub const Game = struct {
             .en_passant_square = null,
         };
         self.board.init();
-        std.debug.assert(self.current_turn == .white);
-        std.debug.assert(self.captures_by_black.len == 0);
-        std.debug.assert(self.captures_by_white.len == 0);
-        std.debug.assert(self.position_hash.len == 0);
-        std.debug.assert(self.en_passant_square == null);
-        std.debug.assert(self.expected_seq == 1);
     }
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
@@ -316,6 +307,13 @@ pub const Game = struct {
         }
 
         return effects;
+    }
+
+    /// Returns true if `move` is a legal move given the current board, castling rights, and
+    /// en-passant square. Pure query — does not mutate game state. Turn check is the caller's
+    /// responsibility (matches `rules.is_legal_piece_move`'s contract).
+    pub fn is_move_legal(self: *const Game, move: Move) bool {
+        return rules_engine.is_legal_piece_move(&self.board, &self.castling_rights, self.en_passant_square, move);
     }
 };
 
@@ -380,4 +378,73 @@ test "inti sets the correct seq number, captures, and position hash" {
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
     try std.testing.expectEqual(@as(usize, 0), game.position_hash.len);
+}
+
+// Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
+// file) forces *analysis* but not test discovery; the `_ = @import` form inside a test block
+// is what adds a file's `test` blocks to the running binary.
+test {
+    _ = @import("rule_engine/rules.zig");
+    _ = @import("rule_engine/check_helper.zig");
+    _ = @import("rule_engine/shared.zig");
+    _ = @import("rule_engine/test_util.zig");
+}
+
+test "is_move_legal accepts e2-e4 from the starting position" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    const mv = Move{
+        .from = .{ .rank = 1, .file = 4 },
+        .to = .{ .rank = 3, .file = 4 },
+    };
+    try std.testing.expect(game.is_move_legal(mv));
+}
+
+test "is_move_legal rejects e2-e5 from the starting position" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    // Triple-push is never legal.
+    const mv = Move{
+        .from = .{ .rank = 1, .file = 4 },
+        .to = .{ .rank = 4, .file = 4 },
+    };
+    try std.testing.expect(!game.is_move_legal(mv));
+}
+
+test "is_move_legal rejects a move whose from square is empty" {
+    var game: Game = undefined;
+    game.init(.white);
+
+    // e4 is empty on the starting board.
+    const mv = Move{
+        .from = .{ .rank = 3, .file = 4 },
+        .to = .{ .rank = 4, .file = 4 },
+    };
+    try std.testing.expect(!game.is_move_legal(mv));
+}
+
+test "is_move_legal rejects a move that would leave own king in check" {
+    // Pin scenario: white king d1, white rook d2 (pinned on the d-file), black rook d8. The
+    // pinned rook's only legal squares are along the pin ray; moving off the d-file exposes
+    // the king to the attacker.
+    var game: Game = undefined;
+    game.init(.white);
+
+    // Clear the starting position down to just the pin setup.
+    game.board.board_state = .{.{.empty} ** 8} ** 8;
+    game.board.board_state[0][3] = .white_king; // d1
+    game.board.board_state[1][3] = .white_rook; // d2
+    game.board.board_state[7][3] = .black_rook; // d8
+    // Black king must exist too — `filter_self_check` runs `in_check` for the side to move,
+    // but also relies on a legal board (both kings present).
+    game.board.board_state[7][7] = .black_king;
+
+    // Pinned rook tries to leave the d-file (d2 → e2) — illegal.
+    const illegal = Move{
+        .from = .{ .rank = 1, .file = 3 },
+        .to = .{ .rank = 1, .file = 4 },
+    };
+    try std.testing.expect(!game.is_move_legal(illegal));
 }

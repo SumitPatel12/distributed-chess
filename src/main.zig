@@ -10,16 +10,6 @@ const board_renderer = @import("board_renderer.zig");
 const Game = game_mod.Game;
 const BoardRenderer = board_renderer.BoardRenderer;
 
-test {
-    _ = @import("game.zig");
-    _ = @import("bounded_array.zig");
-    _ = @import("zobrist_table.zig");
-    _ = @import("board.zig");
-    _ = @import("shared.zig");
-    _ = @import("board_renderer.zig");
-    _ = @import("terminal_io.zig");
-}
-
 pub fn main() !void {
     var io: terminal_io.TerminalIO = undefined;
     try io.init();
@@ -38,4 +28,14 @@ pub fn main() !void {
     if (write_result == -1) {
         std.debug.print("Error rendering board.", .{});
     }
+}
+
+test {
+    _ = @import("game.zig");
+    _ = @import("bounded_array.zig");
+    _ = @import("zobrist_table.zig");
+    _ = @import("board.zig");
+    _ = @import("shared.zig");
+    _ = @import("board_renderer.zig");
+    _ = @import("terminal_io.zig");
 }

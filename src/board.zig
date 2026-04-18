@@ -1,11 +1,13 @@
-//! Tracks the piece placement on the board, doesn't apply any ruled logic. This is just a dumb
-//! state.
+//! Tracks piece placement on the board and exposes state queries used by the rule engine
+//! (king position lookup, piece position lookup). Does NOT apply rule logic — move legality,
+//! check detection, ray walking, and turn enforcement live in `rule_engine/`.
 
 const std = @import("std");
 const terminal_io = @import("terminal_io.zig");
 const shared = @import("shared.zig");
 const Color = shared.Color;
 const Position = shared.Position;
+const BoundedArray = @import("bounded_array.zig").BoundedArray;
 
 const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
 const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
@@ -42,13 +44,9 @@ pub const Piece = enum(i8) {
 
         if (int_value == 0) {
             return null;
-        }
-
-        if (int_value > 0) {
+        } else if (int_value > 0) {
             return .white;
-        }
-
-        if (int_value < 0) {
+        } else {
             return .black;
         }
     }
@@ -180,8 +178,8 @@ pub const Board = struct {
     /// The starting position for a classical game. Sorted by rank and file so white side first.
     const STARTING_BOARD_POSITION: [8][8]Piece = .{
         .{
-            .white_rook, .white_knight, .white_bishop_dark, .white_queen,
-            .white_king, .white_bishop_light, .white_knight, .white_rook,
+            .white_rook, .white_knight,       .white_bishop_dark, .white_queen,
+            .white_king, .white_bishop_light, .white_knight,      .white_rook,
         },
         .{.white_pawn} ** 8,
         .{.empty} ** 8,
@@ -190,8 +188,8 @@ pub const Board = struct {
         .{.empty} ** 8,
         .{.black_pawn} ** 8,
         .{
-            .black_rook, .black_knight, .black_bishop_light, .black_queen,
-            .black_king, .black_bishop_dark, .black_knight, .black_rook,
+            .black_rook, .black_knight,      .black_bishop_light, .black_queen,
+            .black_king, .black_bishop_dark, .black_knight,       .black_rook,
         },
     };
 
@@ -214,9 +212,6 @@ pub const Board = struct {
     /// Mutates `board_state` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
     /// new state to be visible call the redraw function.
     pub fn move(self: *Board, from: Position, to: Position) void {
-        // Positions must refer to real squares on the board.
-        std.debug.assert(from.rank < 8 and from.file < 8);
-        std.debug.assert(to.rank < 8 and to.file < 8);
         // A move that doesn't change the square is not a move.
         std.debug.assert(from.rank != to.rank or from.file != to.file);
 
@@ -226,15 +221,55 @@ pub const Board = struct {
 
         self.board_state[from.rank][from.file] = .empty;
         self.board_state[to.rank][to.file] = piece;
-
-        std.debug.assert(self.board_state[from.rank][from.file] == .empty);
-        std.debug.assert(self.board_state[to.rank][to.file] == piece);
     }
 
     /// Set's the given position to empty. Will be required for en-passant.
     pub fn clear(self: *Board, position: Position) void {
         self.board_state[position.rank][position.file] = .empty;
-        std.debug.assert(self.board_state[position.rank][position.file] == .empty);
+    }
+
+    // Kings position is so commonly required to check if it's under check that it warranted its own
+    // method.
+    /// Returns the position of the king of the given color.
+    /// According to the rules of chess there's always a king on the board for both sides, so this
+    /// function is always guaranteed to return as valid position.
+    pub fn find_king_position(self: *const Board, color: Color) Position {
+        const king_piece: Piece = switch (color) {
+            .white => .white_king,
+            .black => .black_king,
+        };
+
+        for (self.board_state, 0..) |rank_row, rank_idx| {
+            for (rank_row, 0..) |piece, file_idx| {
+                if (piece == king_piece) {
+                    return Position{ .rank = @intCast(rank_idx), .file = @intCast(file_idx) };
+                }
+            }
+        }
+
+        unreachable; // invariant: king always on the board
+    }
+
+    // Capacity 10 covers the worst case for any piece type: 2 starting rooks/knights plus up to 8
+    // promotions. Queens, bishops (per square colour), and pawns all cap below this.
+    //
+    /// Returns every board square occupied by `piece`, in rank-major order. Result Location
+    /// Semantics guarantees the returned aggregate is written directly to the caller's destination.
+    pub fn find_piece_position(self: *const Board, piece: Piece) BoundedArray(Position, 10) {
+        std.debug.assert(piece != .empty);
+
+        var result: BoundedArray(Position, 10) = .{};
+        for (self.board_state, 0..) |rank, rank_idx| {
+            for (rank, 0..) |board_piece, file_idx| {
+                if (board_piece == piece) {
+                    result.append_assume_capacity(.{
+                        .rank = @intCast(rank_idx),
+                        .file = @intCast(file_idx),
+                    });
+                }
+            }
+        }
+        return result;
     }
 };
 
@@ -325,11 +360,55 @@ test "Piece.fg differs for white vs black same-role pieces" {
     try testing.expectEqual(@as(usize, 0), Piece.empty.fg().len);
 }
 
+test "find_king_position returns e1 for white on the starting board" {
+    var board: Board = undefined;
+    board.init();
+
+    const pos = board.find_king_position(.white);
+    try testing.expectEqual(@as(u3, 0), pos.rank);
+    try testing.expectEqual(@as(u3, 4), pos.file);
+}
+
+test "find_king_position returns e8 for black on the starting board" {
+    var board: Board = undefined;
+    board.init();
+
+    const pos = board.find_king_position(.black);
+    try testing.expectEqual(@as(u3, 7), pos.rank);
+    try testing.expectEqual(@as(u3, 4), pos.file);
+}
+
+test "find_king_position finds king after it moves e1 -> e2" {
+    var board: Board = undefined;
+    board.init();
+
+    // Clear e2 (white pawn there on init) so the move target is empty, then walk the king up.
+    board.clear(.{ .rank = 1, .file = 4 });
+    board.move(.{ .rank = 0, .file = 4 }, .{ .rank = 1, .file = 4 });
+
+    const pos = board.find_king_position(.white);
+    try testing.expectEqual(@as(u3, 1), pos.rank);
+    try testing.expectEqual(@as(u3, 4), pos.file);
+}
+
+test "find_piece_position returns 8 white pawns on rank 1 for starting board" {
+    var board: Board = undefined;
+    board.init();
+
+    const positions = board.find_piece_position(.white_pawn);
+    try testing.expectEqual(@as(usize, 8), positions.len);
+    for (positions.slice()) |p| {
+        try testing.expectEqual(@as(u3, 1), p.rank);
+    }
+}
+
 fn countPieces(board: *const Board) usize {
     var count: usize = 0;
     for (board.board_state) |rank| {
         for (rank) |square| {
-            if (square != .empty) count += 1;
+            if (square != .empty) {
+                count += 1;
+            }
         }
     }
     return count;

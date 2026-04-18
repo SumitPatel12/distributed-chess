@@ -19,13 +19,11 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
         pub fn reset(self: *Self) void {
             std.debug.assert(self.len <= capacity);
             self.len = 0;
-            std.debug.assert(self.len == 0);
         }
 
         /// Appends a slice of elements to the end of the array.
         pub fn append_slice(self: *Self, items: []const T) Error!void {
             std.debug.assert(self.len <= capacity);
-            const prev_len = self.len;
 
             if (self.len + items.len > capacity) {
                 return error.Overflow;
@@ -33,15 +31,11 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
 
             @memcpy(self.buf[self.len .. self.len + items.len], items);
             self.len += items.len;
-
-            std.debug.assert(self.len == prev_len + items.len);
-            std.debug.assert(self.len <= capacity);
         }
 
         /// Appends `n` copies of `value` to the end of the array.
         pub fn append_n_times(self: *Self, value: T, n: usize) Error!void {
             std.debug.assert(self.len <= capacity);
-            const prev_len = self.len;
 
             if (self.len + n > capacity) {
                 return error.Overflow;
@@ -49,9 +43,6 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
 
             @memset(self.buf[self.len .. self.len + n], value);
             self.len += n;
-
-            std.debug.assert(self.len == prev_len + n);
-            std.debug.assert(self.len <= capacity);
         }
 
         /// Appends a slice of elements. Caller has already proven capacity (e.g. via a budget
@@ -61,6 +52,15 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
             std.debug.assert(self.len + items.len <= capacity);
             @memcpy(self.buf[self.len .. self.len + items.len], items);
             self.len += items.len;
+        }
+
+        /// Appends a single element. Capacity is a caller-proven precondition — same contract as
+        /// `append_slice_assume_capacity`, optimized for the common case where the caller knows
+        /// there's room for exactly one more.
+        pub fn append_assume_capacity(self: *Self, item: T) void {
+            std.debug.assert(self.len + 1 <= capacity);
+            self.buf[self.len] = item;
+            self.len += 1;
         }
 
         /// Appends `n` copies of `value`. Capacity is a caller-proven precondition.
@@ -73,9 +73,7 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
         /// Returns the populated portion of the array.
         pub fn slice(self: *const Self) []const T {
             std.debug.assert(self.len <= capacity);
-            const result = self.buf[0..self.len];
-            std.debug.assert(result.len == self.len);
-            return result;
+            return self.buf[0..self.len];
         }
     };
 }
@@ -192,6 +190,33 @@ test "reset resets the len back to 0 after append_slice" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, array.slice());
     array.reset();
     try std.testing.expectEqual(@as(usize, 0), array.len);
+}
+
+test "append_assume_capacity writes item at buf[len-1] across sequential calls" {
+    var array: BoundedArray(u8, 6) = .{};
+    array.append_assume_capacity(10);
+    try std.testing.expectEqual(@as(usize, 1), array.len);
+    try std.testing.expectEqual(@as(u8, 10), array.buf[0]);
+
+    array.append_assume_capacity(20);
+    try std.testing.expectEqual(@as(usize, 2), array.len);
+    try std.testing.expectEqual(@as(u8, 20), array.buf[1]);
+
+    array.append_assume_capacity(30);
+    try std.testing.expectEqual(@as(usize, 3), array.len);
+    try std.testing.expectEqual(@as(u8, 30), array.buf[2]);
+
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, array.slice());
+}
+
+test "append_assume_capacity fills to capacity without panic" {
+    var array: BoundedArray(u8, 4) = .{};
+    array.append_assume_capacity(1);
+    array.append_assume_capacity(2);
+    array.append_assume_capacity(3);
+    array.append_assume_capacity(4);
+    try std.testing.expectEqual(@as(usize, 4), array.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, array.slice());
 }
 
 test "reset keeps the buffer for reuse" {

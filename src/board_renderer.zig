@@ -251,7 +251,9 @@ pub const BoardRenderer = struct {
     /// Column at which `content_len` bytes would sit centered within `total_cols`. Falls back to
     /// column 1 when the content is as wide or wider than the window.
     fn centered_col(total_cols: u16, content_len: usize) u16 {
-        if (content_len >= total_cols) return 1;
+        if (content_len >= total_cols) {
+            return 1;
+        }
         const content_u16: u16 = @intCast(content_len);
         return (total_cols - content_u16) / 2 + 1;
     }
