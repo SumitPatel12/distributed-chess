@@ -1,329 +1,611 @@
-//! Benchmark to check how fast the game can apply rules and spit out the byte sequence for the
-//! board state.
+//! Benchmark for the chess engine's hot paths: applying a move (through the rule engine) and
+//! building the renderer's byte-sequence buffer. Replays The Immortal Game (Anderssen vs
+//! Kieseritzky, 1851, 45 half-moves, no castling / en-passant / promotion) on a loop and sprinkles
+//! illegal-move attempts every Nth iteration so we capture the rule engine's rejection path
+//! separately.
+//!
+//! Timing uses `std.Io.Clock` on the `.awake` monotonic clock (Zig 0.16.0 replaced
+//! `std.time.Timer`). Output goes to stderr via `std.debug.print` and to
+//! `tmp/bench/bench_results.txt` via `std.Io.Dir.cwd().writeFile`. No libc clock, no
+//! `std.c.clock_gettime`.
 
-// TODO: Update/Fix the benchmark once the complete loop setup is in place.
+const std = @import("std");
+const builtin = @import("builtin");
+
+const board_renderer = @import("board_renderer");
+const game_mod = @import("game");
+const shared = @import("shared.zig");
+
+const Clock = std.Io.Clock;
+const Threaded = std.Io.Threaded;
+const Io = std.Io;
+
+const Game = game_mod.Game;
+const BoardRenderer = board_renderer.BoardRenderer;
+const Move = shared.Move;
+const Position = shared.Position;
+
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+/// Total loop iterations. One iteration is either a legal move+render pair or an illegal-move
+/// rejection attempt, decided by `ILLEGAL_MOVE_EVERY_N`.
+const ITERATIONS: usize = 10_000;
+
+/// Every Nth iteration is an illegal-move rejection sample instead of a legal move. With
+/// `ITERATIONS = 10_000` and `N = 10` the split is 9000 legal / 1000 illegal.
+const ILLEGAL_MOVE_EVERY_N: usize = 10;
+
+/// Length of one full replay of The Immortal Game (45 half-moves; see `IMMORTAL_GAME` below).
+const MOVE_CYCLE_LEN: usize = IMMORTAL_GAME.len;
+
+/// Size of the stack buffer that accumulates the full result report. Tables use box-drawing
+/// chars (3 UTF-8 bytes each), so the budget is dominated by borders: ~7 tables × ~3 border rows
+/// × ~100 box chars ≈ 6 KB of border bytes alone. 16 KB leaves headroom.
+const RESULT_BUFFER_SIZE: usize = 16 * 1024;
+
+/// On-disk path for the persisted report, relative to cwd.
+const RESULT_FILE_PATH = "tmp/bench/bench_results.txt";
+
+/// Parent directory of `RESULT_FILE_PATH` — created on demand.
+const RESULT_FILE_DIR = "tmp/bench";
+
+/// Synthetic terminal size that triggers the renderer's largest cell dimensions (11x5 per cell),
+/// which is the worst-case buffer size (~12 KB) and therefore the measurement we actually want.
+/// The bench never touches the real tty.
+const BENCH_WINDOW_COLS: u16 = 94;
+const BENCH_WINDOW_ROWS: u16 = 46;
+
+// ── Move tables ───────────────────────────────────────────────────────────────
+
+// The Immortal Game, Anderssen vs Kieseritzky, London, 1851. 23 full moves = 45 half-moves.
+// Source: https://en.wikipedia.org/wiki/Immortal_Game.
 //
-// I think this benchmark is an accurate representation of what I want but I'm not a 100% sure.
+// Board coordinates: `rank` is 0-indexed from white's back rank (so rank_idx 0 == chess rank 1),
+// `file` is 0-indexed a..h. e2-e4 therefore reads as .{ .rank = 1, .file = 4 } → .{ 3, 4 }.
 //
-// So what it's aiming to time is:
-//  1. How long does it take the build the buffer arrya in bytes. (The byte sequence we send to the
-//     terminal for rendering the board). That I'm confident it measures correctly cause it's just one
-//     function and wrapping with time metrics should do the trick.
-//
-//  2. Timing how long the terminal takes to draw it. This one's a bit trickier cause I don't konw
-//     if the write calls returns after the terminal is done rendering or just returns as soon as
-//     it's queued the thing.
-//     I suspect it's the 2nd because when I tried it without sleep of 16ms a lot of frames were
-//     lost or so it seemed to me.
-//
-// So take this benchmark with a fistful of salt for the w and b+w times.
-//
-// TODO: Find out a better way to test the render times.
-//
+// This sequence is free of castling, en-passant, and promotion — all of which the current rule
+// engine either doesn't model (`CastlingRights` is an empty placeholder, `en_passant_square` stays
+// null) or models partially. Anderssen forfeits castling rights on move 4 (Kf1); Kieseritzky
+// never castles.
+const IMMORTAL_GAME = [_]Move{
+    // 1. e4 e5
+    .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } },
+    .{ .from = .{ .rank = 6, .file = 4 }, .to = .{ .rank = 4, .file = 4 } },
+    // 2. f4 exf4
+    .{ .from = .{ .rank = 1, .file = 5 }, .to = .{ .rank = 3, .file = 5 } },
+    .{ .from = .{ .rank = 4, .file = 4 }, .to = .{ .rank = 3, .file = 5 } },
+    // 3. Bc4 Qh4+
+    .{ .from = .{ .rank = 0, .file = 5 }, .to = .{ .rank = 3, .file = 2 } },
+    .{ .from = .{ .rank = 7, .file = 3 }, .to = .{ .rank = 3, .file = 7 } },
+    // 4. Kf1 b5
+    .{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 5 } },
+    .{ .from = .{ .rank = 6, .file = 1 }, .to = .{ .rank = 4, .file = 1 } },
+    // 5. Bxb5 Nf6
+    .{ .from = .{ .rank = 3, .file = 2 }, .to = .{ .rank = 4, .file = 1 } },
+    .{ .from = .{ .rank = 7, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
+    // 6. Nf3 Qh6
+    .{ .from = .{ .rank = 0, .file = 6 }, .to = .{ .rank = 2, .file = 5 } },
+    .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 5, .file = 7 } },
+    // 7. d3 Nh5
+    .{ .from = .{ .rank = 1, .file = 3 }, .to = .{ .rank = 2, .file = 3 } },
+    .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 4, .file = 7 } },
+    // 8. Nh4 Qg5
+    .{ .from = .{ .rank = 2, .file = 5 }, .to = .{ .rank = 3, .file = 7 } },
+    .{ .from = .{ .rank = 5, .file = 7 }, .to = .{ .rank = 4, .file = 6 } },
+    // 9. Nf5 c6
+    .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 4, .file = 5 } },
+    .{ .from = .{ .rank = 6, .file = 2 }, .to = .{ .rank = 5, .file = 2 } },
+    // 10. g4 Nf6
+    .{ .from = .{ .rank = 1, .file = 6 }, .to = .{ .rank = 3, .file = 6 } },
+    .{ .from = .{ .rank = 4, .file = 7 }, .to = .{ .rank = 5, .file = 5 } },
+    // 11. Rg1 cxb5
+    .{ .from = .{ .rank = 0, .file = 7 }, .to = .{ .rank = 0, .file = 6 } },
+    .{ .from = .{ .rank = 5, .file = 2 }, .to = .{ .rank = 4, .file = 1 } },
+    // 12. h4 Qg6
+    .{ .from = .{ .rank = 1, .file = 7 }, .to = .{ .rank = 3, .file = 7 } },
+    .{ .from = .{ .rank = 4, .file = 6 }, .to = .{ .rank = 5, .file = 6 } },
+    // 13. h5 Qg5
+    .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 4, .file = 7 } },
+    .{ .from = .{ .rank = 5, .file = 6 }, .to = .{ .rank = 4, .file = 6 } },
+    // 14. Qf3 Ng8
+    .{ .from = .{ .rank = 0, .file = 3 }, .to = .{ .rank = 2, .file = 5 } },
+    .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 7, .file = 6 } },
+    // 15. Bxf4 Qf6
+    .{ .from = .{ .rank = 0, .file = 2 }, .to = .{ .rank = 3, .file = 5 } },
+    .{ .from = .{ .rank = 4, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
+    // 16. Nc3 Bc5
+    .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 2 } },
+    .{ .from = .{ .rank = 7, .file = 5 }, .to = .{ .rank = 4, .file = 2 } },
+    // 17. Nd5 Qxb2
+    .{ .from = .{ .rank = 2, .file = 2 }, .to = .{ .rank = 4, .file = 3 } },
+    .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 1, .file = 1 } },
+    // 18. Bd6 Bxg1
+    .{ .from = .{ .rank = 3, .file = 5 }, .to = .{ .rank = 5, .file = 3 } },
+    .{ .from = .{ .rank = 4, .file = 2 }, .to = .{ .rank = 0, .file = 6 } },
+    // 19. e5 Qxa1+
+    .{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 4, .file = 4 } },
+    .{ .from = .{ .rank = 1, .file = 1 }, .to = .{ .rank = 0, .file = 0 } },
+    // 20. Ke2 Na6
+    .{ .from = .{ .rank = 0, .file = 5 }, .to = .{ .rank = 1, .file = 4 } },
+    .{ .from = .{ .rank = 7, .file = 1 }, .to = .{ .rank = 5, .file = 0 } },
+    // 21. Nxg7+ Kd8
+    .{ .from = .{ .rank = 4, .file = 5 }, .to = .{ .rank = 6, .file = 6 } },
+    .{ .from = .{ .rank = 7, .file = 4 }, .to = .{ .rank = 7, .file = 3 } },
+    // 22. Qf6+ Nxf6
+    .{ .from = .{ .rank = 2, .file = 5 }, .to = .{ .rank = 5, .file = 5 } },
+    .{ .from = .{ .rank = 7, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
+    // 23. Be7#
+    .{ .from = .{ .rank = 5, .file = 3 }, .to = .{ .rank = 6, .file = 4 } },
+};
 
-pub fn main() void {}
+// Illegal moves used to exercise the rule engine's rejection path. Each originates on a square
+// that is never occupied at any point during The Immortal Game (a4, d4, a5), so
+// `is_legal_piece_move`'s `piece == .empty` short-circuit fires deterministically regardless of
+// the current position within the replay.
+const ILLEGAL_MOVES = [_]Move{
+    .{ .from = .{ .rank = 3, .file = 0 }, .to = .{ .rank = 4, .file = 0 } }, // a4→a5, empty from
+    .{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 4, .file = 3 } }, // d4→d5, empty from
+    .{ .from = .{ .rank = 4, .file = 0 }, .to = .{ .rank = 5, .file = 0 } }, // a5→a6, empty from
+};
 
-// const std = @import("std");
-// const terminal_io = @import("terminal_io");
-// const board_mod = @import("board");
-// const board_renderer = @import("board_renderer");
-// const Position = @import("shared.zig").Position;
+// ── Stats ─────────────────────────────────────────────────────────────────────
 
-// const ITERATIONS = 1000;
+/// Aggregate summary over a set of nanosecond samples. Sorts the samples in place during
+/// `compute_stats`, so callers must not rely on the input order post-call.
+///
+///   min / max — fastest and slowest individual iteration.
+///   avg       — arithmetic mean.
+///   p50 / p99 — median and 99th-percentile.
+///   stddev    — spread around the mean.
+const Stats = struct {
+    min: u64,
+    max: u64,
+    avg: u64,
+    p50: u64,
+    p99: u64,
+    stddev: u64,
+};
 
-// // Inter-frame delay in nanoseconds. Simulates a real display refresh interval so the terminal
-// // actually renders each frame and CPU caches cool between iterations. 16ms ≈ 60Hz.
-// const FRAME_DELAY_NS: u64 = 16 * std.time.ns_per_ms;
+/// Sorts the samples in place, then computes min/max/avg/p50/p99/stddev. The sort is required
+/// for the percentile calculation.
+fn compute_stats(samples: []u64) Stats {
+    std.debug.assert(samples.len > 0);
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
 
-// // A short sequence of legal opening moves cycled through during the benchmark.
-// // Each entry is a (from, to) pair of board positions. The sequence wraps every
-// // 6 iterations, and the board is reset to the starting position at the start
-// // of each cycle so every set of moves is applied to a valid board state.
-// const moves = [_][2]Position{
-//     .{ .{ .rank = 1, .file = 3 }, .{ .rank = 3, .file = 3 } },
-//     .{ .{ .rank = 6, .file = 3 }, .{ .rank = 4, .file = 3 } },
-//     .{ .{ .rank = 1, .file = 2 }, .{ .rank = 3, .file = 2 } },
-//     .{ .{ .rank = 6, .file = 4 }, .{ .rank = 5, .file = 4 } },
-//     .{ .{ .rank = 0, .file = 1 }, .{ .rank = 2, .file = 2 } },
-//     .{ .{ .rank = 7, .file = 6 }, .{ .rank = 5, .file = 5 } },
-// };
+    var sum: u128 = 0;
+    for (samples) |s| {
+        sum += s;
+    }
+    const avg: u64 = @intCast(sum / samples.len);
 
-// /// A human-friendly duration split into a magnitude and unit string.
-// const Duration = struct {
-//     value: f64,
-//     unit: []const u8,
-// };
+    // Variance = average of squared differences from the mean; stddev = sqrt(variance).
+    var variance_sum: u128 = 0;
+    for (samples) |s| {
+        const diff: i128 = @as(i128, s) - @as(i128, avg);
+        variance_sum += @intCast(diff * diff);
+    }
+    const variance: u64 = @intCast(variance_sum / samples.len);
+    const stddev: u64 = std.math.sqrt(variance);
 
-// /// Converts raw nanoseconds into the most readable unit (ns, µs, or ms).
-// fn format_duration(ns: u64) Duration {
-//     const ns_f: f64 = @floatFromInt(ns);
-//     if (ns >= 1_000_000_000) return .{ .value = ns_f / 1_000_000_000, .unit = "s" };
-//     if (ns >= 1_000_000) return .{ .value = ns_f / 1_000_000.0, .unit = "ms" };
-//     if (ns >= 1_000) return .{ .value = ns_f / 1_000.0, .unit = "µs" };
-//     return .{ .value = ns_f, .unit = "ns" };
-// }
+    return .{
+        .min = samples[0],
+        .max = samples[samples.len - 1],
+        .avg = avg,
+        .p50 = samples[samples.len / 2],
+        .p99 = samples[(samples.len * 99) / 100],
+        .stddev = stddev,
+    };
+}
 
-// /// Returns a monotonic timestamp in nanoseconds.
-// fn timestamp_ns() u64 {
-//     const clock = if (@hasField(std.c.CLOCK, "UPTIME_RAW")) .UPTIME_RAW else .MONOTONIC;
-//     var ts: std.c.timespec = undefined;
-//     _ = std.c.clock_gettime(clock, &ts);
-//     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-// }
+/// A human-friendly duration split into a magnitude and unit string.
+const Duration = struct {
+    value: f64,
+    unit: []const u8,
+};
 
-// /// Sleeps for the given number of nanoseconds using the C nanosleep syscall.
-// fn sleep_ns(ns: u64) void {
-//     const secs = ns / std.time.ns_per_s;
-//     const rem_ns = ns % std.time.ns_per_s;
-//     var req = std.c.timespec{
-//         .sec = @intCast(secs),
-//         .nsec = @intCast(rem_ns),
-//     };
-//     while (true) {
-//         var rem: std.c.timespec = undefined;
-//         const rc = std.c.nanosleep(&req, &rem);
-//         if (rc == 0) return;
-//         // Interrupted by signal, sleep the remainder.
-//         req = rem;
-//     }
-// }
+/// Converts raw nanoseconds into the most readable unit (ns, us, ms, s).
+///
+/// Units are kept 2-byte ASCII (including " s" for seconds) so alignment in the comparison table
+/// works byte-for-byte: a multi-byte "µs" would display as 2 chars but measure as 3 bytes, making
+/// `{s:>N}` right-align one char short on µs rows versus ns/ms rows.
+fn format_duration(ns: u64) Duration {
+    const ns_f: f64 = @floatFromInt(ns);
+    if (ns >= std.time.ns_per_s) {
+        return .{ .value = ns_f / @as(f64, @floatFromInt(std.time.ns_per_s)), .unit = " s" };
+    }
+    if (ns >= std.time.ns_per_ms) {
+        return .{ .value = ns_f / @as(f64, @floatFromInt(std.time.ns_per_ms)), .unit = "ms" };
+    }
+    if (ns >= std.time.ns_per_us) {
+        return .{ .value = ns_f / @as(f64, @floatFromInt(std.time.ns_per_us)), .unit = "us" };
+    }
+    return .{ .value = ns_f, .unit = "ns" };
+}
 
-// /// Aggregated statistics for a set of timing samples.
-// ///
-// ///   min / max   — fastest and slowest individual iteration.
-// ///   avg         — arithmetic mean across all samples.
-// ///   p50 / p99   — median and 99th-percentile latency (after sorting).
-// ///   stddev      — standard deviation: measures how spread out the samples are
-// ///                 from the average. A small stddev means consistent timings; a
-// ///                 large one means high variance between iterations.
-// const Stats = struct {
-//     min: u64,
-//     max: u64,
-//     avg: u64,
-//     p50: u64,
-//     p99: u64,
-//     stddev: u64,
-// };
+// ── Result buffer ─────────────────────────────────────────────────────────────
 
-// /// Sorts the samples in place, then computes min/max/avg/p50/p99/stddev.
-// /// The sort is required for percentile calculation — the p50 value is just the
-// /// middle element and p99 is the element at the 99% index.
-// fn compute_stats(samples: []u64) Stats {
-//     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+/// Accumulates the full benchmark report in a fixed-size stack buffer so we can hand the same
+/// bytes to both stderr and the results file with zero heap allocation.
+const ResultWriter = struct {
+    buf: [RESULT_BUFFER_SIZE]u8 = undefined,
+    len: usize = 0,
 
-//     var sum: u128 = 0;
-//     for (samples) |s| sum += s;
-//     const avg: u64 = @intCast(sum / samples.len);
+    fn print(self: *ResultWriter, comptime fmt: []const u8, args: anytype) void {
+        const slice = self.buf[self.len..];
+        const written = std.fmt.bufPrint(slice, fmt, args) catch {
+            // The report exceeded RESULT_BUFFER_SIZE. Leave the partial content and bail; the
+            // stderr output still reflects what fit.
+            return;
+        };
+        self.len += written.len;
+    }
 
-//     // Variance is the average of squared differences from the mean.
-//     // stddev = sqrt(variance) brings it back to the same unit as the samples.
-//     var variance_sum: u128 = 0;
-//     for (samples) |s| {
-//         const diff: i128 = @as(i128, s) - @as(i128, avg);
-//         variance_sum += @intCast(diff * diff);
-//     }
-//     const variance: u64 = @intCast(variance_sum / samples.len);
-//     const stddev: u64 = std.math.sqrt(variance);
+    fn contents(self: *const ResultWriter) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
 
-//     return .{
-//         .min = samples[0],
-//         .max = samples[samples.len - 1],
-//         .avg = avg,
-//         .p50 = samples[samples.len / 2],
-//         .p99 = samples[(samples.len * 99) / 100],
-//         .stddev = stddev,
-//     };
-// }
+/// Writes one row of the copy-vs-mutate comparison table. Negative delta = mutate faster.
+/// Emits "n/a" when `copy_ns` is zero (percent-of-zero is undefined; happens on noise-floor
+/// metrics like illegal-reject p50 where both variants measure 0 ns).
+///
+/// Pre-formats value+unit and delta into buffers so the outer `{s:>N}` alignment works on the
+/// composed string (otherwise splitting value and unit across format slots leaves the unit
+/// dangling at a variable position, and the sign/digit gap on deltas breaks).
+fn write_compare_row(
+    w: *ResultWriter,
+    label: []const u8,
+    copy_ns: u64,
+    mutate_ns: u64,
+) void {
+    const c = format_duration(copy_ns);
+    const m = format_duration(mutate_ns);
 
-// // ── Result output buffer ─────────────────────────────────────────────────────
-// // Accumulates the full benchmark report so it can be written to both stderr
-// // and a file in one shot.
-// const RESULT_BUF_SIZE = 4096;
+    var copy_buf: [16]u8 = undefined;
+    var mutate_buf: [16]u8 = undefined;
+    const copy_str = std.fmt.bufPrint(&copy_buf, "{d:.1} {s}", .{ c.value, c.unit }) catch "?";
+    const mutate_str = std.fmt.bufPrint(&mutate_buf, "{d:.1} {s}", .{ m.value, m.unit }) catch "?";
 
-// const ResultWriter = struct {
-//     buf: [RESULT_BUF_SIZE]u8 = undefined,
-//     len: usize = 0,
+    // Build the delta string so the sign sits adjacent to the digits (Zig 0.16.0 fmt doesn't
+    // accept the `+` flag on floats, so we'd otherwise get "+   6.3%" with a 3-space gap).
+    var delta_buf: [16]u8 = undefined;
+    const delta_str: []const u8 = blk: {
+        if (copy_ns == 0) {
+            break :blk "n/a";
+        }
+        const diff: f64 = @as(f64, @floatFromInt(mutate_ns)) - @as(f64, @floatFromInt(copy_ns));
+        const pct = diff / @as(f64, @floatFromInt(copy_ns)) * 100.0;
+        const abs_pct = @abs(pct);
+        const sign: u8 = if (pct >= 0.0) '+' else '-';
+        break :blk std.fmt.bufPrint(&delta_buf, "{c}{d:.1}%", .{ sign, abs_pct }) catch "?";
+    };
 
-//     fn print(self: *ResultWriter, comptime fmt: []const u8, args: anytype) void {
-//         const slice = self.buf[self.len..];
-//         const written = std.fmt.bufPrint(slice, fmt, args) catch {
-//             return;
-//         };
-//         self.len += written.len;
-//     }
+    w.print("  │ {s:<20} │ {s:>11} │ {s:>11} │ {s:>8} │\n", .{
+        label, copy_str, mutate_str, delta_str,
+    });
+}
 
-//     fn contents(self: *const ResultWriter) []const u8 {
-//         return self.buf[0..self.len];
-//     }
-// };
+/// One row of a stat table: the label plus its six summary values.
+const StatRow = struct {
+    label: []const u8,
+    stats: Stats,
+};
 
-// fn write_stat_block(w: *ResultWriter, label: []const u8, stats: Stats) void {
-//     const min = format_duration(stats.min);
-//     const avg = format_duration(stats.avg);
-//     const p50 = format_duration(stats.p50);
-//     const p99 = format_duration(stats.p99);
-//     const max = format_duration(stats.max);
-//     const sd = format_duration(stats.stddev);
+/// Writes a stat table: one row per metric, six columns (min/avg/p50/p99/max/stddev). Values are
+/// pre-formatted into small buffers before the outer `{s:>N}` alignment runs, for the same reason
+/// `write_compare_row` does it — splitting value + unit across format slots desyncs alignment.
+fn write_stat_table(w: *ResultWriter, rows: []const StatRow) void {
+    w.print("  ┌────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┐\n", .{});
+    w.print("  │ {s:<6} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │\n", .{
+        "metric", "min", "avg", "p50", "p99", "max", "stddev",
+    });
+    w.print("  ├────────┼─────────────┼─────────────┼─────────────┼─────────────┼─────────────┼─────────────┤\n", .{});
+    for (rows) |row| {
+        const min = format_duration(row.stats.min);
+        const avg = format_duration(row.stats.avg);
+        const p50 = format_duration(row.stats.p50);
+        const p99 = format_duration(row.stats.p99);
+        const max = format_duration(row.stats.max);
+        const sd = format_duration(row.stats.stddev);
 
-//     w.print("  {s}\r\n", .{label});
-//     w.print("    min    {d:>8.1} {s}\r\n", .{ min.value, min.unit });
-//     w.print("    avg    {d:>8.1} {s}\r\n", .{ avg.value, avg.unit });
-//     w.print("    p50    {d:>8.1} {s}\r\n", .{ p50.value, p50.unit });
-//     w.print("    p99    {d:>8.1} {s}\r\n", .{ p99.value, p99.unit });
-//     w.print("    max    {d:>8.1} {s}\r\n", .{ max.value, max.unit });
-//     w.print("    stddev {d:>8.1} {s}\r\n", .{ sd.value, sd.unit });
-// }
+        var min_buf: [16]u8 = undefined;
+        var avg_buf: [16]u8 = undefined;
+        var p50_buf: [16]u8 = undefined;
+        var p99_buf: [16]u8 = undefined;
+        var max_buf: [16]u8 = undefined;
+        var sd_buf: [16]u8 = undefined;
+        const min_s = std.fmt.bufPrint(&min_buf, "{d:.1} {s}", .{ min.value, min.unit }) catch "?";
+        const avg_s = std.fmt.bufPrint(&avg_buf, "{d:.1} {s}", .{ avg.value, avg.unit }) catch "?";
+        const p50_s = std.fmt.bufPrint(&p50_buf, "{d:.1} {s}", .{ p50.value, p50.unit }) catch "?";
+        const p99_s = std.fmt.bufPrint(&p99_buf, "{d:.1} {s}", .{ p99.value, p99.unit }) catch "?";
+        const max_s = std.fmt.bufPrint(&max_buf, "{d:.1} {s}", .{ max.value, max.unit }) catch "?";
+        const sd_s = std.fmt.bufPrint(&sd_buf, "{d:.1} {s}", .{ sd.value, sd.unit }) catch "?";
 
-// /// Queries a macOS sysctl string value by name into the provided buffer.
-// /// Returns the slice of the buffer that was filled, or null if the call failed.
-// fn sysctl_string(name: [*:0]const u8, buf: []u8) ?[]const u8 {
-//     var len: usize = buf.len;
-//     const rc = std.c.sysctlbyname(name, buf.ptr, &len, null, 0);
-//     if (rc != 0 or len == 0) return null;
-//     // sysctl includes a trailing null byte in the returned length.
-//     const str_len = if (buf[len - 1] == 0) len - 1 else len;
-//     return buf[0..str_len];
-// }
+        w.print("  │ {s:<6} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │\n", .{
+            row.label, min_s, avg_s, p50_s, p99_s, max_s, sd_s,
+        });
+    }
+    w.print("  └────────┴─────────────┴─────────────┴─────────────┴─────────────┴─────────────┴─────────────┘\n", .{});
+}
 
-// /// Queries a macOS sysctl u64 value by name. Returns null if the call failed.
-// fn sysctl_u64(name: [*:0]const u8) ?u64 {
-//     var value: u64 = 0;
-//     var len: usize = @sizeOf(u64);
-//     const rc = std.c.sysctlbyname(name, @ptrCast(&value), &len, null, 0);
-//     if (rc != 0) return null;
-//     return value;
-// }
+fn write_system_info(w: *ResultWriter) void {
+    w.print("  os:      {s}\n", .{@tagName(builtin.os.tag)});
+    w.print("  arch:    {s}\n", .{@tagName(builtin.cpu.arch)});
+    w.print("  mode:    {s}\n", .{@tagName(builtin.mode)});
+}
 
-// fn write_system_info(w: *ResultWriter) void {
-//     var cpu_buf: [256]u8 = undefined;
-//     const cpu = sysctl_string("machdep.cpu.brand_string", &cpu_buf) orelse "unknown";
-//     const ram_bytes = sysctl_u64("hw.memsize") orelse 0;
-//     const ram_gb = @as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0);
+// ── Timing helpers ────────────────────────────────────────────────────────────
 
-//     w.print("  cpu:   {s}\r\n", .{cpu});
-//     w.print("  ram:   {d:.0} GB\r\n", .{ram_gb});
-// }
+/// Reads the monotonic `.awake` clock (CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW on macOS) via
+/// `std.Io.Clock.Timestamp.now`. Returns the timestamp; callers use `duration_ns_between` to
+/// compute elapsed nanoseconds.
+inline fn timestamp_now(io: Io) Clock.Timestamp {
+    return Clock.Timestamp.now(io, .awake);
+}
 
-// /// Writes the result buffer to a file at the given path. Silently does nothing
-// /// on failure — benchmark results are already on screen.
-// fn write_results_file(path: [*:0]const u8, data: []const u8) void {
-//     // O_WRONLY | O_CREAT | O_TRUNC
-//     const O = std.c.O;
-//     const mode: std.c.mode_t = 0o644;
-//     const fd = std.c.open(
-//         path,
-//         @bitCast(O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }),
-//         mode,
-//     );
-//     if (fd < 0) return;
-//     defer _ = std.c.close(fd);
-//     _ = std.c.write(fd, data.ptr, data.len);
-// }
+/// Nanoseconds elapsed from `t0` to `t1`. Expects `t1 >= t0` on the same monotonic clock; the
+/// `.awake` clock guarantees this by the Zig 0.16.0 spec.
+inline fn duration_ns_between(t0: Clock.Timestamp, t1: Clock.Timestamp) u64 {
+    const ns_i96: i96 = t0.durationTo(t1).raw.toNanoseconds();
+    // Monotonic clock plus `t1 >= t0` means the delta is non-negative and fits in u64 for any
+    // practical benchmark length.
+    std.debug.assert(ns_i96 >= 0);
+    return @intCast(ns_i96);
+}
 
-// pub fn main() !void {
-//     var io: terminal_io.TerminalIO = undefined;
-//     try io.init();
-//     try io.enable_raw_mode();
-//     defer io.restore_termios();
+// ── File output ───────────────────────────────────────────────────────────────
 
-//     var board: board_mod.Board = undefined;
-//     board.init();
+/// Writes `data` to `RESULT_FILE_PATH`, creating the parent directory if needed. Uses
+/// `std.Io.Dir` exclusively — no libc, no `std.c.open/write`.
+fn write_results_file(io: Io, data: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(io, RESULT_FILE_DIR);
+    try cwd.writeFile(io, .{ .sub_path = RESULT_FILE_PATH, .data = data });
+}
 
-//     var renderer: board_renderer.BoardRenderer = undefined;
-//     try renderer.init(io.window_config);
+// ── Main ──────────────────────────────────────────────────────────────────────
 
-//     // Per-iteration nanosecond timings, filled during the loop and fed to
-//     // compute_stats afterwards. build = buffer construction, write = terminal
-//     // I/O, total = build + write for each iteration.
-//     var build_samples: [ITERATIONS]u64 = undefined;
-//     var write_samples: [ITERATIONS]u64 = undefined;
-//     var total_samples: [ITERATIONS]u64 = undefined;
+pub fn main() void {
+    // Single-threaded Io instance for the file-write path and clock reads. `init_single_threaded`
+    // pre-initialises everything at comptime, including an allocator that would fail on any
+    // concurrent call — fine here because the bench is fully synchronous.
+    var threaded: Threaded = Threaded.init_single_threaded;
+    const io = threaded.io();
 
-//     // Counts how many frames the terminal write syscall accepted successfully.
-//     // Should equal ITERATIONS if all frames were delivered to the pty buffer.
-//     var successful_writes: u32 = 0;
+    // Two independent games, one driven by the copy-based legality path (`play_move`,
+    // `is_move_legal`) and one by the mutate-and-retract path (`play_move_mutate`,
+    // `is_move_legal_mutate`). Both are reset in lockstep so each iteration times both variants
+    // on the same position, cancelling out most cache/scheduler noise.
+    var game_copy: Game = undefined;
+    game_copy.init(.white);
+    var game_mutate: Game = undefined;
+    game_mutate.init(.white);
 
-//     // Track the last frame's buffer size for reporting.
-//     var last_frame_size: usize = 0;
+    // Construct a synthetic terminal size large enough to pick the renderer's largest cell
+    // dimensions (11x5). This is where the worst-case ~12 KB frame buffer lives, matching the
+    // shape the real game will eventually produce.
+    const ws: std.posix.winsize = .{
+        .col = BENCH_WINDOW_COLS,
+        .row = BENCH_WINDOW_ROWS,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    var renderer: BoardRenderer = undefined;
+    renderer.init(ws);
 
-//     const move_count = moves.len;
-//     const wall_start = timestamp_ns();
+    // Per-iteration samples, two variants. `reject_samples_*` sized to the illegal-move upper
+    // bound. `cycle_samples_*` holds one entry per completed 45-move replay (`ITERATIONS /
+    // MOVE_CYCLE_LEN + 1` slots; unused tail stays undefined). `render_samples` is shared — the
+    // renderer is only exercised once per legal iteration (on `game_copy`, which stays in sync
+    // with the mutate game anyway).
+    var apply_samples_copy: [ITERATIONS]u64 = undefined;
+    var apply_samples_mutate: [ITERATIONS]u64 = undefined;
+    var render_samples: [ITERATIONS]u64 = undefined;
+    var reject_samples_copy: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
+    var reject_samples_mutate: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
+    var cycle_samples_copy: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
+    var cycle_samples_mutate: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
 
-//     for (0..ITERATIONS) |i| {
-//         const move_idx = i % move_count;
+    var legal_count: usize = 0;
+    var reject_count: usize = 0;
+    var cycle_count: usize = 0;
 
-//         // Reset to starting position at the beginning of each cycle so every
-//         // set of moves is applied to a valid board. The reset is deliberately
-//         // outside the timed region.
-//         if (move_idx == 0) {
-//             board.init();
-//         }
+    // Cycle accumulators — rolled into `cycle_samples_*` on the last half-move of each replay.
+    // Illegal-move rejection time is deliberately excluded so the full-game stat is independent
+    // of `ILLEGAL_MOVE_EVERY_N`.
+    var cycle_accum_copy: u64 = 0;
+    var cycle_accum_mutate: u64 = 0;
 
-//         const m = moves[move_idx];
-//         board.move(m[0], m[1]);
-//         renderer.flip_perspective();
+    const wall_start = timestamp_now(io);
 
-//         const build_start = timestamp_ns();
-//         const buffer = try renderer.draw(&board);
-//         const build_ns = timestamp_ns() - build_start;
+    for (0..ITERATIONS) |i| {
+        if (i % ILLEGAL_MOVE_EVERY_N == 0) {
+            const mv = ILLEGAL_MOVES[reject_count % ILLEGAL_MOVES.len];
 
-//         const write_start = timestamp_ns();
-//         const write_result = terminal_io.TerminalIO.write(buffer);
-//         const write_ns = timestamp_ns() - write_start;
+            // Copy path.
+            const c0 = timestamp_now(io);
+            const legal_copy = game_copy.is_move_legal(mv);
+            const c1 = timestamp_now(io);
 
-//         build_samples[i] = build_ns;
-//         write_samples[i] = write_ns;
-//         total_samples[i] = build_ns + write_ns;
+            // Mutate path.
+            const m0 = timestamp_now(io);
+            const legal_mutate = game_mutate.is_move_legal_mutate(mv);
+            const m1 = timestamp_now(io);
 
-//         last_frame_size = buffer.len;
+            // Sanity: the chosen illegal moves originate on always-empty squares, so both rule
+            // paths must reject. If either fires, the illegal table or the game state invariant
+            // is wrong.
+            std.debug.assert(!legal_copy);
+            std.debug.assert(!legal_mutate);
+            reject_samples_copy[reject_count] = duration_ns_between(c0, c1);
+            reject_samples_mutate[reject_count] = duration_ns_between(m0, m1);
+            reject_count += 1;
+            continue;
+        }
 
-//         // Track whether the write syscall succeeded (returned a positive byte count).
-//         if (write_result > 0) successful_writes += 1;
+        // Reset at every cycle boundary so every replay starts from the real starting position.
+        // Reset runs outside the timed region.
+        const cycle_idx = legal_count % MOVE_CYCLE_LEN;
+        if (cycle_idx == 0) {
+            game_copy.init(.white);
+            game_mutate.init(.white);
+        }
+        const mv = IMMORTAL_GAME[cycle_idx];
 
-//         // Sleep between frames so the terminal actually renders each one and
-//         // CPU caches cool down, giving realistic per-frame latency numbers.
-//         sleep_ns(FRAME_DELAY_NS);
-//     }
+        // Copy-based apply.
+        const c0 = timestamp_now(io);
+        game_copy.play_move(mv) catch {
+            std.debug.print(
+                "bench: copy-variant legal move rejected at cycle_idx={d} (iter={d}); aborting\n",
+                .{ cycle_idx, i },
+            );
+            return;
+        };
+        const c1 = timestamp_now(io);
+        const apply_ns_copy = duration_ns_between(c0, c1);
+        apply_samples_copy[legal_count] = apply_ns_copy;
 
-//     const wall_elapsed_ns = timestamp_ns() - wall_start;
+        // Mutate-based apply.
+        const m0 = timestamp_now(io);
+        game_mutate.play_move_mutate(mv) catch {
+            std.debug.print(
+                "bench: mutate-variant legal move rejected at cycle_idx={d} (iter={d}); aborting\n",
+                .{ cycle_idx, i },
+            );
+            return;
+        };
+        const m1 = timestamp_now(io);
+        const apply_ns_mutate = duration_ns_between(m0, m1);
+        apply_samples_mutate[legal_count] = apply_ns_mutate;
 
-//     // Restore terminal before printing results so they aren't cleared.
-//     io.restore_termios();
+        // Render once (shared between variants — the two game instances hold identical state).
+        const r0 = timestamp_now(io);
+        const buf = renderer.draw(&game_copy);
+        const r1 = timestamp_now(io);
+        const render_ns = duration_ns_between(r0, r1);
+        render_samples[legal_count] = render_ns;
+        std.mem.doNotOptimizeAway(buf.len);
 
-//     // Clear the screen so the last rendered board doesn't sit above the results.
-//     _ = terminal_io.TerminalIO.write(
-//         terminal_io.EscapeSequences.CLEAR_SCREEN ++ terminal_io.EscapeSequences.SET_CURSOR_TO_HOME,
-//     );
+        cycle_accum_copy += apply_ns_copy + render_ns;
+        cycle_accum_mutate += apply_ns_mutate + render_ns;
+        if (cycle_idx == MOVE_CYCLE_LEN - 1) {
+            cycle_samples_copy[cycle_count] = cycle_accum_copy;
+            cycle_samples_mutate[cycle_count] = cycle_accum_mutate;
+            cycle_count += 1;
+            cycle_accum_copy = 0;
+            cycle_accum_mutate = 0;
+        }
 
-//     const size_kb = @as(f64, @floatFromInt(last_frame_size)) / 1024.0;
-//     const elapsed = format_duration(wall_elapsed_ns);
-//     const delay_ms = @as(f64, @floatFromInt(FRAME_DELAY_NS)) / 1_000_000.0;
+        legal_count += 1;
+    }
 
-//     // Build the full report into a buffer so we can write it to both stderr and a file.
-//     var results: ResultWriter = .{};
+    const wall_end = timestamp_now(io);
+    const wall_ns = duration_ns_between(wall_start, wall_end);
 
-//     results.print("=== Benchmark ===\r\n", .{});
-//     write_system_info(&results);
-//     results.print("  iters: {d}, {d:.2} KB/frame, {d:.0} ms inter-frame delay\r\n", .{
-//         ITERATIONS, size_kb, delay_ms,
-//     });
-//     results.print("  wrote: {d}/{d} frames delivered to pty\r\n", .{
-//         successful_writes,
-//         ITERATIONS,
-//     });
-//     results.print("  clock: {d:.1} {s}\r\n", .{ elapsed.value, elapsed.unit });
-//     results.print("\r\n", .{});
+    // Cross-check the iteration accounting — catches off-by-ones in the illegal cadence logic
+    // without relying on the tests (there are no bench tests).
+    std.debug.assert(legal_count + reject_count == ITERATIONS);
 
-//     write_stat_block(&results, "buffer build", compute_stats(&build_samples));
-//     results.print("\r\n", .{});
-//     write_stat_block(&results, "terminal write", compute_stats(&write_samples));
-//     results.print("\r\n", .{});
-//     write_stat_block(&results, "total (b+w)", compute_stats(&total_samples));
-//     results.print("\r\n", .{});
+    // Build the report.
+    var results: ResultWriter = .{};
+    results.print("=== Benchmark ===\n", .{});
+    write_system_info(&results);
+    results.print("  iters:   {d} total ({d} legal, {d} illegal)\n", .{
+        ITERATIONS,
+        legal_count,
+        reject_count,
+    });
+    results.print("  cycle:   Immortal Game ({d} half-moves, resets at cycle boundary)\n", .{
+        MOVE_CYCLE_LEN,
+    });
+    const wall = format_duration(wall_ns);
+    results.print("  clock:   {d:.1} {s} wall\n", .{ wall.value, wall.unit });
+    results.print("  cycles:  {d} full {d}-move replays completed\n", .{
+        cycle_count,
+        MOVE_CYCLE_LEN,
+    });
+    results.print("\n", .{});
 
-//     // Print to terminal.
-//     std.debug.print("{s}", .{results.contents()});
+    // Compute stats once per variant × metric, then reuse for the stat tables and comparison.
+    const apply_copy = compute_stats(apply_samples_copy[0..legal_count]);
+    const apply_mutate = compute_stats(apply_samples_mutate[0..legal_count]);
+    const reject_copy = compute_stats(reject_samples_copy[0..reject_count]);
+    const reject_mutate = compute_stats(reject_samples_mutate[0..reject_count]);
+    const render_stats = compute_stats(render_samples[0..legal_count]);
+    const cycle_copy = if (cycle_count > 0)
+        compute_stats(cycle_samples_copy[0..cycle_count])
+    else
+        Stats{ .min = 0, .max = 0, .avg = 0, .p50 = 0, .p99 = 0, .stddev = 0 };
+    const cycle_mutate = if (cycle_count > 0)
+        compute_stats(cycle_samples_mutate[0..cycle_count])
+    else
+        Stats{ .min = 0, .max = 0, .avg = 0, .p50 = 0, .p99 = 0, .stddev = 0 };
 
-//     // Also persist to file for later reference.
-//     write_results_file("tmp/bench/bench_results.txt", results.contents());
-// }
+    // Copy-based variant (current filter_self_check).
+    const copy_rows_all = [_]StatRow{
+        .{ .label = "apply", .stats = apply_copy },
+        .{ .label = "reject", .stats = reject_copy },
+        .{ .label = "cycle", .stats = cycle_copy },
+    };
+    const copy_rows: []const StatRow = if (cycle_count > 0) copy_rows_all[0..] else copy_rows_all[0..2];
+    results.print("── variant: copy (filter_self_check) ─────────────────────────\n", .{});
+    write_stat_table(&results, copy_rows);
+    results.print("\n", .{});
+
+    // Mutate-and-retract variant (filter_self_check_mutate).
+    const mutate_rows_all = [_]StatRow{
+        .{ .label = "apply", .stats = apply_mutate },
+        .{ .label = "reject", .stats = reject_mutate },
+        .{ .label = "cycle", .stats = cycle_mutate },
+    };
+    const mutate_rows: []const StatRow = if (cycle_count > 0) mutate_rows_all[0..] else mutate_rows_all[0..2];
+    results.print("── variant: mutate (filter_self_check_mutate) ────────────────\n", .{});
+    write_stat_table(&results, mutate_rows);
+    results.print("\n", .{});
+
+    // Renderer is drawn after every legal move, on game_copy (both games track the same position,
+    // so one draw suffices). Reported here as a single-row table — per-move samples, not a
+    // one-shot measurement.
+    const render_rows = [_]StatRow{.{ .label = "render", .stats = render_stats }};
+    results.print("── renderer (drawn after every legal move) ───────────────────\n", .{});
+    write_stat_table(&results, &render_rows);
+    results.print("\n", .{});
+
+    // Side-by-side comparison. Negative delta means the mutate variant ran faster than the copy
+    // variant for that metric. Box-drawn as a proper table — all cells right-align byte-for-byte
+    // because every unit string is 2 bytes (ns, us, ms, " s") and deltas / values are composed
+    // into buffers before the outer `{s:>N}` alignment runs.
+    results.print("── comparison (mutate vs copy) ───────────────────────────────\n", .{});
+    results.print("  ┌──────────────────────┬─────────────┬─────────────┬──────────┐\n", .{});
+    results.print("  │ {s:<20} │ {s:>11} │ {s:>11} │ {s:>8} │\n", .{
+        "metric", "copy", "mutate", "delta",
+    });
+    results.print("  ├──────────────────────┼─────────────┼─────────────┼──────────┤\n", .{});
+    write_compare_row(&results, "apply min", apply_copy.min, apply_mutate.min);
+    write_compare_row(&results, "apply avg", apply_copy.avg, apply_mutate.avg);
+    write_compare_row(&results, "apply p50", apply_copy.p50, apply_mutate.p50);
+    write_compare_row(&results, "apply p99", apply_copy.p99, apply_mutate.p99);
+    write_compare_row(&results, "apply max", apply_copy.max, apply_mutate.max);
+    write_compare_row(&results, "reject avg", reject_copy.avg, reject_mutate.avg);
+    write_compare_row(&results, "reject p50", reject_copy.p50, reject_mutate.p50);
+    write_compare_row(&results, "reject p99", reject_copy.p99, reject_mutate.p99);
+    if (cycle_count > 0) {
+        write_compare_row(&results, "cycle min", cycle_copy.min, cycle_mutate.min);
+        write_compare_row(&results, "cycle avg", cycle_copy.avg, cycle_mutate.avg);
+        write_compare_row(&results, "cycle p50", cycle_copy.p50, cycle_mutate.p50);
+        write_compare_row(&results, "cycle p99", cycle_copy.p99, cycle_mutate.p99);
+        write_compare_row(&results, "cycle max", cycle_copy.max, cycle_mutate.max);
+    }
+    results.print("  └──────────────────────┴─────────────┴─────────────┴──────────┘\n", .{});
+
+    // Emit to stderr.
+    std.debug.print("{s}", .{results.contents()});
+
+    // Persist. Best-effort: if the write fails, the stderr report is still available.
+    write_results_file(io, results.contents()) catch |err| {
+        std.debug.print(
+            "bench: failed to write {s}: {t}\n",
+            .{ RESULT_FILE_PATH, err },
+        );
+    };
+}

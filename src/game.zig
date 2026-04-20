@@ -309,12 +309,81 @@ pub const Game = struct {
         return effects;
     }
 
+    /// Tries to play the inputted move. If it's a legal move updates the board position and handles
+    /// the captures. Returns error.IllegalMove in case the move is illegal.
+    pub fn play_move(self: *Game, move: Move) !void {
+        if (!self.is_move_legal(move)) {
+            return error.InvalidMove;
+        }
+
+        // TODO: Handle special captures. Like en-passant
+        const captured_piece = self.board.board_state[move.to.rank][move.to.file];
+
+        // Handle captures.
+        if (captured_piece != .empty) {
+            // You can't capture your own piece and you can't captrue a king.
+            std.debug.assert(captured_piece.color().? != self.current_turn);
+            std.debug.assert(captured_piece != .white_king and captured_piece != .black_king);
+
+            switch (self.current_turn) {
+                .white => self.captures_by_white.append_assume_capacity(captured_piece),
+                .black => self.captures_by_black.append_assume_capacity(captured_piece),
+            }
+        }
+
+        // Update the board position and flip the turn color.
+        self.board.move(move.from, move.to);
+        // TODO: This should likely be something a game effect would enforce, not sure, keeping
+        // as is for now for testing purposes.
+        self.current_turn = switch (self.current_turn) {
+            .black => .white,
+            .white => .black,
+        };
+    }
+
     /// Returns true if `move` is a legal move given the current board, castling rights, and
     /// en-passant square. Pure query — does not mutate game state. Turn check is the caller's
-    /// responsibility (matches `rules.is_legal_piece_move`'s contract).
+    /// responsibility.
     pub fn is_move_legal(self: *const Game, move: Move) bool {
         return rules_engine.is_legal_piece_move(&self.board, &self.castling_rights, self.en_passant_square, move);
     }
+
+    // ── TEMP: mutate-and-retract A/B twins ───────────────────────────────────
+    // Paired with the `*_mutate` functions in rule_engine/rules.zig. Delete this block together
+    // with the rule-engine twins once the comparison lands.
+
+    /// Twin of `is_move_legal` that routes through `rules_engine.is_legal_piece_move_mutate`.
+    pub fn is_move_legal_mutate(self: *const Game, move: Move) bool {
+        return rules_engine.is_legal_piece_move_mutate(&self.board, &self.castling_rights, self.en_passant_square, move);
+    }
+
+    /// Twin of `play_move` that uses the mutate-and-retract legality path. Body is otherwise
+    /// verbatim — captures, assertions, turn flip all identical.
+    pub fn play_move_mutate(self: *Game, move: Move) !void {
+        if (!self.is_move_legal_mutate(move)) {
+            return error.InvalidMove;
+        }
+
+        const captured_piece = self.board.board_state[move.to.rank][move.to.file];
+
+        if (captured_piece != .empty) {
+            std.debug.assert(captured_piece.color().? != self.current_turn);
+            std.debug.assert(captured_piece != .white_king and captured_piece != .black_king);
+
+            switch (self.current_turn) {
+                .white => self.captures_by_white.append_assume_capacity(captured_piece),
+                .black => self.captures_by_black.append_assume_capacity(captured_piece),
+            }
+        }
+
+        self.board.move(move.from, move.to);
+        self.current_turn = switch (self.current_turn) {
+            .black => .white,
+            .white => .black,
+        };
+    }
+
+    // ── end TEMP ─────────────────────────────────────────────────────────────
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

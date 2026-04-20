@@ -185,6 +185,82 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "terminal_io.zig", .module = bench_terminal_io_mod },
             .{ .name = "shared.zig", .module = bench_shared_mod },
+            .{ .name = "bounded_array.zig", .module = bench_bounded_array_mod },
+        },
+    });
+
+    // Rule-engine modules. rule_engine/*.zig files import siblings via "shared.zig",
+    // "check_helper.zig", "test_util.zig" and parents via "../shared.zig", "../board.zig",
+    // "../bounded_array.zig"; we wire each literal import string to the matching named
+    // module so the whole bench graph resolves to a single module per source file
+    // (otherwise Zig synthesizes anonymous modules per importing file and types diverge).
+    // "test_util.zig" is pulled in because the three rule_engine files declare a file-level
+    // `const test_util = @import("test_util.zig")` that Zig resolves during non-test builds too.
+    const bench_test_util_mod = b.createModule(.{
+        .root_source_file = b.path("src/rule_engine/test_util.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "../shared.zig", .module = bench_shared_mod },
+            .{ .name = "../board.zig", .module = bench_board_mod },
+        },
+    });
+
+    const bench_rule_engine_shared_mod = b.createModule(.{
+        .root_source_file = b.path("src/rule_engine/shared.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "../shared.zig", .module = bench_shared_mod },
+            .{ .name = "../board.zig", .module = bench_board_mod },
+            .{ .name = "../bounded_array.zig", .module = bench_bounded_array_mod },
+            .{ .name = "test_util.zig", .module = bench_test_util_mod },
+        },
+    });
+
+    const bench_check_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/rule_engine/check_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "../shared.zig", .module = bench_shared_mod },
+            .{ .name = "../board.zig", .module = bench_board_mod },
+            .{ .name = "shared.zig", .module = bench_rule_engine_shared_mod },
+            .{ .name = "test_util.zig", .module = bench_test_util_mod },
+        },
+    });
+
+    const bench_rules_mod = b.createModule(.{
+        .root_source_file = b.path("src/rule_engine/rules.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "../shared.zig", .module = bench_shared_mod },
+            .{ .name = "../board.zig", .module = bench_board_mod },
+            .{ .name = "../bounded_array.zig", .module = bench_bounded_array_mod },
+            .{ .name = "shared.zig", .module = bench_rule_engine_shared_mod },
+            .{ .name = "check_helper.zig", .module = bench_check_helper_mod },
+            .{ .name = "test_util.zig", .module = bench_test_util_mod },
+        },
+    });
+
+    // game.zig has a file-level test block that does `_ = @import("rule_engine/check_helper.zig")`,
+    // `"rule_engine/shared.zig"`, and `"rule_engine/test_util.zig"` (these force the rule engine's
+    // own tests into the test runner). Zig evaluates these imports during non-test compilation
+    // too, so we must wire named imports for each — otherwise Zig falls back to file-relative
+    // resolution and creates anonymous modules that clash with the ones already registered.
+    const bench_game_mod = b.createModule(.{
+        .root_source_file = b.path("src/game.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "board.zig", .module = bench_board_mod },
+            .{ .name = "shared.zig", .module = bench_shared_mod },
+            .{ .name = "bounded_array.zig", .module = bench_bounded_array_mod },
+            .{ .name = "rule_engine/rules.zig", .module = bench_rules_mod },
+            .{ .name = "rule_engine/check_helper.zig", .module = bench_check_helper_mod },
+            .{ .name = "rule_engine/shared.zig", .module = bench_rule_engine_shared_mod },
+            .{ .name = "rule_engine/test_util.zig", .module = bench_test_util_mod },
         },
     });
 
@@ -197,6 +273,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "board.zig", .module = bench_board_mod },
             .{ .name = "shared.zig", .module = bench_shared_mod },
             .{ .name = "bounded_array.zig", .module = bench_bounded_array_mod },
+            .{ .name = "game.zig", .module = bench_game_mod },
         },
     });
 
@@ -211,6 +288,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "board", .module = bench_board_mod },
                 .{ .name = "board_renderer", .module = bench_board_renderer_mod },
                 .{ .name = "shared.zig", .module = bench_shared_mod },
+                .{ .name = "game", .module = bench_game_mod },
             },
         }),
     });
