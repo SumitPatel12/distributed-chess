@@ -38,10 +38,12 @@ const ILLEGAL_MOVE_EVERY_N: usize = 10;
 /// Length of one full replay of The Immortal Game (45 half-moves; see `IMMORTAL_GAME` below).
 const MOVE_CYCLE_LEN: usize = IMMORTAL_GAME.len;
 
-/// Size of the stack buffer that accumulates the full result report. Tables use box-drawing
-/// chars (3 UTF-8 bytes each), so the budget is dominated by borders: ~7 tables × ~3 border rows
-/// × ~100 box chars ≈ 6 KB of border bytes alone. 16 KB leaves headroom.
-const RESULT_BUFFER_SIZE: usize = 16 * 1024;
+/// Size of the stack buffer that accumulates the full result report. Seven stat blocks
+/// (apply/reject/cycle × copy+mutate + renderer) at ~210 bytes each ≈ 1.5 KB, plus the box-drawn
+/// comparison table (≈1.5 KB with 3-byte UTF-8 borders) and the header / system-info block
+/// (≈500 bytes) land at ~3.5 KB peak. 8 KB doubles that for headroom so a future metric or an
+/// extra comparison row doesn't silently truncate via `bufPrint`'s catch-and-return.
+const RESULT_BUFFER_SIZE: usize = 8 * 1024;
 
 /// On-disk path for the persisted report, relative to cwd.
 const RESULT_FILE_PATH = "tmp/bench/bench_results.txt";
@@ -285,47 +287,21 @@ fn write_compare_row(
     });
 }
 
-/// One row of a stat table: the label plus its six summary values.
-const StatRow = struct {
-    label: []const u8,
-    stats: Stats,
-};
+fn write_stat_block(w: *ResultWriter, label: []const u8, stats: Stats) void {
+    const min = format_duration(stats.min);
+    const avg = format_duration(stats.avg);
+    const p50 = format_duration(stats.p50);
+    const p99 = format_duration(stats.p99);
+    const max = format_duration(stats.max);
+    const sd = format_duration(stats.stddev);
 
-/// Writes a stat table: one row per metric, six columns (min/avg/p50/p99/max/stddev). Values are
-/// pre-formatted into small buffers before the outer `{s:>N}` alignment runs, for the same reason
-/// `write_compare_row` does it — splitting value + unit across format slots desyncs alignment.
-fn write_stat_table(w: *ResultWriter, rows: []const StatRow) void {
-    w.print("  ┌────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┐\n", .{});
-    w.print("  │ {s:<6} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │\n", .{
-        "metric", "min", "avg", "p50", "p99", "max", "stddev",
-    });
-    w.print("  ├────────┼─────────────┼─────────────┼─────────────┼─────────────┼─────────────┼─────────────┤\n", .{});
-    for (rows) |row| {
-        const min = format_duration(row.stats.min);
-        const avg = format_duration(row.stats.avg);
-        const p50 = format_duration(row.stats.p50);
-        const p99 = format_duration(row.stats.p99);
-        const max = format_duration(row.stats.max);
-        const sd = format_duration(row.stats.stddev);
-
-        var min_buf: [16]u8 = undefined;
-        var avg_buf: [16]u8 = undefined;
-        var p50_buf: [16]u8 = undefined;
-        var p99_buf: [16]u8 = undefined;
-        var max_buf: [16]u8 = undefined;
-        var sd_buf: [16]u8 = undefined;
-        const min_s = std.fmt.bufPrint(&min_buf, "{d:.1} {s}", .{ min.value, min.unit }) catch "?";
-        const avg_s = std.fmt.bufPrint(&avg_buf, "{d:.1} {s}", .{ avg.value, avg.unit }) catch "?";
-        const p50_s = std.fmt.bufPrint(&p50_buf, "{d:.1} {s}", .{ p50.value, p50.unit }) catch "?";
-        const p99_s = std.fmt.bufPrint(&p99_buf, "{d:.1} {s}", .{ p99.value, p99.unit }) catch "?";
-        const max_s = std.fmt.bufPrint(&max_buf, "{d:.1} {s}", .{ max.value, max.unit }) catch "?";
-        const sd_s = std.fmt.bufPrint(&sd_buf, "{d:.1} {s}", .{ sd.value, sd.unit }) catch "?";
-
-        w.print("  │ {s:<6} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │ {s:>11} │\n", .{
-            row.label, min_s, avg_s, p50_s, p99_s, max_s, sd_s,
-        });
-    }
-    w.print("  └────────┴─────────────┴─────────────┴─────────────┴─────────────┴─────────────┴─────────────┘\n", .{});
+    w.print("  {s}\n", .{label});
+    w.print("    min    {d:>8.1} {s}\n", .{ min.value, min.unit });
+    w.print("    avg    {d:>8.1} {s}\n", .{ avg.value, avg.unit });
+    w.print("    p50    {d:>8.1} {s}\n", .{ p50.value, p50.unit });
+    w.print("    p99    {d:>8.1} {s}\n", .{ p99.value, p99.unit });
+    w.print("    max    {d:>8.1} {s}\n", .{ max.value, max.unit });
+    w.print("    stddev {d:>8.1} {s}\n", .{ sd.value, sd.unit });
 }
 
 fn write_system_info(w: *ResultWriter) void {
@@ -526,12 +502,11 @@ pub fn main() void {
     });
     results.print("\n", .{});
 
-    // Compute stats once per variant × metric, then reuse for the stat tables and comparison.
+    // Compute stats once per variant × metric, then reuse for the stat blocks and comparison.
     const apply_copy = compute_stats(apply_samples_copy[0..legal_count]);
     const apply_mutate = compute_stats(apply_samples_mutate[0..legal_count]);
     const reject_copy = compute_stats(reject_samples_copy[0..reject_count]);
     const reject_mutate = compute_stats(reject_samples_mutate[0..reject_count]);
-    const render_stats = compute_stats(render_samples[0..legal_count]);
     const cycle_copy = if (cycle_count > 0)
         compute_stats(cycle_samples_copy[0..cycle_count])
     else
@@ -542,33 +517,34 @@ pub fn main() void {
         Stats{ .min = 0, .max = 0, .avg = 0, .p50 = 0, .p99 = 0, .stddev = 0 };
 
     // Copy-based variant (current filter_self_check).
-    const copy_rows_all = [_]StatRow{
-        .{ .label = "apply", .stats = apply_copy },
-        .{ .label = "reject", .stats = reject_copy },
-        .{ .label = "cycle", .stats = cycle_copy },
-    };
-    const copy_rows: []const StatRow = if (cycle_count > 0) copy_rows_all[0..] else copy_rows_all[0..2];
     results.print("── variant: copy (filter_self_check) ─────────────────────────\n", .{});
-    write_stat_table(&results, copy_rows);
+    write_stat_block(&results, "move apply (play_move, legal)", apply_copy);
+    results.print("\n", .{});
+    write_stat_block(&results, "move reject (is_move_legal, illegal)", reject_copy);
+    if (cycle_count > 0) {
+        results.print("\n", .{});
+        write_stat_block(&results, "full game cycle (45 moves, apply+render)", cycle_copy);
+    }
+
     results.print("\n", .{});
 
     // Mutate-and-retract variant (filter_self_check_mutate).
-    const mutate_rows_all = [_]StatRow{
-        .{ .label = "apply", .stats = apply_mutate },
-        .{ .label = "reject", .stats = reject_mutate },
-        .{ .label = "cycle", .stats = cycle_mutate },
-    };
-    const mutate_rows: []const StatRow = if (cycle_count > 0) mutate_rows_all[0..] else mutate_rows_all[0..2];
     results.print("── variant: mutate (filter_self_check_mutate) ────────────────\n", .{});
-    write_stat_table(&results, mutate_rows);
+    write_stat_block(&results, "move apply (play_move_mutate, legal)", apply_mutate);
+    results.print("\n", .{});
+    write_stat_block(&results, "move reject (is_move_legal_mutate, illegal)", reject_mutate);
+    if (cycle_count > 0) {
+        results.print("\n", .{});
+        write_stat_block(&results, "full game cycle (45 moves, apply+render)", cycle_mutate);
+    }
+
     results.print("\n", .{});
 
-    // Renderer is drawn after every legal move, on game_copy (both games track the same position,
-    // so one draw suffices). Reported here as a single-row table — per-move samples, not a
-    // one-shot measurement.
-    const render_rows = [_]StatRow{.{ .label = "render", .stats = render_stats }};
+    // Renderer is drawn after every legal move, on game_copy (both games track the same
+    // position, so one draw suffices). Per-move samples, not a one-shot measurement.
     results.print("── renderer (drawn after every legal move) ───────────────────\n", .{});
-    write_stat_table(&results, &render_rows);
+    write_stat_block(&results, "renderer.draw", compute_stats(render_samples[0..legal_count]));
+
     results.print("\n", .{});
 
     // Side-by-side comparison. Negative delta means the mutate variant ran faster than the copy

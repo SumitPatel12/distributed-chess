@@ -103,6 +103,17 @@ pub const Board = struct {
     /// Row 0 is black's back rank and row 7 is white's back rank.
     board_state: [8][8]Piece,
 
+    /// Cached king positions — maintained in lockstep with `board_state` so `find_king_position`
+    /// is O(1). Indexed as `king_pos[@intFromEnum(color)]` (white = 0, black = 1).
+    ///
+    /// Coherence contract: `Board.move` updates this cache automatically, and `Board.clear`
+    /// asserts its target is not a king. Any code path that writes directly into `board_state`
+    /// (test fixtures bypassing `move`, low-level state patching) MUST maintain `king_pos` by
+    /// hand — see `src/rule_engine/test_util.zig` (`place`) and `src/game.zig`'s pin-scenario
+    /// test for examples. A stale cache trips the `expected_king` assert in
+    /// `check_helper.in_check`.
+    king_pos: [2]Position,
+
     // Chess board anatomy:
     //
     // Files run a..h left to right, ranks run 1..8 from white's side up to black's. A square is
@@ -200,6 +211,10 @@ pub const Board = struct {
     pub fn init(self: *Board) void {
         self.* = .{
             .board_state = STARTING_BOARD_POSITION,
+            .king_pos = .{
+                Position{ .rank = 0, .file = 4 }, // white king e1
+                Position{ .rank = 7, .file = 4 }, // black king e8
+            },
         };
     }
 
@@ -221,10 +236,18 @@ pub const Board = struct {
 
         self.board_state[from.rank][from.file] = .empty;
         self.board_state[to.rank][to.file] = piece;
+
+        switch (piece) {
+            .white_king => self.king_pos[@intFromEnum(Color.white)] = to,
+            .black_king => self.king_pos[@intFromEnum(Color.black)] = to,
+            else => {},
+        }
     }
 
     /// Set's the given position to empty. Will be required for en-passant.
     pub fn clear(self: *Board, position: Position) void {
+        const piece = self.board_state[position.rank][position.file];
+        std.debug.assert(piece != .white_king and piece != .black_king);
         self.board_state[position.rank][position.file] = .empty;
     }
 
@@ -234,20 +257,7 @@ pub const Board = struct {
     /// According to the rules of chess there's always a king on the board for both sides, so this
     /// function is always guaranteed to return as valid position.
     pub fn find_king_position(self: *const Board, color: Color) Position {
-        const king_piece: Piece = switch (color) {
-            .white => .white_king,
-            .black => .black_king,
-        };
-
-        for (self.board_state, 0..) |rank_row, rank_idx| {
-            for (rank_row, 0..) |piece, file_idx| {
-                if (piece == king_piece) {
-                    return Position{ .rank = @intCast(rank_idx), .file = @intCast(file_idx) };
-                }
-            }
-        }
-
-        unreachable; // invariant: king always on the board
+        return self.king_pos[@intFromEnum(color)];
     }
 
     // Capacity 10 covers the worst case for any piece type: 2 starting rooks/knights plus up to 8
@@ -298,17 +308,17 @@ test "clear zeroes target square and leaves adjacent squares untouched" {
     var board: Board = undefined;
     board.init();
 
-    const target = Position{ .rank = 0, .file = 4 }; // white king at e1
+    const target = Position{ .rank = 0, .file = 3 }; // white queen at d1
 
     // Snapshot neighbours before clearing.
-    const left = board.board_state[0][3]; // d1 queen
-    const right = board.board_state[0][5]; // f1 bishop
+    const left = board.board_state[0][2]; // c1 bishop
+    const right = board.board_state[0][4]; // e1 king
 
     board.clear(target);
 
     try testing.expectEqual(Piece.empty, board.board_state[target.rank][target.file]);
-    try testing.expectEqual(left, board.board_state[0][3]);
-    try testing.expectEqual(right, board.board_state[0][5]);
+    try testing.expectEqual(left, board.board_state[0][2]);
+    try testing.expectEqual(right, board.board_state[0][4]);
 }
 
 test "move preserves board integrity under a scripted sequence" {

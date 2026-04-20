@@ -15,16 +15,19 @@ pub fn in_check(board: *const Board, turn: Color) bool {
     const king_position = board.find_king_position(turn);
 
     // The different ways the king can be under check:
-    //   1. Direct line of sight of a bishop or Queen. (Diagonal)
-    //   2. Direct line of sight of a rook or Queen. (Vertical or Horizontal lines i.e. rank or file)
-    //   3. On the diagonal attack sight of a pawn.
-    //   4. A knight, on any of the L positions. (I know knights are a wonder on the board, heh)
+    //   1. Direct line of sight of a sliding piece (rook, bishop, or queen) along any of the 8
+    //      directions — rook-like (rank/file) and bishop-like (diagonal) merged into one scan.
+    //   2. On the diagonal attack sight of a pawn.
+    //   3. A knight, on any of the L positions. (I know knights are a wonder on the board, heh)
+    //   4. Adjacent enemy king. Two kings can never legally sit next to each other, so this
+    //      only fires while probing hypothetical king moves — but it's load-bearing for
+    //      `is_legal_piece_move` to reject walking into the enemy king's square.
 
-    if (is_checked_by_rook_or_queen(board, king_position, turn)) {
-        return true;
-    }
+    // Checks 1 and 2 are merged into a single 8-direction ray scan. Each ray finds the first
+    // piece, then the direction tells us whether rook-like or bishop-like attackers apply.
+    // Queens threaten along both, so they match in every direction.
 
-    if (is_checked_by_bishop_or_queen(board, king_position, turn)) {
+    if (is_checked_by_sliding_piece(board, king_position, turn)) {
         return true;
     }
 
@@ -32,54 +35,45 @@ pub fn in_check(board: *const Board, turn: Color) bool {
         return true;
     }
 
-    return is_checked_by_knight(board, king_position, turn);
-}
-
-/// Returns true if the king is in the line of sight of an opponent rook or queen along a rank or file.
-fn is_checked_by_rook_or_queen(board: *const Board, king_position: Position, turn: Color) bool {
-    // Caller contract: king_position must actually hold the king of the given turn color.
-    const expected_king: Piece = if (turn == .white) .white_king else .black_king;
-    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
-
-    for (rules_shared.ROOK_DIRECTIONS) |direction| {
-        const piece = rules_shared.ray_find_piece(board, king_position, direction);
-
-        if (piece != .empty and piece.color() != turn) {
-            // `or` instead of `|=` to short-circuit: the switch result has no side effects,
-            // but `or` signals intent — we stop caring once we know we're in check.
-            if (switch (piece) {
-                .white_rook, .white_queen, .black_rook, .black_queen => true,
-                else => false,
-            }) {
-                return true;
-            }
-        }
+    if (is_checked_by_knight(board, king_position, turn)) {
+        return true;
     }
 
-    return false;
+    return is_checked_by_adjacent_king(board, king_position, turn);
 }
 
-/// Returns true if the king is in the line of sight of an opponent bishop or queen along a diagonal.
-fn is_checked_by_bishop_or_queen(board: *const Board, king_position: Position, turn: Color) bool {
+/// Returns true if the king is in the line of sight of an opponent sliding piece (rook, bishop, or
+/// queen) along any of the 8 directions. Merges the old rook/queen and bishop/queen checks into a
+/// single pass — one `ray_find_piece` per direction, piece type matched against the ray's axis.
+fn is_checked_by_sliding_piece(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
     std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
 
-    for (rules_shared.BISHOP_DIRECTIONS) |direction| {
+    for (rules_shared.ALL_DIRECTIONS) |direction| {
         const piece = rules_shared.ray_find_piece(board, king_position, direction);
 
-        if (piece != .empty and piece.color() != turn) {
-            if (switch (piece) {
-                .white_bishop_dark,
-                .white_bishop_light,
-                .white_queen,
-                .black_bishop_dark,
-                .black_bishop_light,
-                .black_queen,
-                => true,
-                else => false,
-            }) {
-                return true;
-            }
+        if (piece == .empty or piece.color() == turn) {
+            continue;
+        }
+
+        const is_diagonal = switch (direction) {
+            .north_east, .north_west, .south_east, .south_west => true,
+            else => false,
+        };
+
+        switch (piece) {
+            .white_queen, .black_queen => return true,
+            .white_rook, .black_rook => {
+                if (!is_diagonal) return true;
+            },
+            .white_bishop_light,
+            .white_bishop_dark,
+            .black_bishop_light,
+            .black_bishop_dark,
+            => {
+                if (is_diagonal) return true;
+            },
+            else => {},
         }
     }
 
@@ -134,6 +128,35 @@ fn is_checked_by_pawn(board: *const Board, king_position: Position, turn: Color)
         }
 
         if (board.board_state[attacker_rank][@intCast(f_i8)] == enemy_pawn) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Returns true if the opponent king stands on any of the 8 squares adjacent to ours. A legal
+/// chess position never has the two kings touching, but `is_legal_piece_move` simulates a king
+/// move before calling `in_check`, so this guard is what actually forbids `Ke4` when the enemy
+/// king sits on `e5`.
+fn is_checked_by_adjacent_king(board: *const Board, king_position: Position, turn: Color) bool {
+    const expected_king: Piece = if (turn == .white) .white_king else .black_king;
+    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
+
+    const enemy_king: Piece = if (turn == .white) .black_king else .white_king;
+    const rank: i8 = @intCast(king_position.rank);
+    const file: i8 = @intCast(king_position.file);
+
+    for (rules_shared.ALL_DIRECTIONS) |direction| {
+        const delta = direction.deltas();
+        const target_rank = rank + delta.rank;
+        const target_file = file + delta.file;
+
+        if (target_rank < 0 or target_rank > 7 or target_file < 0 or target_file > 7) {
+            continue;
+        }
+
+        if (board.board_state[@intCast(target_rank)][@intCast(target_file)] == enemy_king) {
             return true;
         }
     }
@@ -235,5 +258,16 @@ test "in_check: white king on edge file a1 with no attacker returns false" {
     // Edge-file guard: ensures the pawn-check's file ± 1 doesn't falsely trigger at the board edge.
     var board = test_util.empty_board();
     test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
     try testing.expect(!in_check(&board, .white));
+}
+
+test "in_check: enemy king on an adjacent square counts as check (both directions)" {
+    // Two kings can never legally sit next to each other; this guard lets the legality path
+    // reject a king move that would put the two in contact.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 3, .file = 4 }); // e4
+    test_util.place(&board, .black_king, .{ .rank = 4, .file = 4 }); // e5
+    try testing.expect(in_check(&board, .white));
+    try testing.expect(in_check(&board, .black));
 }

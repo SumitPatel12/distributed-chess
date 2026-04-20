@@ -509,6 +509,10 @@ test "is_move_legal rejects a move that would leave own king in check" {
     // Black king must exist too — `filter_self_check` runs `in_check` for the side to move,
     // but also relies on a legal board (both kings present).
     game.board.board_state[7][7] = .black_king;
+    game.board.king_pos = .{
+        .{ .rank = 0, .file = 3 }, // white king d1
+        .{ .rank = 7, .file = 7 }, // black king h8
+    };
 
     // Pinned rook tries to leave the d-file (d2 → e2) — illegal.
     const illegal = Move{
