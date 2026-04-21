@@ -38,11 +38,10 @@ const ILLEGAL_MOVE_EVERY_N: usize = 10;
 /// Length of one full replay of The Immortal Game (45 half-moves; see `IMMORTAL_GAME` below).
 const MOVE_CYCLE_LEN: usize = IMMORTAL_GAME.len;
 
-/// Size of the stack buffer that accumulates the full result report. Seven stat blocks
-/// (apply/reject/cycle × copy+mutate + renderer) at ~210 bytes each ≈ 1.5 KB, plus the box-drawn
-/// comparison table (≈1.5 KB with 3-byte UTF-8 borders) and the header / system-info block
-/// (≈500 bytes) land at ~3.5 KB peak. 8 KB doubles that for headroom so a future metric or an
-/// extra comparison row doesn't silently truncate via `bufPrint`'s catch-and-return.
+/// Size of the stack buffer that accumulates the full result report. Four stat blocks
+/// (apply / reject / cycle / renderer) at ~210 bytes each ≈ 850 bytes, plus the header /
+/// system-info block (~500 bytes) land at ~1.5 KB peak. 8 KB leaves generous headroom so a
+/// future metric doesn't silently truncate via `bufPrint`'s catch-and-return.
 const RESULT_BUFFER_SIZE: usize = 8 * 1024;
 
 /// On-disk path for the persisted report, relative to cwd.
@@ -207,9 +206,9 @@ const Duration = struct {
 
 /// Converts raw nanoseconds into the most readable unit (ns, us, ms, s).
 ///
-/// Units are kept 2-byte ASCII (including " s" for seconds) so alignment in the comparison table
-/// works byte-for-byte: a multi-byte "µs" would display as 2 chars but measure as 3 bytes, making
-/// `{s:>N}` right-align one char short on µs rows versus ns/ms rows.
+/// Units are kept 2-byte ASCII (including " s" for seconds) so right-aligned output in the stat
+/// blocks stays byte-for-byte consistent: a multi-byte "µs" would display as 2 chars but measure
+/// as 3 bytes, making `{s:>N}` right-align one char short on µs rows versus ns/ms rows.
 fn format_duration(ns: u64) Duration {
     const ns_f: f64 = @floatFromInt(ns);
     if (ns >= std.time.ns_per_s) {
@@ -246,46 +245,6 @@ const ResultWriter = struct {
         return self.buf[0..self.len];
     }
 };
-
-/// Writes one row of the copy-vs-mutate comparison table. Negative delta = mutate faster.
-/// Emits "n/a" when `copy_ns` is zero (percent-of-zero is undefined; happens on noise-floor
-/// metrics like illegal-reject p50 where both variants measure 0 ns).
-///
-/// Pre-formats value+unit and delta into buffers so the outer `{s:>N}` alignment works on the
-/// composed string (otherwise splitting value and unit across format slots leaves the unit
-/// dangling at a variable position, and the sign/digit gap on deltas breaks).
-fn write_compare_row(
-    w: *ResultWriter,
-    label: []const u8,
-    copy_ns: u64,
-    mutate_ns: u64,
-) void {
-    const c = format_duration(copy_ns);
-    const m = format_duration(mutate_ns);
-
-    var copy_buf: [16]u8 = undefined;
-    var mutate_buf: [16]u8 = undefined;
-    const copy_str = std.fmt.bufPrint(&copy_buf, "{d:.1} {s}", .{ c.value, c.unit }) catch "?";
-    const mutate_str = std.fmt.bufPrint(&mutate_buf, "{d:.1} {s}", .{ m.value, m.unit }) catch "?";
-
-    // Build the delta string so the sign sits adjacent to the digits (Zig 0.16.0 fmt doesn't
-    // accept the `+` flag on floats, so we'd otherwise get "+   6.3%" with a 3-space gap).
-    var delta_buf: [16]u8 = undefined;
-    const delta_str: []const u8 = blk: {
-        if (copy_ns == 0) {
-            break :blk "n/a";
-        }
-        const diff: f64 = @as(f64, @floatFromInt(mutate_ns)) - @as(f64, @floatFromInt(copy_ns));
-        const pct = diff / @as(f64, @floatFromInt(copy_ns)) * 100.0;
-        const abs_pct = @abs(pct);
-        const sign: u8 = if (pct >= 0.0) '+' else '-';
-        break :blk std.fmt.bufPrint(&delta_buf, "{c}{d:.1}%", .{ sign, abs_pct }) catch "?";
-    };
-
-    w.print("  │ {s:<20} │ {s:>11} │ {s:>11} │ {s:>8} │\n", .{
-        label, copy_str, mutate_str, delta_str,
-    });
-}
 
 fn write_stat_block(w: *ResultWriter, label: []const u8, stats: Stats) void {
     const min = format_duration(stats.min);
@@ -348,14 +307,8 @@ pub fn main() void {
     var threaded: Threaded = Threaded.init_single_threaded;
     const io = threaded.io();
 
-    // Two independent games, one driven by the copy-based legality path (`play_move`,
-    // `is_move_legal`) and one by the mutate-and-retract path (`play_move_mutate`,
-    // `is_move_legal_mutate`). Both are reset in lockstep so each iteration times both variants
-    // on the same position, cancelling out most cache/scheduler noise.
-    var game_copy: Game = undefined;
-    game_copy.init(.white);
-    var game_mutate: Game = undefined;
-    game_mutate.init(.white);
+    var game: Game = undefined;
+    game.init(.white);
 
     // Construct a synthetic terminal size large enough to pick the renderer's largest cell
     // dimensions (11x5). This is where the worst-case ~12 KB frame buffer lives, matching the
@@ -369,28 +322,22 @@ pub fn main() void {
     var renderer: BoardRenderer = undefined;
     renderer.init(ws);
 
-    // Per-iteration samples, two variants. `reject_samples_*` sized to the illegal-move upper
-    // bound. `cycle_samples_*` holds one entry per completed 45-move replay (`ITERATIONS /
-    // MOVE_CYCLE_LEN + 1` slots; unused tail stays undefined). `render_samples` is shared — the
-    // renderer is only exercised once per legal iteration (on `game_copy`, which stays in sync
-    // with the mutate game anyway).
-    var apply_samples_copy: [ITERATIONS]u64 = undefined;
-    var apply_samples_mutate: [ITERATIONS]u64 = undefined;
+    // Per-iteration samples. `reject_samples` sized to the illegal-move upper bound.
+    // `cycle_samples` holds one entry per completed 45-move replay (`ITERATIONS / MOVE_CYCLE_LEN
+    // + 1` slots; unused tail stays undefined).
+    var apply_samples: [ITERATIONS]u64 = undefined;
     var render_samples: [ITERATIONS]u64 = undefined;
-    var reject_samples_copy: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
-    var reject_samples_mutate: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
-    var cycle_samples_copy: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
-    var cycle_samples_mutate: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
+    var reject_samples: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
+    var cycle_samples: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
 
     var legal_count: usize = 0;
     var reject_count: usize = 0;
     var cycle_count: usize = 0;
 
-    // Cycle accumulators — rolled into `cycle_samples_*` on the last half-move of each replay.
+    // Cycle accumulator — rolled into `cycle_samples` on the last half-move of each replay.
     // Illegal-move rejection time is deliberately excluded so the full-game stat is independent
     // of `ILLEGAL_MOVE_EVERY_N`.
-    var cycle_accum_copy: u64 = 0;
-    var cycle_accum_mutate: u64 = 0;
+    var cycle_accum: u64 = 0;
 
     const wall_start = timestamp_now(io);
 
@@ -398,23 +345,15 @@ pub fn main() void {
         if (i % ILLEGAL_MOVE_EVERY_N == 0) {
             const mv = ILLEGAL_MOVES[reject_count % ILLEGAL_MOVES.len];
 
-            // Copy path.
-            const c0 = timestamp_now(io);
-            const legal_copy = game_copy.is_move_legal(mv);
-            const c1 = timestamp_now(io);
+            const t0 = timestamp_now(io);
+            const legal = game.is_move_legal(mv);
+            const t1 = timestamp_now(io);
 
-            // Mutate path.
-            const m0 = timestamp_now(io);
-            const legal_mutate = game_mutate.is_move_legal_mutate(mv);
-            const m1 = timestamp_now(io);
-
-            // Sanity: the chosen illegal moves originate on always-empty squares, so both rule
-            // paths must reject. If either fires, the illegal table or the game state invariant
+            // Sanity: the chosen illegal moves originate on always-empty squares, so the rule
+            // engine must reject. If this fires, the illegal table or the game state invariant
             // is wrong.
-            std.debug.assert(!legal_copy);
-            std.debug.assert(!legal_mutate);
-            reject_samples_copy[reject_count] = duration_ns_between(c0, c1);
-            reject_samples_mutate[reject_count] = duration_ns_between(m0, m1);
+            std.debug.assert(!legal);
+            reject_samples[reject_count] = duration_ns_between(t0, t1);
             reject_count += 1;
             continue;
         }
@@ -423,53 +362,34 @@ pub fn main() void {
         // Reset runs outside the timed region.
         const cycle_idx = legal_count % MOVE_CYCLE_LEN;
         if (cycle_idx == 0) {
-            game_copy.init(.white);
-            game_mutate.init(.white);
+            game.init(.white);
         }
         const mv = IMMORTAL_GAME[cycle_idx];
 
-        // Copy-based apply.
-        const c0 = timestamp_now(io);
-        game_copy.play_move(mv) catch {
+        const a0 = timestamp_now(io);
+        game.play_move(mv) catch {
             std.debug.print(
-                "bench: copy-variant legal move rejected at cycle_idx={d} (iter={d}); aborting\n",
+                "bench: legal move rejected at cycle_idx={d} (iter={d}); aborting\n",
                 .{ cycle_idx, i },
             );
             return;
         };
-        const c1 = timestamp_now(io);
-        const apply_ns_copy = duration_ns_between(c0, c1);
-        apply_samples_copy[legal_count] = apply_ns_copy;
+        const a1 = timestamp_now(io);
+        const apply_ns = duration_ns_between(a0, a1);
+        apply_samples[legal_count] = apply_ns;
 
-        // Mutate-based apply.
-        const m0 = timestamp_now(io);
-        game_mutate.play_move_mutate(mv) catch {
-            std.debug.print(
-                "bench: mutate-variant legal move rejected at cycle_idx={d} (iter={d}); aborting\n",
-                .{ cycle_idx, i },
-            );
-            return;
-        };
-        const m1 = timestamp_now(io);
-        const apply_ns_mutate = duration_ns_between(m0, m1);
-        apply_samples_mutate[legal_count] = apply_ns_mutate;
-
-        // Render once (shared between variants — the two game instances hold identical state).
         const r0 = timestamp_now(io);
-        const buf = renderer.draw(&game_copy);
+        const buf = renderer.draw(&game);
         const r1 = timestamp_now(io);
         const render_ns = duration_ns_between(r0, r1);
         render_samples[legal_count] = render_ns;
         std.mem.doNotOptimizeAway(buf.len);
 
-        cycle_accum_copy += apply_ns_copy + render_ns;
-        cycle_accum_mutate += apply_ns_mutate + render_ns;
+        cycle_accum += apply_ns + render_ns;
         if (cycle_idx == MOVE_CYCLE_LEN - 1) {
-            cycle_samples_copy[cycle_count] = cycle_accum_copy;
-            cycle_samples_mutate[cycle_count] = cycle_accum_mutate;
+            cycle_samples[cycle_count] = cycle_accum;
             cycle_count += 1;
-            cycle_accum_copy = 0;
-            cycle_accum_mutate = 0;
+            cycle_accum = 0;
         }
 
         legal_count += 1;
@@ -502,77 +422,20 @@ pub fn main() void {
     });
     results.print("\n", .{});
 
-    // Compute stats once per variant × metric, then reuse for the stat blocks and comparison.
-    const apply_copy = compute_stats(apply_samples_copy[0..legal_count]);
-    const apply_mutate = compute_stats(apply_samples_mutate[0..legal_count]);
-    const reject_copy = compute_stats(reject_samples_copy[0..reject_count]);
-    const reject_mutate = compute_stats(reject_samples_mutate[0..reject_count]);
-    const cycle_copy = if (cycle_count > 0)
-        compute_stats(cycle_samples_copy[0..cycle_count])
-    else
-        Stats{ .min = 0, .max = 0, .avg = 0, .p50 = 0, .p99 = 0, .stddev = 0 };
-    const cycle_mutate = if (cycle_count > 0)
-        compute_stats(cycle_samples_mutate[0..cycle_count])
-    else
-        Stats{ .min = 0, .max = 0, .avg = 0, .p50 = 0, .p99 = 0, .stddev = 0 };
-
-    // Copy-based variant (current filter_self_check).
-    results.print("── variant: copy (filter_self_check) ─────────────────────────\n", .{});
-    write_stat_block(&results, "move apply (play_move, legal)", apply_copy);
+    results.print("── rule engine (filter_self_check, copy-per-candidate) ───────\n", .{});
+    write_stat_block(&results, "move apply (play_move, legal)", compute_stats(apply_samples[0..legal_count]));
     results.print("\n", .{});
-    write_stat_block(&results, "move reject (is_move_legal, illegal)", reject_copy);
+    write_stat_block(&results, "move reject (is_move_legal, illegal)", compute_stats(reject_samples[0..reject_count]));
     if (cycle_count > 0) {
         results.print("\n", .{});
-        write_stat_block(&results, "full game cycle (45 moves, apply+render)", cycle_copy);
+        write_stat_block(&results, "full game cycle (45 moves, apply+render)", compute_stats(cycle_samples[0..cycle_count]));
     }
 
     results.print("\n", .{});
 
-    // Mutate-and-retract variant (filter_self_check_mutate).
-    results.print("── variant: mutate (filter_self_check_mutate) ────────────────\n", .{});
-    write_stat_block(&results, "move apply (play_move_mutate, legal)", apply_mutate);
-    results.print("\n", .{});
-    write_stat_block(&results, "move reject (is_move_legal_mutate, illegal)", reject_mutate);
-    if (cycle_count > 0) {
-        results.print("\n", .{});
-        write_stat_block(&results, "full game cycle (45 moves, apply+render)", cycle_mutate);
-    }
-
-    results.print("\n", .{});
-
-    // Renderer is drawn after every legal move, on game_copy (both games track the same
-    // position, so one draw suffices). Per-move samples, not a one-shot measurement.
+    // Renderer is drawn after every legal move. Per-move samples, not a one-shot measurement.
     results.print("── renderer (drawn after every legal move) ───────────────────\n", .{});
     write_stat_block(&results, "renderer.draw", compute_stats(render_samples[0..legal_count]));
-
-    results.print("\n", .{});
-
-    // Side-by-side comparison. Negative delta means the mutate variant ran faster than the copy
-    // variant for that metric. Box-drawn as a proper table — all cells right-align byte-for-byte
-    // because every unit string is 2 bytes (ns, us, ms, " s") and deltas / values are composed
-    // into buffers before the outer `{s:>N}` alignment runs.
-    results.print("── comparison (mutate vs copy) ───────────────────────────────\n", .{});
-    results.print("  ┌──────────────────────┬─────────────┬─────────────┬──────────┐\n", .{});
-    results.print("  │ {s:<20} │ {s:>11} │ {s:>11} │ {s:>8} │\n", .{
-        "metric", "copy", "mutate", "delta",
-    });
-    results.print("  ├──────────────────────┼─────────────┼─────────────┼──────────┤\n", .{});
-    write_compare_row(&results, "apply min", apply_copy.min, apply_mutate.min);
-    write_compare_row(&results, "apply avg", apply_copy.avg, apply_mutate.avg);
-    write_compare_row(&results, "apply p50", apply_copy.p50, apply_mutate.p50);
-    write_compare_row(&results, "apply p99", apply_copy.p99, apply_mutate.p99);
-    write_compare_row(&results, "apply max", apply_copy.max, apply_mutate.max);
-    write_compare_row(&results, "reject avg", reject_copy.avg, reject_mutate.avg);
-    write_compare_row(&results, "reject p50", reject_copy.p50, reject_mutate.p50);
-    write_compare_row(&results, "reject p99", reject_copy.p99, reject_mutate.p99);
-    if (cycle_count > 0) {
-        write_compare_row(&results, "cycle min", cycle_copy.min, cycle_mutate.min);
-        write_compare_row(&results, "cycle avg", cycle_copy.avg, cycle_mutate.avg);
-        write_compare_row(&results, "cycle p50", cycle_copy.p50, cycle_mutate.p50);
-        write_compare_row(&results, "cycle p99", cycle_copy.p99, cycle_mutate.p99);
-        write_compare_row(&results, "cycle max", cycle_copy.max, cycle_mutate.max);
-    }
-    results.print("  └──────────────────────┴─────────────┴─────────────┴──────────┘\n", .{});
 
     // Emit to stderr.
     std.debug.print("{s}", .{results.contents()});

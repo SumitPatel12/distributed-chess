@@ -585,6 +585,9 @@ fn filter_self_check(
     for (candidates.slice()) |candidate| {
         // Stack copy so we don't mutate the real board. The copy is cheap — it's just an 8×8
         // array of i8 on the stack.
+        // I tried changing from copy to just mutate-retract, but that didn't come with any
+        // visible benefit over this in terms of performance, and added more on my plate to always
+        // remember to retract.
         var scratch = board.*;
         scratch.move(candidate.from, candidate.to);
 
@@ -593,101 +596,6 @@ fn filter_self_check(
         }
     }
 }
-
-// ── TEMP: mutate-and-retract A/B variants ─────────────────────────────────────
-// Kept around so the bench can time both paths side-by-side. When the comparison is done and
-// you've picked a winner, delete everything between this banner and the matching close banner
-// below (plus the corresponding `is_move_legal_mutate` / `play_move_mutate` in game.zig and
-// the mutate-path instrumentation in bench/main.zig).
-
-/// Mutate-and-retract twin of `filter_self_check`. Applies each candidate in place on the caller's
-/// board via `@constCast`, runs `in_check`, then undoes the mutation. Every iteration exits with
-/// the board in the exact state it entered, so the pointer stays logically `const` to callers.
-pub fn filter_self_check_mutate(
-    board: *const Board,
-    turn: Color,
-    candidates: *const BoundedArray(Move, MAX_LEGAL_MOVES),
-    out: *BoundedArray(Move, MAX_LEGAL_MOVES),
-) void {
-    const mutable: *Board = @constCast(board);
-    for (candidates.slice()) |candidate| {
-        const captured = mutable.board_state[candidate.to.rank][candidate.to.file];
-
-        mutable.move(candidate.from, candidate.to);
-
-        const legal = !check_helper.in_check(mutable, turn);
-
-        // Retract: move the piece back, then restore whatever was on `to` before (empty for
-        // non-captures, the captured piece for captures).
-        mutable.move(candidate.to, candidate.from);
-        mutable.board_state[candidate.to.rank][candidate.to.file] = captured;
-
-        if (legal) {
-            out.append_assume_capacity(candidate);
-        }
-    }
-}
-
-/// Twin of `piece_legal_moves` that routes through `filter_self_check_mutate`. Duplicates the
-/// body verbatim rather than adding a comptime parameter — keeps the A/B scaffolding easy to rip
-/// out as one block.
-pub fn piece_legal_moves_mutate(
-    board: *const Board,
-    position: Position,
-    castling_rights: *const CastlingRights,
-    enpassant_square: ?Position,
-    out: *BoundedArray(Move, MAX_LEGAL_MOVES),
-) void {
-    // Caller must pass a fresh buffer — stale moves from a prior call would corrupt the result.
-    std.debug.assert(out.len == 0);
-
-    const piece = board.board_state[position.rank][position.file];
-    std.debug.assert(piece != .empty);
-    const turn = piece.color().?;
-
-    var pseudo_legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
-    switch (piece) {
-        .white_pawn, .black_pawn => pawn_moves_from(board, position, turn, enpassant_square, &pseudo_legal),
-        .white_knight, .black_knight => knight_moves_from(board, position, turn, &pseudo_legal),
-        .white_bishop_light,
-        .white_bishop_dark,
-        .black_bishop_light,
-        .black_bishop_dark,
-        => bishop_moves_from(board, position, turn, &pseudo_legal),
-        .white_rook, .black_rook => rook_moves_from(board, position, turn, &pseudo_legal),
-        .white_queen, .black_queen => queen_moves_from(board, position, turn, &pseudo_legal),
-        .white_king, .black_king => king_moves_from(board, position, turn, &pseudo_legal),
-        .empty => unreachable,
-    }
-    _ = castling_rights;
-
-    filter_self_check_mutate(board, turn, &pseudo_legal, out);
-}
-
-/// Twin of `is_legal_piece_move` that routes through `is_pseudo_legal` + in_check.
-pub fn is_legal_piece_move_mutate(
-    board: *const Board,
-    castling_rights: *const CastlingRights,
-    enpassant_square: ?Position,
-    move: Move,
-) bool {
-    const piece = board.board_state[move.from.rank][move.from.file];
-    if (piece == .empty) {
-        return false;
-    }
-    const turn = piece.color().?;
-
-    if (!is_pseudo_legal(board, piece, turn, move, enpassant_square)) {
-        return false;
-    }
-    _ = castling_rights;
-
-    var scratch = board.*;
-    scratch.move(move.from, move.to);
-    return !check_helper.in_check(&scratch, turn);
-}
-
-// ── end TEMP ──────────────────────────────────────────────────────────────────
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
