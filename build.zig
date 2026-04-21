@@ -292,6 +292,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "board_renderer", .module = bench_board_renderer_mod },
                 .{ .name = "shared.zig", .module = bench_shared_mod },
                 .{ .name = "game", .module = bench_game_mod },
+                .{ .name = "rules", .module = bench_rules_mod },
             },
         }),
     });

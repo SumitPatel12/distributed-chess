@@ -21,7 +21,7 @@ pub fn in_check(board: *const Board, turn: Color) bool {
     //   3. A knight, on any of the L positions. (I know knights are a wonder on the board, heh)
     //   4. Adjacent enemy king. Two kings can never legally sit next to each other, so this
     //      only fires while probing hypothetical king moves — but it's load-bearing for
-    //      `is_legal_piece_move` to reject walking into the enemy king's square.
+    //      `preview_move`'s self-check filter to reject walking into the enemy king's square.
 
     // Checks 1 and 2 are merged into a single 8-direction ray scan. Each ray finds the first
     // piece, then the direction tells us whether rook-like or bishop-like attackers apply.
@@ -136,9 +136,9 @@ fn is_checked_by_pawn(board: *const Board, king_position: Position, turn: Color)
 }
 
 /// Returns true if the opponent king stands on any of the 8 squares adjacent to ours. A legal
-/// chess position never has the two kings touching, but `is_legal_piece_move` simulates a king
-/// move before calling `in_check`, so this guard is what actually forbids `Ke4` when the enemy
-/// king sits on `e5`.
+/// chess position never has the two kings touching, but `preview_move`'s self-check simulates a
+/// king move before calling `in_check`, so this guard is what actually forbids `Ke4` when the
+/// enemy king sits on `e5`.
 fn is_checked_by_adjacent_king(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
     std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);

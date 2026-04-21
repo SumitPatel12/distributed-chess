@@ -12,6 +12,7 @@ const Position = shared.Position;
 const CastlingRights = shared.CastlingRights;
 const Piece = board_mod.Piece;
 const rules_engine = @import("rule_engine/rules.zig");
+const MoveEffect = rules_engine.MoveEffect;
 
 pub const GameResult = enum {
     /// One of the players won by checkmating.
@@ -206,7 +207,7 @@ pub const Game = struct {
     board: Board,
 
     /// Stores whose turn it is, either black or white.
-    current_turn: Color,
+    turn: Color,
 
     /// What player does this game instance belong to, either black or white.
     player_color: Color,
@@ -265,7 +266,7 @@ pub const Game = struct {
         self.* = .{
             .board = undefined,
             .state = initial_state(player_color),
-            .current_turn = .white,
+            .turn = .white,
             .halfmove_clock = 0,
             .fullmove_number = 1,
             .player_color = player_color,
@@ -310,42 +311,85 @@ pub const Game = struct {
     }
 
     /// Tries to play the inputted move. If it's a legal move updates the board position and handles
-    /// the captures. Returns error.IllegalMove in case the move is illegal.
+    /// the captures. Returns error.InvalidMove in case the move is illegal.
     pub fn play_move(self: *Game, move: Move) !void {
-        if (!self.is_move_legal(move)) {
-            return error.InvalidMove;
-        }
+        // When preview_move grows a new error variant the exhaustive switch below will fail
+        // to compile — that's the signal to add a TODO (or a proper handler) for it.
+        const move_effect = rules_engine.preview_move(
+            &self.board,
+            self.turn,
+            move,
+            self.en_passant_square,
+            self.castling_rights,
+        ) catch |err| switch (err) {
+            // TODO: Surface InvalidMove as a game effect (NACK) instead of propagating raw.
+            error.InvalidMove => return err,
+        };
 
-        // TODO: Handle special captures. Like en-passant
-        const captured_piece = self.board.board_state[move.to.rank][move.to.file];
+        self.castling_rights = rules_engine.castling_rights_after(&self.board, self.turn, move, move_effect, self.castling_rights);
+        self.apply_effect(move, move_effect);
 
-        // Handle captures.
-        if (captured_piece != .empty) {
-            // You can't capture your own piece and you can't captrue a king.
-            std.debug.assert(captured_piece.color().? != self.current_turn);
-            std.debug.assert(captured_piece != .white_king and captured_piece != .black_king);
+        // TODO: Update halfmove_clock (reset on captures/pawn moves, bump otherwise) and
+        // fullmove_number (bump after black's ply) — both required for draw-claim logic.
 
-            switch (self.current_turn) {
-                .white => self.captures_by_white.append_assume_capacity(captured_piece),
-                .black => self.captures_by_black.append_assume_capacity(captured_piece),
-            }
-        }
-
-        // Update the board position and flip the turn color.
-        self.board.move(move.from, move.to);
         // TODO: This should likely be something a game effect would enforce, not sure, keeping
         // as is for now for testing purposes.
-        self.current_turn = switch (self.current_turn) {
+        self.turn = switch (self.turn) {
             .black => .white,
             .white => .black,
         };
     }
 
-    /// Returns true if `move` is a legal move given the current board, castling rights, and
-    /// en-passant square. Pure query — does not mutate game state. Turn check is the caller's
-    /// responsibility.
-    pub fn is_move_legal(self: *const Game, move: Move) bool {
-        return rules_engine.is_legal_piece_move(&self.board, &self.castling_rights, self.en_passant_square, move);
+    /// Applies the move effect to the game.
+    fn apply_effect(self: *Game, move: Move, effect: MoveEffect) void {
+        self.board.move(move.from, move.to);
+
+        switch (effect) {
+            .capture => |captured_piece| self.append_captured_piece(captured_piece),
+            .promotion => |promotion_effect| {
+                if (promotion_effect.capture) |captured_piece| {
+                    self.append_captured_piece(captured_piece);
+                }
+                // TODO: Handle promotion prompt for user.
+                // TODO: Update board position with promoted piece after.
+            },
+            .en_passant => |ep| {
+                const captured_pawn: Piece = switch (self.turn) {
+                    .white => .black_pawn,
+                    .black => .white_pawn,
+                };
+                self.append_captured_piece(captured_pawn);
+                self.board.clear(ep.captured_pawn_at);
+            },
+            .castling => |c| {
+                self.board.move(c.rook_from, c.rook_to);
+            },
+            // We've already moved the piece at the start, there are no other side effects.
+            .move_only, .pawn_double_push => {},
+        }
+
+        // En-passant target is a one-ply window: only valid immediately after a double push.
+        // Reset on every other effect; set to the square the pawn passed over on double push.
+        self.en_passant_square = switch (effect) {
+            .pawn_double_push => blk: {
+                const mid_rank: u3 = switch (self.turn) {
+                    .white => move.from.rank + 1,
+                    .black => move.from.rank - 1,
+                };
+                break :blk .{ .rank = mid_rank, .file = move.from.file };
+            },
+            else => null,
+        };
+    }
+
+    fn append_captured_piece(self: *Game, piece: Piece) void {
+        std.debug.assert(piece != .empty);
+        std.debug.assert(piece.color().? != self.turn);
+        std.debug.assert(piece != .white_king and piece != .black_king);
+        switch (self.turn) {
+            .black => self.captures_by_black.append_assume_capacity(piece),
+            .white => self.captures_by_white.append_assume_capacity(piece),
+        }
     }
 };
 
@@ -412,17 +456,11 @@ test "inti sets the correct seq number, captures, and position hash" {
     try std.testing.expectEqual(@as(usize, 0), game.position_hash.len);
 }
 
-// Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
-// file) forces *analysis* but not test discovery; the `_ = @import` form inside a test block
-// is what adds a file's `test` blocks to the running binary.
-test {
-    _ = @import("rule_engine/rules.zig");
-    _ = @import("rule_engine/check_helper.zig");
-    _ = @import("rule_engine/shared.zig");
-    _ = @import("rule_engine/test_util.zig");
-}
+// Smoke tests — primarily exist to force semantic analysis of play_move and friends. Without a
+// test-side caller, Zig skips analyzing pub fns that aren't reached, and field/signature bugs
+// can sit in the file undetected.
 
-test "is_move_legal accepts e2-e4 from the starting position" {
+test "play_move applies e2-e4 from the starting position" {
     var game: Game = undefined;
     game.init(.white);
 
@@ -430,22 +468,16 @@ test "is_move_legal accepts e2-e4 from the starting position" {
         .from = .{ .rank = 1, .file = 4 },
         .to = .{ .rank = 3, .file = 4 },
     };
-    try std.testing.expect(game.is_move_legal(mv));
+    try game.play_move(mv);
+
+    try std.testing.expectEqual(.empty, game.board.board_state[1][4]);
+    try std.testing.expectEqual(.white_pawn, game.board.board_state[3][4]);
+    try std.testing.expectEqual(Color.black, game.turn);
+    // Double push registers the passed-over square (e3) as the en-passant target.
+    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
 }
 
-test "is_move_legal rejects e2-e5 from the starting position" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    // Triple-push is never legal.
-    const mv = Move{
-        .from = .{ .rank = 1, .file = 4 },
-        .to = .{ .rank = 4, .file = 4 },
-    };
-    try std.testing.expect(!game.is_move_legal(mv));
-}
-
-test "is_move_legal rejects a move whose from square is empty" {
+test "play_move returns InvalidMove when source square is empty" {
     var game: Game = undefined;
     game.init(.white);
 
@@ -454,33 +486,15 @@ test "is_move_legal rejects a move whose from square is empty" {
         .from = .{ .rank = 3, .file = 4 },
         .to = .{ .rank = 4, .file = 4 },
     };
-    try std.testing.expect(!game.is_move_legal(mv));
+    try std.testing.expectError(error.InvalidMove, game.play_move(mv));
 }
 
-test "is_move_legal rejects a move that would leave own king in check" {
-    // Pin scenario: white king d1, white rook d2 (pinned on the d-file), black rook d8. The
-    // pinned rook's only legal squares are along the pin ray; moving off the d-file exposes
-    // the king to the attacker.
-    var game: Game = undefined;
-    game.init(.white);
-
-    // Clear the starting position down to just the pin setup.
-    game.board.board_state = .{.{.empty} ** 8} ** 8;
-    game.board.board_state[0][3] = .white_king; // d1
-    game.board.board_state[1][3] = .white_rook; // d2
-    game.board.board_state[7][3] = .black_rook; // d8
-    // Black king must exist too — `filter_self_check` runs `in_check` for the side to move,
-    // but also relies on a legal board (both kings present).
-    game.board.board_state[7][7] = .black_king;
-    game.board.king_pos = .{
-        .{ .rank = 0, .file = 3 }, // white king d1
-        .{ .rank = 7, .file = 7 }, // black king h8
-    };
-
-    // Pinned rook tries to leave the d-file (d2 → e2) — illegal.
-    const illegal = Move{
-        .from = .{ .rank = 1, .file = 3 },
-        .to = .{ .rank = 1, .file = 4 },
-    };
-    try std.testing.expect(!game.is_move_legal(illegal));
+// Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
+// file) forces *analysis* but not test discovery; the `_ = @import` form inside a test block
+// is what adds a file's `test` blocks to the running binary.
+test {
+    _ = @import("rule_engine/rules.zig");
+    _ = @import("rule_engine/check_helper.zig");
+    _ = @import("rule_engine/shared.zig");
+    _ = @import("rule_engine/test_util.zig");
 }

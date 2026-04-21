@@ -12,7 +12,7 @@ const Position = shared.Position;
 /// pieces pair this with `place` to avoid the noise of a full starting position.
 ///
 /// Caller contract: `king_pos` is intentionally left `undefined`. Every test that calls
-/// `in_check`, `legal_moves`, `piece_legal_moves`, or any other routine that reads the king
+/// `in_check`, `preview_move`, `piece_legal_moves`, or any other routine that reads the king
 /// cache MUST first `place` both a `.white_king` and a `.black_king` on the board — `place`
 /// updates the cache in sync. Skipping this is a test-author bug that will trip safety
 /// assertions on first use.

@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 
 const board_renderer = @import("board_renderer");
 const game_mod = @import("game");
+const rules_engine = @import("rules");
 const shared = @import("shared.zig");
 
 const Clock = std.Io.Clock;
@@ -140,9 +141,9 @@ const IMMORTAL_GAME = [_]Move{
 };
 
 // Illegal moves used to exercise the rule engine's rejection path. Each originates on a square
-// that is never occupied at any point during The Immortal Game (a4, d4, a5), so
-// `is_legal_piece_move`'s `piece == .empty` short-circuit fires deterministically regardless of
-// the current position within the replay.
+// that is never occupied at any point during The Immortal Game (a4, d4, a5), so `preview_move`'s
+// `piece == .empty` short-circuit fires deterministically regardless of the current position
+// within the replay.
 const ILLEGAL_MOVES = [_]Move{
     .{ .from = .{ .rank = 3, .file = 0 }, .to = .{ .rank = 4, .file = 0 } }, // a4→a5, empty from
     .{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 4, .file = 3 } }, // d4→d5, empty from
@@ -346,7 +347,7 @@ pub fn main() void {
             const mv = ILLEGAL_MOVES[reject_count % ILLEGAL_MOVES.len];
 
             const t0 = timestamp_now(io);
-            const legal = game.is_move_legal(mv);
+            const legal = if (rules_engine.preview_move(&game.board, game.turn, mv, game.en_passant_square, game.castling_rights)) |_| true else |_| false;
             const t1 = timestamp_now(io);
 
             // Sanity: the chosen illegal moves originate on always-empty squares, so the rule
@@ -425,7 +426,7 @@ pub fn main() void {
     results.print("── rule engine (filter_self_check, copy-per-candidate) ───────\n", .{});
     write_stat_block(&results, "move apply (play_move, legal)", compute_stats(apply_samples[0..legal_count]));
     results.print("\n", .{});
-    write_stat_block(&results, "move reject (is_move_legal, illegal)", compute_stats(reject_samples[0..reject_count]));
+    write_stat_block(&results, "move reject (preview_move, illegal)", compute_stats(reject_samples[0..reject_count]));
     if (cycle_count > 0) {
         results.print("\n", .{});
         write_stat_block(&results, "full game cycle (45 moves, apply+render)", compute_stats(cycle_samples[0..cycle_count]));

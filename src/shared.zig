@@ -30,8 +30,13 @@ pub const Move = struct {
     to: Position,
 };
 
-// TODO: After understanding what is requied a bit more populate this struct.
-pub const CastlingRights = struct {};
+/// Holds the castling rights validity for both sides. Defaults to true for all 4.
+pub const CastlingRights = struct {
+    white_kingside: bool = true,
+    white_queenside: bool = true,
+    black_kingside: bool = true,
+    black_queenside: bool = true,
+};
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
