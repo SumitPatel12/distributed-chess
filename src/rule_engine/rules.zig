@@ -164,6 +164,14 @@ fn pseudo_legal_pawn(
     if (rank_delta == forward and (file_delta == 1 or file_delta == -1)) {
         const target = board.board_state[to.rank][to.file];
         if (en_passant_square) |en_passant_position| {
+            // Caller contract: ep target rank matches "the square a pawn passed over on
+            // the opponent's prior double push" — rank 5 when white is the mover (black
+            // pushed 6→4), rank 2 when black is the mover (white pushed 1→3). Defends
+            // against drift in callers that forget to clear the one-ply window.
+            std.debug.assert(
+                (turn == .white and en_passant_position.rank == 5) or
+                    (turn == .black and en_passant_position.rank == 2),
+            );
             if (target == .empty and to.rank == en_passant_position.rank and to.file == en_passant_position.file) {
                 return .{
                     .en_passant = .{

@@ -344,6 +344,10 @@ pub const Game = struct {
     fn apply_effect(self: *Game, move: Move, effect: MoveEffect) void {
         self.board.move(move.from, move.to);
 
+        // En-passant target is a one-ply window: only valid immediately after a double push.
+        // Reset here; the pawn_double_push arm below re-sets it to the square the pawn passed over.
+        self.en_passant_square = null;
+
         switch (effect) {
             .capture => |captured_piece| self.append_captured_piece(captured_piece),
             .promotion => |promotion_effect| {
@@ -364,22 +368,20 @@ pub const Game = struct {
             .castling => |c| {
                 self.board.move(c.rook_from, c.rook_to);
             },
-            // We've already moved the piece at the start, there are no other side effects.
-            .move_only, .pawn_double_push => {},
-        }
-
-        // En-passant target is a one-ply window: only valid immediately after a double push.
-        // Reset on every other effect; set to the square the pawn passed over on double push.
-        self.en_passant_square = switch (effect) {
-            .pawn_double_push => blk: {
+            .pawn_double_push => {
+                // pawn_double_push is only emitted by pseudo_legal_pawn from rank 1 (white) or rank
+                // 6 (black); pinning the contract here keeps the u3 arithmetic below safe under any
+                // caller drift.
+                std.debug.assert(move.from.rank == 1 or move.from.rank == 6);
                 const mid_rank: u3 = switch (self.turn) {
                     .white => move.from.rank + 1,
                     .black => move.from.rank - 1,
                 };
-                break :blk .{ .rank = mid_rank, .file = move.from.file };
+                self.en_passant_square = .{ .rank = mid_rank, .file = move.from.file };
             },
-            else => null,
-        };
+            // We've already moved the piece at the start, there are no other side effects.
+            .move_only => {},
+        }
     }
 
     fn append_captured_piece(self: *Game, piece: Piece) void {
@@ -394,6 +396,8 @@ pub const Game = struct {
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+const test_util = @import("rule_engine/test_util.zig");
 
 test "intial state white returns local turn idle" {
     var game: Game = undefined;
@@ -487,6 +491,73 @@ test "play_move returns InvalidMove when source square is empty" {
         .to = .{ .rank = 4, .file = 4 },
     };
     try std.testing.expectError(error.InvalidMove, game.play_move(mv));
+}
+
+test "play_move: black plays en-passant after white double-push, victim removed and recorded" {
+    // Minimal fixture: both kings + the two pawns involved. Goes through the full game
+    // state machine — preview_move detects en-passant, apply_effect removes the victim
+    // and appends to captures_by_black, the trailing switch clears the ep window.
+    var game: Game = undefined;
+    game.init(.white);
+    game.board = test_util.empty_board();
+    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&game.board, .white_pawn, .{ .rank = 1, .file = 4 }); // e2
+    test_util.place(&game.board, .black_pawn, .{ .rank = 3, .file = 3 }); // d4
+
+    // 1. e2-e4 — double push, sets ep target to e3 = (2, 4).
+    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
+    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
+
+    // 1... d4xe3 e.p. — black diagonal capture onto the (empty) ep target square; the
+    // victim white pawn physically sits on e4 = (3, 4) and must be cleared.
+    try game.play_move(.{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 2, .file = 4 } });
+
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]); // e4 victim removed
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][3]); // d4 source empty
+    try std.testing.expectEqual(Piece.black_pawn, game.board.board_state[2][4]); // e3 ep destination
+    try std.testing.expectEqual(@as(usize, 1), game.captures_by_black.len);
+    try std.testing.expectEqual(Piece.white_pawn, game.captures_by_black.slice()[0]);
+    try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
+    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
+    try std.testing.expectEqual(Color.white, game.turn);
+}
+
+test "play_move: regular capture appends the victim to captures_by_<turn>" {
+    // Confirms the new MoveEffect.capture → Game.append_captured_piece plumbing actually
+    // populates the per-side captures list when a capturing move flows through play_move.
+    var game: Game = undefined;
+    game.init(.white);
+    game.board = test_util.empty_board();
+    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&game.board, .white_rook, .{ .rank = 3, .file = 4 }); // e4
+    test_util.place(&game.board, .black_pawn, .{ .rank = 5, .file = 4 }); // e6
+
+    // White rook e4 → e6, captures black pawn.
+    try game.play_move(.{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 5, .file = 4 } });
+
+    try std.testing.expectEqual(@as(usize, 1), game.captures_by_white.len);
+    try std.testing.expectEqual(Piece.black_pawn, game.captures_by_white.slice()[0]);
+    try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
+    try std.testing.expectEqual(Piece.white_rook, game.board.board_state[5][4]);
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]);
+}
+
+test "play_move: en_passant_square clears after a non-double-push reply to a double push" {
+    // Regression guard for the trailing switch in apply_effect — drop the `else => null`
+    // arm and a stale ep target survives indefinitely. Two-move sequence (1. e4, 1... a6)
+    // proves the clear leg fires for any non-double-push effect.
+    var game: Game = undefined;
+    game.init(.white);
+
+    // 1. e4 — sets ep target to e3.
+    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
+    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
+
+    // 1... a6 — black single push, must clear the ep window.
+    try game.play_move(.{ .from = .{ .rank = 6, .file = 0 }, .to = .{ .rank = 5, .file = 0 } });
+    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
 }
 
 // Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
