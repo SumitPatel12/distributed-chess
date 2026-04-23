@@ -560,6 +560,30 @@ test "play_move: en_passant_square clears after a non-double-push reply to a dou
     try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
 }
 
+test "play_move: white kingside castling moves king + rook and clears both white rights" {
+    // End-to-end: preview_move → apply_effect (castling arm moves the rook) → castling_rights_after
+    // clears both white flags. Black rights must be untouched.
+    var game: Game = undefined;
+    game.init(.white);
+    game.board = test_util.empty_board();
+    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&game.board, .white_rook, .{ .rank = 0, .file = 7 });
+    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 0 });
+
+    try game.play_move(.{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } });
+
+    try std.testing.expectEqual(Piece.white_king, game.board.board_state[0][6]);
+    try std.testing.expectEqual(Piece.white_rook, game.board.board_state[0][5]);
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[0][4]);
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[0][7]);
+    try std.testing.expect(!game.castling_rights.white_kingside);
+    try std.testing.expect(!game.castling_rights.white_queenside);
+    try std.testing.expect(game.castling_rights.black_kingside);
+    try std.testing.expect(game.castling_rights.black_queenside);
+    try std.testing.expectEqual(Color.black, game.turn);
+    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
+}
+
 // Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
 // file) forces *analysis* but not test discovery; the `_ = @import` form inside a test block
 // is what adds a file's `test` blocks to the running binary.

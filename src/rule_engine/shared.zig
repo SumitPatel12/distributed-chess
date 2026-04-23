@@ -12,6 +12,9 @@ const BoundedArray = @import("../bounded_array.zig").BoundedArray;
 
 pub const MAX_LEGAL_MOVES: usize = 256;
 
+pub const WHITE_KING_HOME_POSITION: Position = .{ .rank = 0, .file = 4 };
+pub const BLACK_KING_HOME_POSITION: Position = .{ .rank = 7, .file = 4 };
+
 // That extra line gives better formatting on the hovered definition.
 /// Direction of movement on the board.
 ///

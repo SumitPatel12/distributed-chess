@@ -1,8 +1,8 @@
 //! Benchmark for the chess engine's hot paths: applying a move (through the rule engine) and
 //! building the renderer's byte-sequence buffer. Replays The Immortal Game (Anderssen vs
-//! Kieseritzky, 1851, 45 half-moves, no castling / en-passant / promotion) on a loop and sprinkles
-//! illegal-move attempts every Nth iteration so we capture the rule engine's rejection path
-//! separately.
+//! Kieseritzky, 1851, 45 half-moves, no castling / en-passant / promotion in the game itself) on
+//! a loop and sprinkles illegal-move attempts every Nth iteration so we capture the rule engine's
+//! rejection path separately.
 //!
 //! Timing uses `std.Io.Clock` on the `.awake` monotonic clock (Zig 0.16.0 replaced
 //! `std.time.Timer`). Output goes to stderr via `std.debug.print` and to
@@ -65,10 +65,11 @@ const BENCH_WINDOW_ROWS: u16 = 46;
 // Board coordinates: `rank` is 0-indexed from white's back rank (so rank_idx 0 == chess rank 1),
 // `file` is 0-indexed a..h. e2-e4 therefore reads as .{ .rank = 1, .file = 4 } → .{ 3, 4 }.
 //
-// This sequence is free of castling, en-passant, and promotion — all of which the current rule
-// engine either doesn't model (`CastlingRights` is an empty placeholder, `en_passant_square` stays
-// null) or models partially. Anderssen forfeits castling rights on move 4 (Kf1); Kieseritzky
-// never castles.
+// This sequence is free of castling, en-passant, and promotion — the game itself never triggers
+// them (Anderssen forfeits castling rights on move 4 via Kf1; Kieseritzky never castles; no pawn
+// reaches the last rank). Castling and en-passant are now both fully modeled by the rule engine,
+// but exercising them here would need a different game. Promotion is still partially modeled
+// (Game.play_move doesn't swap in the promoted piece yet).
 const IMMORTAL_GAME = [_]Move{
     // 1. e4 e5
     .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } },
