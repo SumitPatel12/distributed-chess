@@ -10,6 +10,7 @@ const Color = shared.Color;
 const Move = shared.Move;
 const Position = shared.Position;
 const CastlingRights = shared.CastlingRights;
+const PromotionPiece = shared.PromotionPiece;
 const Piece = board_mod.Piece;
 const rules_engine = @import("rule_engine/rules.zig");
 const MoveEffect = rules_engine.MoveEffect;
@@ -102,15 +103,6 @@ const GameState = union(enum) {
 pub const DrawClaim = enum {
     fifty_moves,
     threefold_repetition,
-};
-
-/// The piece a pawn is promoted to on reaching the final rank. A restricted subset of Piece —
-/// kings and pawns can't be promotion targets, and the color is determined by the mover.
-pub const PromotionPiece = enum {
-    queen,
-    rook,
-    bishop,
-    knight,
 };
 
 pub const GameCommand = union(enum) {
@@ -326,11 +318,43 @@ pub const Game = struct {
             error.InvalidMove => return err,
         };
 
-        self.castling_rights = rules_engine.castling_rights_after(&self.board, self.turn, move, move_effect, self.castling_rights);
+        // Rejected here, not inside apply_effect: both play_move (castling_rights assignment
+        // below) and apply_effect (pre-switch board.move + en_passant_square reset) mutate state
+        // before a `.promotion` arm would run. Erroring from either spot would leave the game
+        // half-applied; gating up front keeps the reject path mutation-free.
+        if (move_effect == .promotion) {
+            return error.PromotionNotSupported;
+        }
+
+        // Snapshot the mover's piece identity BEFORE `apply_effect` mutates the board — the 50-move
+        // clock below needs to know whether this was a pawn move, and the source square is about to
+        // change.
+        const moving_piece = self.board.board_state[move.from.rank][move.from.file];
+        const is_pawn_move = moving_piece == .white_pawn or moving_piece == .black_pawn;
+
+        self.castling_rights = rules_engine.castling_rights_after(
+            &self.board,
+            self.turn,
+            move,
+            move_effect,
+            self.castling_rights,
+        );
         self.apply_effect(move, move_effect);
 
-        // TODO: Update halfmove_clock (reset on captures/pawn moves, bump otherwise) and
-        // fullmove_number (bump after black's ply) — both required for draw-claim logic.
+        // 50-move / draw-claim clock: resets on any pawn move or capture, bumps otherwise.
+        // `.en_passant` and `.pawn_double_push` both imply a pawn mover (covered by `is_pawn_move`);
+        // `.capture` is the only reset path that can fire for a non-pawn.
+        if (is_pawn_move or move_effect == .capture) {
+            self.halfmove_clock = 0;
+        } else {
+            self.halfmove_clock += 1;
+        }
+
+        // Fullmove number bumps once per full round of play — after black completes a ply. Checked
+        // before the turn flip below so "it was black's move just now".
+        if (self.turn == .black) {
+            self.fullmove_number += 1;
+        }
 
         // TODO: This should likely be something a game effect would enforce, not sure, keeping
         // as is for now for testing purposes.
@@ -350,13 +374,11 @@ pub const Game = struct {
 
         switch (effect) {
             .capture => |captured_piece| self.append_captured_piece(captured_piece),
-            .promotion => |promotion_effect| {
-                if (promotion_effect.capture) |captured_piece| {
-                    self.append_captured_piece(captured_piece);
-                }
-                // TODO: Handle promotion prompt for user.
-                // TODO: Update board position with promoted piece after.
-            },
+            // play_move rejects `.promotion` with error.PromotionNotSupported before this
+            // switch runs — reaching here means the guard was removed without wiring up
+            // the promotion apply logic (pawn clear + promoted-piece set + captured-piece
+            // append conditional on ep.capture). Keep these linked so the TODO can't rot.
+            .promotion => unreachable,
             .en_passant => |ep| {
                 const captured_pawn: Piece = switch (self.turn) {
                     .white => .black_pawn,
@@ -370,9 +392,13 @@ pub const Game = struct {
             },
             .pawn_double_push => {
                 // pawn_double_push is only emitted by pseudo_legal_pawn from rank 1 (white) or rank
-                // 6 (black); pinning the contract here keeps the u3 arithmetic below safe under any
-                // caller drift.
-                std.debug.assert(move.from.rank == 1 or move.from.rank == 6);
+                // 6 (black); pinning the (turn, from.rank) pair here keeps the u3 arithmetic below
+                // safe AND rules out a bogus effect that pairs, say, black with rank 1 — which
+                // would set ep_square on rank 0 and trip the next ply's pawn asserts.
+                std.debug.assert(
+                    (self.turn == .white and move.from.rank == 1) or
+                        (self.turn == .black and move.from.rank == 6),
+                );
                 const mid_rank: u3 = switch (self.turn) {
                     .white => move.from.rank + 1,
                     .black => move.from.rank - 1,

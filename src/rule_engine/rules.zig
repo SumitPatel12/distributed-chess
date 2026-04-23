@@ -224,6 +224,11 @@ fn pseudo_legal_pawn(
                     (turn == .black and en_passant_position.rank == 2),
             );
             if (target == .empty and to.rank == en_passant_position.rank and to.file == en_passant_position.file) {
+                const expected_enemy_pawn: Piece = switch (turn) {
+                    .white => .black_pawn,
+                    .black => .white_pawn,
+                };
+                std.debug.assert(board.board_state[from.rank][to.file] == expected_enemy_pawn);
                 return .{
                     .en_passant = .{
                         .captured_pawn_at = .{ .rank = from.rank, .file = to.file },
@@ -464,6 +469,10 @@ pub fn castling_rights_after(
     effect: MoveEffect,
     current: CastlingRights,
 ) CastlingRights {
+    const moving_piece = board.board_state[move.from.rank][move.from.file];
+    std.debug.assert(moving_piece != .empty);
+    std.debug.assert(moving_piece.color().? == turn);
+
     // Once all four flags are off they're a fixed point — no later move can resurrect a right.
     // Skips the whole switch during late games where the rights are likely long gone.
     if (!current.white_kingside and !current.white_queenside and
@@ -471,10 +480,6 @@ pub fn castling_rights_after(
     {
         return current;
     }
-
-    const moving_piece = board.board_state[move.from.rank][move.from.file];
-    std.debug.assert(moving_piece != .empty);
-    std.debug.assert(moving_piece.color().? == turn);
 
     var rights = current;
     switch (effect) {
@@ -495,6 +500,7 @@ pub fn castling_rights_after(
         // clip. Only rook captures can touch castling rights; the is-rook guard keeps the
         // intent legible at the call site.
         .capture => |captured_piece| {
+            std.debug.assert(captured_piece.color().? != turn);
             clear_mover_rights(moving_piece, move.from, &rights);
             if (captured_piece == .white_rook or captured_piece == .black_rook) {
                 clear_rights_if_rook_captured_at_corner(captured_piece, move.to, &rights);
@@ -504,6 +510,7 @@ pub fn castling_rights_after(
         // unaffected. But a capture-promotion on a rook's home corner still clips the
         // defender's rights on that side — same shape as .capture minus the mover leg.
         .promotion => |p| {
+            std.debug.assert(moving_piece == .white_pawn or moving_piece == .black_pawn);
             if (p.capture) |captured_piece| {
                 if (captured_piece == .white_rook or captured_piece == .black_rook) {
                     clear_rights_if_rook_captured_at_corner(captured_piece, move.to, &rights);

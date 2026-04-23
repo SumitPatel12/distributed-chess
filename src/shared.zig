@@ -30,6 +30,15 @@ pub const Move = struct {
     to: Position,
 };
 
+/// The piece a pawn is promoted to on reaching the final rank. A restricted subset of `Piece` —
+/// kings and pawns can't be promotion targets, and the color is determined by the mover.
+pub const PromotionPiece = enum {
+    queen,
+    rook,
+    bishop,
+    knight,
+};
+
 /// Holds the castling rights validity for both sides. Defaults to true for all 4.
 pub const CastlingRights = struct {
     white_kingside: bool = true,
@@ -43,4 +52,12 @@ pub const CastlingRights = struct {
 test "Color.opponent is symmetric" {
     try std.testing.expectEqual(Color.black, Color.white.opponent());
     try std.testing.expectEqual(Color.white, Color.black.opponent());
+}
+
+test "CastlingRights default-initializes to all-true" {
+    const rights: CastlingRights = .{};
+    try std.testing.expect(rights.white_kingside);
+    try std.testing.expect(rights.white_queenside);
+    try std.testing.expect(rights.black_kingside);
+    try std.testing.expect(rights.black_queenside);
 }
