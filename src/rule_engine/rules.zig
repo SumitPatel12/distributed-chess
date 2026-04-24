@@ -12,6 +12,7 @@ const Piece = @import("../board.zig").Piece;
 const BoundedArray = @import("../bounded_array.zig").BoundedArray;
 const rules_shared = @import("shared.zig");
 const check_helper = @import("check_helper.zig");
+const Direction = rules_shared.Direction;
 
 const MAX_LEGAL_MOVES = rules_shared.MAX_LEGAL_MOVES;
 
@@ -94,6 +95,64 @@ pub const MoveEffect = union(enum) {
     promotion: struct { capture: ?Piece },
 };
 
+/// Checks if the player of the given color is in a stalemate: not in check, and no legal moves.
+pub fn is_stalemate(
+    board: *const Board,
+    player_color: Color,
+    castling_rights: CastlingRights,
+    en_passant_square: ?Position,
+) bool {
+    if (check_helper.in_check(board, player_color)) {
+        return false;
+    }
+    return !has_any_legal_move(board, player_color, castling_rights, en_passant_square);
+}
+
+/// Checks if the player of the given color is checkmated: in check, and no legal moves.
+pub fn is_checkmate(
+    board: *const Board,
+    player_color: Color,
+    castling_rights: CastlingRights,
+    en_passant_square: ?Position,
+) bool {
+    if (!check_helper.in_check(board, player_color)) {
+        return false;
+    }
+    return !has_any_legal_move(board, player_color, castling_rights, en_passant_square);
+}
+
+/// Returns true as soon as any legal move exists for `player_color`. Walks every square and for
+/// each piece belonging to `player_color` checks if that piece has any legal moves.
+fn has_any_legal_move(
+    board: *const Board,
+    player_color: Color,
+    castling_rights: CastlingRights,
+    en_passant_square: ?Position,
+) bool {
+    // Holds the legal moves after the self-check filter strips the illegal ones. The
+    // intermediate pseudo-legal buffer is owned by `piece_legal_moves` itself — bench A/B
+    // showed that hoisting it out here saved nothing (see tmp/zig-review-local-mate-castling/
+    // bench_AB_comparison.md) and forced an extra parameter on every caller.
+    var legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+
+    for (0..8) |rank| {
+        for (0..8) |file| {
+            const from: Position = .{ .rank = @intCast(rank), .file = @intCast(file) };
+            const piece = board.board_state[from.rank][from.file];
+            if (piece == .empty or piece.color().? != player_color) {
+                continue;
+            }
+
+            legal.reset();
+            piece_legal_moves(board, from, castling_rights, en_passant_square, &legal);
+            if (legal.len > 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // I was generating all of the moves and picking the ones that were from the starting move position
 // and then checked if the resulting position was illegal. The king's position was also not cached,
 // resulting in a lot of redundant and useless calculations.
@@ -111,8 +170,8 @@ pub fn preview_move(
     board: *const Board,
     turn: Color,
     move: Move,
-    enpassant_square: ?Position,
     castling_rights: CastlingRights,
+    en_passant_square: ?Position,
 ) !MoveEffect {
     const from = move.from;
     const to = move.to;
@@ -141,7 +200,7 @@ pub fn preview_move(
     }
 
     const effect: MoveEffect = try switch (piece) {
-        .white_pawn, .black_pawn => pseudo_legal_pawn(board, from, to, turn, enpassant_square),
+        .white_pawn, .black_pawn => pseudo_legal_pawn(board, from, to, turn, en_passant_square),
         .white_knight, .black_knight => pseudo_legal_knight(board, from, to, turn),
         .white_bishop_light,
         .white_bishop_dark,
@@ -359,15 +418,15 @@ fn try_castle(
         return error.InvalidMove;
     }
 
-    for (plan.between_files) |f| {
-        if (board.board_state[plan.rank][f] != .empty) {
+    for (plan.between_files) |file| {
+        if (board.board_state[plan.rank][file] != .empty) {
             return error.InvalidMove;
         }
     }
 
-    for (plan.king_path_files) |f| {
+    for (plan.king_path_files) |file| {
         var scratch = board.*;
-        scratch.move(from, .{ .rank = plan.rank, .file = f });
+        scratch.move(from, .{ .rank = plan.rank, .file = file });
         if (check_helper.in_check(&scratch, turn)) {
             return error.InvalidMove;
         }
@@ -389,7 +448,7 @@ fn pseudo_legal_sliding(
     from: Position,
     to: Position,
     turn: Color,
-    allowed_directions: []const rules_shared.Direction,
+    allowed_directions: []const Direction,
 ) !MoveEffect {
     const rank_delta: i8 = @as(i8, @intCast(to.rank)) - @as(i8, @intCast(from.rank));
     const file_delta: i8 = @as(i8, @intCast(to.file)) - @as(i8, @intCast(from.file));
@@ -399,7 +458,7 @@ fn pseudo_legal_sliding(
     }
 
     // Determine the direction.
-    const direction: rules_shared.Direction = blk: {
+    const direction: Direction = blk: {
         if (file_delta == 0) {
             break :blk if (rank_delta > 0) .north else .south;
         }
@@ -421,8 +480,8 @@ fn pseudo_legal_sliding(
 
     // Check the direction is in the allowed set.
     var allowed = false;
-    for (allowed_directions) |d| {
-        if (d == direction) {
+    for (allowed_directions) |allowed_direction| {
+        if (allowed_direction == direction) {
             allowed = true;
             break;
         }
@@ -509,9 +568,9 @@ pub fn castling_rights_after(
         // Promotion: mover is always a pawn (never king/rook), so mover-side rights are
         // unaffected. But a capture-promotion on a rook's home corner still clips the
         // defender's rights on that side — same shape as .capture minus the mover leg.
-        .promotion => |p| {
+        .promotion => |promotion| {
             std.debug.assert(moving_piece == .white_pawn or moving_piece == .black_pawn);
-            if (p.capture) |captured_piece| {
+            if (promotion.capture) |captured_piece| {
                 if (captured_piece == .white_rook or captured_piece == .black_rook) {
                     clear_rights_if_rook_captured_at_corner(captured_piece, move.to, &rights);
                 }
@@ -600,8 +659,8 @@ fn apply_effect(scratch: *Board, move: Move, effect: MoveEffect) void {
         .en_passant => |ep| {
             scratch.clear(ep.captured_pawn_at);
         },
-        .castling => |c| {
-            scratch.move(c.rook_from, c.rook_to);
+        .castling => |castling| {
+            scratch.move(castling.rook_from, castling.rook_to);
         },
     }
 }
@@ -639,100 +698,93 @@ fn filter_self_check(
     }
 }
 
-// --- TODO: Refactor to respect MoveEffect -------
-// Everything below predates the preview_move-centric design.
-
-/// Returns all of the legal moves of the piece at given position. Position must hold a non-empty
-/// piece — calling on an empty square is a programmer bug.
+// --- Aggregate per-color movegen — does NOT compute MoveEffect ----------------------------------
+/// Returns all of the legal moves of the piece at given `from`. `from` must hold a non-empty
+/// piece — calling on an empty square is a programmer bug. The intermediate pseudo-legal buffer
+/// lives on this function's stack frame (~1 KB); bench A/B confirmed there's no win in hoisting
+/// it to the caller (see tmp/zig-review-local-mate-castling/bench_AB_comparison.md).
 pub fn piece_legal_moves(
     board: *const Board,
-    position: Position,
+    from: Position,
     castling_rights: CastlingRights,
-    enpassant_square: ?Position,
+    en_passant_square: ?Position,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
-    // Caller must pass a fresh buffer — stale moves from a prior call would corrupt the result.
     std.debug.assert(out.len == 0);
 
-    const piece = board.board_state[position.rank][position.file];
+    var pseudo_legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+
+    const piece = board.board_state[from.rank][from.file];
     std.debug.assert(piece != .empty);
     const turn = piece.color().?;
 
-    // The per-piece `*_from` helpers generate pseudo-legal moves for the single piece at
-    // `position` (unlike the aggregate `*_moves` helpers below, which iterate every piece of
-    // that type for the colour). We then discard any move that would leave our own king in
-    // check via `filter_self_check`.
-    var pseudo_legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
     switch (piece) {
-        .white_pawn, .black_pawn => pawn_moves_from(board, position, turn, enpassant_square, &pseudo_legal),
-        .white_knight, .black_knight => knight_moves_from(board, position, turn, &pseudo_legal),
+        .white_pawn, .black_pawn => pawn_moves_from(board, from, turn, en_passant_square, &pseudo_legal),
+        .white_knight, .black_knight => knight_moves_from(board, from, turn, &pseudo_legal),
         .white_bishop_light,
         .white_bishop_dark,
         .black_bishop_light,
         .black_bishop_dark,
-        => bishop_moves_from(board, position, turn, &pseudo_legal),
-        .white_rook, .black_rook => rook_moves_from(board, position, turn, &pseudo_legal),
-        .white_queen, .black_queen => queen_moves_from(board, position, turn, &pseudo_legal),
-        .white_king, .black_king => king_moves_from(board, position, turn, &pseudo_legal),
+        => bishop_moves_from(board, from, turn, &pseudo_legal),
+        .white_rook, .black_rook => rook_moves_from(board, from, turn, &pseudo_legal),
+        .white_queen, .black_queen => queen_moves_from(board, from, turn, &pseudo_legal),
+        .white_king, .black_king => king_moves_from(board, from, turn, castling_rights, &pseudo_legal),
         .empty => unreachable,
     }
-    _ = castling_rights;
 
     filter_self_check(board, turn, &pseudo_legal, out);
 }
 
-/// Appends single-push and double-push forward moves for one pawn at `position`. Does not
+/// Appends single-push and double-push forward moves for one pawn at `from`. Does not
 /// handle captures — those stay inline in `pawn_moves` because they share the capture_directions
-/// loop. `start_rank` is 1 (white) or 6 (black); matches `position.rank` exactly when the pawn
+/// loop. `start_rank` is 1 (white) or 6 (black); matches `from.rank` exactly when the pawn
 /// can double-push.
 fn pawn_forward_moves(
     board: *const Board,
-    position: Position,
+    from: Position,
     target_rank: u3,
     start_rank: u3,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     // Single push: target square must be empty.
-    if (board.board_state[target_rank][position.file] == .empty) {
+    if (board.board_state[target_rank][from.file] == .empty) {
         out.append_assume_capacity(.{
-            .from = position,
-            .to = .{ .rank = target_rank, .file = position.file },
+            .from = from,
+            .to = .{ .rank = target_rank, .file = from.file },
         });
 
         // Double push: only from starting rank, and the intermediate square must be empty
         // (which we just proved by entering this branch). start_rank is 1 or 6, so +/- 2
         // stays in u3 range.
-        if (position.rank == start_rank) {
+        if (from.rank == start_rank) {
             const double_rank: u3 = switch (turn) {
-                .white => position.rank + 2,
-                .black => position.rank - 2,
+                .white => from.rank + 2,
+                .black => from.rank - 2,
             };
-            if (board.board_state[double_rank][position.file] == .empty) {
+            if (board.board_state[double_rank][from.file] == .empty) {
                 out.append_assume_capacity(.{
-                    .from = position,
-                    .to = .{ .rank = double_rank, .file = position.file },
+                    .from = from,
+                    .to = .{ .rank = double_rank, .file = from.file },
                 });
             }
         }
     }
 }
 
-/// Appends diagonal-capture moves for one pawn at `position`. Does not handle en-passant —
-/// that's deferred (see the TODO in `pawn_moves`). `target_rank` is `position.rank ± 1`
-/// per the caller's color perspective and is load-bearing for u3 safety.
+/// Appends diagonal-capture moves for one pawn at `from`.
 fn pawn_capture_moves(
     board: *const Board,
-    position: Position,
+    from: Position,
     target_rank: u3,
-    capture_directions: [2]rules_shared.Direction,
+    capture_directions: [2]Direction,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     for (capture_directions) |direction| {
         const file_delta = direction.deltas().file;
         // File is the only axis that can fall off the edge (a/h files). Rank is caller-pinned safe.
-        const diag_file_i8: i8 = @as(i8, @intCast(position.file)) + file_delta;
+        const diag_file_i8: i8 = @as(i8, @intCast(from.file)) + file_delta;
         if (diag_file_i8 < 0 or diag_file_i8 > 7) {
             continue;
         }
@@ -742,34 +794,77 @@ fn pawn_capture_moves(
         // Regular capture — opponent piece on the diagonal.
         if (target_piece != .empty and target_piece.color().? != turn) {
             out.append_assume_capacity(.{
-                .from = position,
+                .from = from,
                 .to = .{ .rank = target_rank, .file = diag_file },
             });
         }
     }
 }
 
-/// Pseudo-legal moves for a single pawn at `position`. Covers single push, double push (from
-/// starting rank only), and diagonal captures. En-passant is deferred — see the TODO just below.
-/// The self-check filter applied by the caller handles pins and moves that would leave our own
-/// king in check.
-fn pawn_moves_from(
+/// Appends the en-passant capture for one pawn at `from`, if it's available.
+fn en_passant_move(
     board: *const Board,
-    position: Position,
     turn: Color,
-    enpassant_square: ?Position,
+    from: Position,
+    directions: [2]Direction,
+    en_passant_square: ?Position,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
-    // TODO: en-passant — currently stripped because filter_self_check can't simulate ep
-    // capture cleanly (Board.move is geometry-only and doesn't remove the captured pawn on
-    // the adjacent file). Re-introduce here alongside an ep-aware move-application helper
-    // and drop this discard.
-    _ = enpassant_square;
+    const ep = en_passant_square orelse return;
+
+    // The en-passant rank: rank 5 for white to move (black just pushed), rank 2 for black to move.
+    std.debug.assert((turn == .white and ep.rank == 5) or (turn == .black and ep.rank == 2));
+
+    // Both capture diagonals share a rank delta, so either index works.
+    const rank_delta = directions[0].deltas().rank;
+
+    // The attacker sits one forward step behind the ep square — i.e. on the same rank as the
+    // pushed pawn. i8 math dodges u3 overflow/underflow at the edges.
+    const from_rank_i8: i8 = @intCast(from.rank);
+    const ep_rank_i8: i8 = @intCast(ep.rank);
+    if (from_rank_i8 + rank_delta != ep_rank_i8) {
+        return;
+    }
+
+    // The attacker's file must be adjacent to the ep square. The two capture diagonals carry
+    // file deltas of +1 and -1, so we test both. i8 dodges the u3 underflow when ep sits on
+    // file 0 or 7.
+    const from_file_i8: i8 = @intCast(from.file);
+    const ep_file_i8: i8 = @intCast(ep.file);
+    const file_delta1 = directions[0].deltas().file;
+    const file_delta2 = directions[1].deltas().file;
+    if (from_file_i8 != ep_file_i8 + file_delta1 and
+        from_file_i8 != ep_file_i8 + file_delta2)
+    {
+        return;
+    }
+
+    // The enemy pawn being captured must actually be sitting where en-passant expects it — same
+    // rank as the attacker, same file as the ep target.
+    const expected_enemy_pawn: Piece = switch (turn) {
+        .white => .black_pawn,
+        .black => .white_pawn,
+    };
+    std.debug.assert(board.board_state[from.rank][ep.file] == expected_enemy_pawn);
+
+    out.append_assume_capacity(.{ .from = from, .to = ep });
+}
+
+/// Pseudo-legal moves for a single pawn at `from`. Covers single push, double push (from the
+/// starting rank only), diagonal captures, and en-passant. The self-check filter applied by the
+/// caller handles pins and moves that would leave our own king in check.
+fn pawn_moves_from(
+    board: *const Board,
+    from: Position,
+    turn: Color,
+    en_passant_square: ?Position,
+    out: *BoundedArray(Move, MAX_LEGAL_MOVES),
+) void {
     // Pawns on rank 0 or 7 would have been promoted already. Also the load-bearing guarantee
     // for the u3 arithmetic below: rank 1..6 + 1 stays 2..7, rank 1..6 - 1 stays 0..5.
-    std.debug.assert(position.rank != 0 and position.rank != 7);
+    std.debug.assert(from.rank != 0 and from.rank != 7);
 
-    const capture_directions: [2]rules_shared.Direction = switch (turn) {
+    const capture_directions: [2]Direction = switch (turn) {
         .white => rules_shared.WHITE_PAWN_CAPTURE_DIRECTIONS,
         .black => rules_shared.BLACK_PAWN_CAPTURE_DIRECTIONS,
     };
@@ -778,23 +873,24 @@ fn pawn_moves_from(
         .black => 6,
     };
     const target_rank: u3 = switch (turn) {
-        .white => position.rank + 1,
-        .black => position.rank - 1,
+        .white => from.rank + 1,
+        .black => from.rank - 1,
     };
 
-    pawn_forward_moves(board, position, target_rank, start_rank, turn, out);
-    pawn_capture_moves(board, position, target_rank, capture_directions, turn, out);
+    pawn_forward_moves(board, from, target_rank, start_rank, turn, out);
+    pawn_capture_moves(board, from, target_rank, capture_directions, turn, out);
+    en_passant_move(board, turn, from, capture_directions, en_passant_square, out);
 }
 
-/// Pseudo-legal moves for a single knight at `position`.
+/// Pseudo-legal moves for a single knight at `from`.
 fn knight_moves_from(
     board: *const Board,
-    position: Position,
+    from: Position,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
-    const rank: i8 = @intCast(position.rank);
-    const file: i8 = @intCast(position.file);
+    const rank: i8 = @intCast(from.rank);
+    const file: i8 = @intCast(from.file);
 
     for (rules_shared.KNIGHT_OFFSETS) |offset| {
         const target_rank = rank + offset.rank;
@@ -810,57 +906,61 @@ fn knight_moves_from(
         }
 
         out.append_assume_capacity(.{
-            .from = position,
+            .from = from,
             .to = .{ .rank = @intCast(target_rank), .file = @intCast(target_file) },
         });
     }
 }
 
-/// Pseudo-legal moves for a single bishop at `position`.
+/// Pseudo-legal moves for a single bishop at `from`.
 fn bishop_moves_from(
     board: *const Board,
-    position: Position,
+    from: Position,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     for (rules_shared.BISHOP_DIRECTIONS) |direction| {
-        rules_shared.collect_ray_moves(board, position, direction, turn, out);
+        rules_shared.collect_ray_moves(board, from, direction, turn, out);
     }
 }
 
-/// Pseudo-legal moves for a single rook at `position`.
+/// Pseudo-legal moves for a single rook at `from`.
 fn rook_moves_from(
     board: *const Board,
-    position: Position,
+    from: Position,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     for (rules_shared.ROOK_DIRECTIONS) |direction| {
-        rules_shared.collect_ray_moves(board, position, direction, turn, out);
+        rules_shared.collect_ray_moves(board, from, direction, turn, out);
     }
 }
 
-/// Pseudo-legal moves for a single queen at `position`.
+/// Pseudo-legal moves for a single queen at `from`.
 fn queen_moves_from(
     board: *const Board,
-    position: Position,
+    from: Position,
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     for (rules_shared.ALL_DIRECTIONS) |direction| {
-        rules_shared.collect_ray_moves(board, position, direction, turn, out);
+        rules_shared.collect_ray_moves(board, from, direction, turn, out);
     }
 }
 
-/// Pseudo-legal moves for the king at `position`.
+/// Pseudo-legal moves for the king at `from`. Covers the eight one-step directions and
+/// castling. Mirrors `pawn_moves_from`'s shape — the per-piece entry point bundles every kind
+/// of king move, including the two-file castling slides, so callers don't have to know
+/// castling is a distinct concern.
 fn king_moves_from(
     board: *const Board,
-    position: Position,
+    from: Position,
     turn: Color,
+    castling_rights: CastlingRights,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
-    const rank: i8 = @intCast(position.rank);
-    const file: i8 = @intCast(position.file);
+    const rank: i8 = @intCast(from.rank);
+    const file: i8 = @intCast(from.file);
 
     for (rules_shared.ALL_DIRECTIONS) |direction| {
         const delta = direction.deltas();
@@ -878,21 +978,120 @@ fn king_moves_from(
         }
 
         out.append_assume_capacity(.{
-            .from = position,
+            .from = from,
             .to = .{ .rank = @intCast(target_rank), .file = @intCast(target_file) },
+        });
+    }
+
+    king_castling_moves(board, from, turn, castling_rights, out);
+}
+
+/// Appends pseudo-legal castling moves for the king at `from`. Emits only the king's `from → to`
+/// (landing file 6 for king-side, 2 for queen-side) — we deliberately do NOT emit a separate
+/// rook move. A `Move` represents a single user-issued request, and castling is issued as the
+/// king's two-file sideways slide; the companion rook relocation is derived at apply-time when
+/// `preview_move` classifies the king's `abs_file == 2` move as castling and `try_castle`
+/// returns `MoveEffect.castling.{rook_from, rook_to}` for `apply_effect` to consume.
+///
+/// Mirrors the castling preconditions from `try_castle`: right present, rook on its home square,
+/// between-files empty, king not currently in check, and no king-path square under attack. The
+/// caller's `filter_self_check` handles the landing-square-under-attack case post-move, but it
+/// cannot see the "currently in check" rule or the "passes through attacked square" rule — so
+/// we enforce those here.
+fn king_castling_moves(
+    board: *const Board,
+    from: Position,
+    turn: Color,
+    castling_rights: CastlingRights,
+    out: *BoundedArray(Move, MAX_LEGAL_MOVES),
+) void {
+    // King must be on its home square — castling is defined only from there.
+    if ((turn == .white and !std.meta.eql(from, rules_shared.WHITE_KING_HOME_POSITION)) or
+        (turn == .black and !std.meta.eql(from, rules_shared.BLACK_KING_HOME_POSITION)))
+    {
+        return;
+    }
+
+    // Short-circuit: with no rights on the mover's side, no castling option can be legal —
+    // skips both the per-plan loop and the in_check sweep.
+    const any_right = switch (turn) {
+        .white => castling_rights.white_kingside or castling_rights.white_queenside,
+        .black => castling_rights.black_kingside or castling_rights.black_queenside,
+    };
+    if (!any_right) {
+        return;
+    }
+
+    // Can't castle out of check. The answer is the same for both plans, and it's the priciest
+    // guard here — hoist it out of the loop.
+    if (check_helper.in_check(board, turn)) {
+        return;
+    }
+
+    const castling_options: [2]struct { plan: CastlingPlan, right: bool } = switch (turn) {
+        .white => .{
+            .{ .plan = WHITE_KING_SIDE_PLAN, .right = castling_rights.white_kingside },
+            .{ .plan = WHITE_QUEEN_SIDE_PLAN, .right = castling_rights.white_queenside },
+        },
+        .black => .{
+            .{ .plan = BLACK_KING_SIDE_PLAN, .right = castling_rights.black_kingside },
+            .{ .plan = BLACK_QUEEN_SIDE_PLAN, .right = castling_rights.black_queenside },
+        },
+    };
+
+    const expected_rook: Piece = switch (turn) {
+        .white => .white_rook,
+        .black => .black_rook,
+    };
+
+    option_loop: for (castling_options) |option| {
+        if (!option.right) {
+            continue;
+        }
+
+        const plan = option.plan;
+
+        // Rights imply the rook is home by invariant (any move off the corner, or capture of
+        // the rook on the corner, clears the matching right). Hand-crafted positions can still
+        // set flags without the rook actually being there — guard against that here.
+        if (board.board_state[plan.rank][plan.rook_from_file] != expected_rook) {
+            continue;
+        }
+
+        for (plan.between_files) |file| {
+            if (board.board_state[plan.rank][file] != .empty) {
+                continue :option_loop;
+            }
+        }
+
+        for (plan.king_path_files) |file| {
+            var scratch = board.*;
+            scratch.move(from, .{ .rank = plan.rank, .file = file });
+            if (check_helper.in_check(&scratch, turn)) {
+                continue :option_loop;
+            }
+        }
+
+        // The landing file is fixed by side (6 / 2) — derive directly rather than indexing into
+        // `king_path_files`, which would couple this emit to that array's last-element layout.
+        const king_to_file: u3 = switch (plan.side) {
+            .king_side => 6,
+            .queen_side => 2,
+        };
+        out.append_assume_capacity(.{
+            .from = from,
+            .to = .{ .rank = plan.rank, .file = king_to_file },
         });
     }
 }
 
-// TODO: Handle Promotion or defer it to the caller.
 /// Calculates the pseudo-legal pawn moves given the board state and color turn. Covers single push,
-/// double push (from starting rank only), and diagonal captures. En-passant is deferred — see the
-/// TODO inside `pawn_moves_from`. The self-check filter applied by the caller handles pins and
-/// moves that would leave our own king in check.
+/// double push (from starting rank only), diagonal captures, and en-passant. The self-check filter
+/// applied by the caller handles pins and moves that would leave our own king in check.
 fn pawn_moves(
     board: *const Board,
     turn: Color,
-    enpassant_square: ?Position,
+    en_passant_square: ?Position,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     const pawn_piece: Piece = switch (turn) {
@@ -902,7 +1101,7 @@ fn pawn_moves(
 
     const positions = board.find_piece_position(pawn_piece);
     for (positions.slice()) |position| {
-        pawn_moves_from(board, position, turn, enpassant_square, out);
+        pawn_moves_from(board, position, turn, en_passant_square, out);
     }
 }
 
@@ -978,14 +1177,16 @@ fn queen_moves(board: *const Board, turn: Color, out: *BoundedArray(
     }
 }
 
-// TODO: Castling will be added here once CastlingRights is fleshed out.
-/// Calculates pseudo-legal king moves — one square in any of the 8 directions. Moves onto empty
-/// squares or opponent-occupied squares (captures) are included. Friendly-occupied squares are
-/// skipped. The self-check filter applied by the caller handles the "can't move into check" rule.
-fn king_moves(board: *const Board, turn: Color, out: *BoundedArray(
-    Move,
-    MAX_LEGAL_MOVES,
-)) void {
+/// Calculates pseudo-legal king moves — one square in any of the 8 directions, plus castling.
+/// Moves onto empty squares or opponent-occupied squares (captures) are included; friendly-
+/// occupied squares are skipped. The self-check filter applied by the caller handles the
+/// "can't move into check" rule.
+fn king_moves(
+    board: *const Board,
+    turn: Color,
+    castling_rights: CastlingRights,
+    out: *BoundedArray(Move, MAX_LEGAL_MOVES),
+) void {
     const king_piece: Piece = switch (turn) {
         .white => .white_king,
         .black => .black_king,
@@ -994,9 +1195,9 @@ fn king_moves(board: *const Board, turn: Color, out: *BoundedArray(
     const positions = board.find_piece_position(king_piece);
     std.debug.assert(positions.len == 1);
 
-    king_moves_from(board, positions.slice()[0], turn, out);
+    king_moves_from(board, positions.slice()[0], turn, castling_rights, out);
 }
-// --- TODO END ---
+// --- END aggregate movegen ----------------------------------------------------------------------
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -1067,7 +1268,7 @@ test "king_moves refuses to walk onto a friendly piece" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
 
     var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
-    king_moves(&board, .white, &out);
+    king_moves(&board, .white, .{}, &out);
 
     for (out.slice()) |mv| {
         const to_d4 = mv.to.rank == 3 and mv.to.file == 3;
@@ -1085,7 +1286,7 @@ test "preview_move returns InvalidMove for a move from an empty square" {
         .from = .{ .rank = 4, .file = 4 }, // e5, empty
         .to = .{ .rank = 5, .file = 4 }, // e6
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, castling));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, castling, null));
 }
 
 test "preview_move rejects a move that would leave own king in check" {
@@ -1102,14 +1303,14 @@ test "preview_move rejects a move that would leave own king in check" {
         .from = .{ .rank = 1, .file = 3 },
         .to = .{ .rank = 1, .file = 4 }, // d2 → e2, off the pin ray
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, illegal, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, illegal, .{}, null));
 
     // Sanity: a rook move *along* the pin ray remains legal.
     const legal = Move{
         .from = .{ .rank = 1, .file = 3 },
         .to = .{ .rank = 2, .file = 3 }, // d2 → d3, stays on d-file
     };
-    _ = try preview_move(&board, .white, legal, null, .{});
+    _ = try preview_move(&board, .white, legal, .{}, null);
 }
 
 test "piece_legal_moves on the king returns only moves with from == king_pos" {
@@ -1187,14 +1388,14 @@ test "preview_move rejects capturing the opposing king" {
         .from = .{ .rank = 0, .file = 4 },
         .to = .{ .rank = 3, .file = 4 },
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, king_capture, null, castling));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, king_capture, castling, null));
 
     // Sanity: a non-king target along the same ray still validates.
     const quiet_move = Move{
         .from = .{ .rank = 0, .file = 4 },
         .to = .{ .rank = 1, .file = 4 },
     };
-    _ = try preview_move(&board, .white, quiet_move, null, castling);
+    _ = try preview_move(&board, .white, quiet_move, castling, null);
 }
 
 test "piece_legal_moves never emits a king capture" {
@@ -1344,7 +1545,7 @@ test "preview_move: white kingside castling returns MoveEffect.castling with cor
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    const effect = try preview_move(&board, .white, mv, null, .{});
+    const effect = try preview_move(&board, .white, mv, .{}, null);
 
     try testing.expectEqual(CastlingSide.king_side, effect.castling.side);
     try testing.expectEqual(Position{ .rank = 0, .file = 7 }, effect.castling.rook_from);
@@ -1358,7 +1559,7 @@ test "preview_move: white queenside castling returns MoveEffect.castling with co
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 2 } };
-    const effect = try preview_move(&board, .white, mv, null, .{});
+    const effect = try preview_move(&board, .white, mv, .{}, null);
 
     try testing.expectEqual(CastlingSide.queen_side, effect.castling.side);
     try testing.expectEqual(Position{ .rank = 0, .file = 0 }, effect.castling.rook_from);
@@ -1372,7 +1573,7 @@ test "preview_move: black kingside castling returns MoveEffect.castling with cor
     test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 7, .file = 4 }, .to = .{ .rank = 7, .file = 6 } };
-    const effect = try preview_move(&board, .black, mv, null, .{});
+    const effect = try preview_move(&board, .black, mv, .{}, null);
 
     try testing.expectEqual(CastlingSide.king_side, effect.castling.side);
     try testing.expectEqual(Position{ .rank = 7, .file = 7 }, effect.castling.rook_from);
@@ -1386,7 +1587,7 @@ test "preview_move: black queenside castling returns MoveEffect.castling with co
     test_util.place(&board, .white_king, .{ .rank = 0, .file = 7 });
 
     const mv = Move{ .from = .{ .rank = 7, .file = 4 }, .to = .{ .rank = 7, .file = 2 } };
-    const effect = try preview_move(&board, .black, mv, null, .{});
+    const effect = try preview_move(&board, .black, mv, .{}, null);
 
     try testing.expectEqual(CastlingSide.queen_side, effect.castling.side);
     try testing.expectEqual(Position{ .rank = 7, .file = 0 }, effect.castling.rook_from);
@@ -1404,7 +1605,7 @@ test "preview_move: castling rejected when king is not on home square" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 3, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when all four rights are off" {
@@ -1420,7 +1621,7 @@ test "preview_move: castling rejected when all four rights are off" {
     };
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, all_off));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, all_off, null));
 }
 
 test "preview_move: castling rejected when king is currently in check" {
@@ -1432,7 +1633,7 @@ test "preview_move: castling rejected when king is currently in check" {
     test_util.place(&board, .black_rook, .{ .rank = 7, .file = 4 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when the matching side's right is false" {
@@ -1444,7 +1645,7 @@ test "preview_move: castling rejected when the matching side's right is false" {
     const rights: CastlingRights = .{ .white_kingside = false };
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, rights));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, rights, null));
 }
 
 test "preview_move: castling rejected when a between-files square is occupied" {
@@ -1456,7 +1657,7 @@ test "preview_move: castling rejected when a between-files square is occupied" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when a king-path square is attacked" {
@@ -1468,7 +1669,7 @@ test "preview_move: castling rejected when a king-path square is attacked" {
     test_util.place(&board, .black_rook, .{ .rank = 7, .file = 5 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when rook is missing from home corner" {
@@ -1478,7 +1679,7 @@ test "preview_move: castling rejected when rook is missing from home corner" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: queenside castling rejected when b-file has a blocker" {
@@ -1491,5 +1692,273 @@ test "preview_move: queenside castling rejected when b-file has a blocker" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 2 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, null, .{}));
+    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+}
+
+// ── is_checkmate / is_stalemate ───────────────────────────────────────────────
+// Lock down the new game-status detection. Each fixture is the smallest legal position that
+// exercises one branch of has_any_legal_move + the in_check pre-condition.
+
+test "is_checkmate: classic back-rank mate is detected for black" {
+    // Black king h8 with friendly pawns f7/g7/h7 trapping it on the back rank; white rook on
+    // e8 delivers check along rank 7. None of black's pieces can capture, block, or escape.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 5 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 6 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 7 });
+
+    try testing.expect(is_checkmate(&board, .black, .{}, null));
+    try testing.expect(!is_stalemate(&board, .black, .{}, null));
+}
+
+test "is_checkmate: returns false when king has an escape square" {
+    // Same back-rank position minus the h7 pawn — h7 is now an unattacked escape square,
+    // so the position is check but not mate.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 5 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 6 });
+
+    try testing.expect(!is_checkmate(&board, .black, .{}, null));
+}
+
+test "is_checkmate: returns false when not in check (stalemate-shaped position)" {
+    // Same fixture as the stalemate test below — black has no moves but isn't in check.
+    // is_checkmate must short-circuit on the in_check pre-condition and return false.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 6, .file = 5 });
+    test_util.place(&board, .white_queen, .{ .rank = 5, .file = 6 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
+
+    try testing.expect(!is_checkmate(&board, .black, .{}, null));
+}
+
+test "is_stalemate: king-in-corner trapped by opposing king + queen, no check" {
+    // Black king h8; white king f7 controls g7/g8; white queen g6 covers h7 (NE diagonal one step)
+    // and reinforces g7/g8. h8 itself is unattacked — black is not in check.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 6, .file = 5 });
+    test_util.place(&board, .white_queen, .{ .rank = 5, .file = 6 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
+
+    try testing.expect(is_stalemate(&board, .black, .{}, null));
+    try testing.expect(!is_checkmate(&board, .black, .{}, null));
+}
+
+test "is_stalemate: returns false when in check (would be checkmate, not stalemate)" {
+    // Reuse the back-rank mate fixture — black is mated, but the question here is just "is
+    // this stalemate?" — the answer must be false because the side-to-move is in check.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 5 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 6 });
+    test_util.place(&board, .black_pawn, .{ .rank = 6, .file = 7 });
+
+    try testing.expect(!is_stalemate(&board, .black, .{}, null));
+}
+
+test "is_stalemate: returns false when the side has any legal move" {
+    // Starting position — white has 20 legal opening moves. Sanity guard so a regression in
+    // has_any_legal_move's "found one, return true" early-exit doesn't sneak past the
+    // narrower fixtures above.
+    var board: Board = undefined;
+    board.init();
+
+    try testing.expect(!is_stalemate(&board, .white, .{}, null));
+    try testing.expect(!is_checkmate(&board, .white, .{}, null));
+}
+
+// ── king castling movegen via piece_legal_moves ────────────────────────────────
+// `try_castle` (the per-move validator) is exhaustively covered by the preview_move tests
+// above. These tests pin the *enumeration* path: piece_legal_moves on the king must surface
+// the available castling slides.
+
+test "piece_legal_moves: white king with both rights and clear path emits g1 and c1" {
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 7 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 0, .file = 4 }, .{}, null, &out);
+
+    var saw_kingside = false;
+    var saw_queenside = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 0 and mv.to.file == 6) saw_kingside = true;
+        if (mv.to.rank == 0 and mv.to.file == 2) saw_queenside = true;
+    }
+    try testing.expect(saw_kingside);
+    try testing.expect(saw_queenside);
+}
+
+test "piece_legal_moves: kingside-only right emits g1 but not c1" {
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 7 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    const rights: CastlingRights = .{ .white_queenside = false };
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 0, .file = 4 }, rights, null, &out);
+
+    var saw_kingside = false;
+    var saw_queenside = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 0 and mv.to.file == 6) saw_kingside = true;
+        if (mv.to.rank == 0 and mv.to.file == 2) saw_queenside = true;
+    }
+    try testing.expect(saw_kingside);
+    try testing.expect(!saw_queenside);
+}
+
+test "piece_legal_moves: king in check emits no castling moves" {
+    // Black rook on e3 puts the white king on e1 in check. king_castling_moves's
+    // up-front in_check guard must fire — no castling moves should appear, even though the
+    // matching rights are set and the rook is home.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 7 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_rook, .{ .rank = 2, .file = 4 });
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 0, .file = 4 }, .{}, null, &out);
+
+    for (out.slice()) |mv| {
+        const is_kingside_castle = mv.to.rank == 0 and mv.to.file == 6;
+        const is_queenside_castle = mv.to.rank == 0 and mv.to.file == 2;
+        try testing.expect(!is_kingside_castle and !is_queenside_castle);
+    }
+}
+
+test "piece_legal_moves: black king with both rights emits g8 and c8" {
+    // Mirror of the white test on rank 7.
+    var board = test_util.empty_board();
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_rook, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_rook, .{ .rank = 7, .file = 7 });
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 7, .file = 4 }, .{}, null, &out);
+
+    var saw_kingside = false;
+    var saw_queenside = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 7 and mv.to.file == 6) saw_kingside = true;
+        if (mv.to.rank == 7 and mv.to.file == 2) saw_queenside = true;
+    }
+    try testing.expect(saw_kingside);
+    try testing.expect(saw_queenside);
+}
+
+test "piece_legal_moves: rook missing from corner suppresses that side's castling" {
+    // White kingside right is set but h1 is empty. king_castling_moves's defensive rook-home
+    // check must skip kingside while still emitting queenside (a1 is occupied).
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .white_rook, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 0, .file = 4 }, .{}, null, &out);
+
+    var saw_kingside = false;
+    var saw_queenside = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 0 and mv.to.file == 6) saw_kingside = true;
+        if (mv.to.rank == 0 and mv.to.file == 2) saw_queenside = true;
+    }
+    try testing.expect(!saw_kingside);
+    try testing.expect(saw_queenside);
+}
+
+// ── en-passant movegen via piece_legal_moves ───────────────────────────────────
+// pseudo_legal_pawn covers the per-move validator path; these tests pin the *enumeration*
+// path: piece_legal_moves on the attacking pawn must surface the ep capture.
+
+test "piece_legal_moves: white pawn on e5 emits ep capture to d6 when ep target is set" {
+    // Black just played d7-d5 (double push), so ep target = d6 = (5, 3). The white pawn on
+    // e5 = (4, 4) is positioned to capture en-passant.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 4 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 3 });
+    const ep: Position = .{ .rank = 5, .file = 3 };
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 4, .file = 4 }, .{}, ep, &out);
+
+    var saw_ep = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 5 and mv.to.file == 3) saw_ep = true;
+    }
+    try testing.expect(saw_ep);
+}
+
+test "piece_legal_moves: black pawn on d4 emits ep capture to e3 when ep target is set" {
+    // White just played e2-e4 (double push), so ep target = e3 = (2, 4). The black pawn on
+    // d4 = (3, 3) can capture en-passant.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_pawn, .{ .rank = 3, .file = 3 });
+    test_util.place(&board, .white_pawn, .{ .rank = 3, .file = 4 });
+    const ep: Position = .{ .rank = 2, .file = 4 };
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 3, .file = 3 }, .{}, ep, &out);
+
+    var saw_ep = false;
+    for (out.slice()) |mv| {
+        if (mv.to.rank == 2 and mv.to.file == 4) saw_ep = true;
+    }
+    try testing.expect(saw_ep);
+}
+
+test "piece_legal_moves: ep target set but pawn not on the attack rank emits no ep move" {
+    // White pawn sits on a2 (rank 1) with ep target on d6 (rank 5). The rank-delta guard in
+    // en_passant_move filters this out — no move with `to == d6` should appear.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 1, .file = 0 });
+    const ep: Position = .{ .rank = 5, .file = 3 };
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 1, .file = 0 }, .{}, ep, &out);
+
+    for (out.slice()) |mv| {
+        try testing.expect(!(mv.to.rank == 5 and mv.to.file == 3));
+    }
+}
+
+test "piece_legal_moves: ep target on adjacent file but wrong distance emits no ep move" {
+    // White pawn on a4 (rank 3, file 0); ep target on h5 (rank 4, file 7). Rank delta passes
+    // (3+1=4=ep.rank) but the file isn't adjacent to ep.file. The file-delta guard must reject.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 0 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 7 });
+    const ep: Position = .{ .rank = 5, .file = 7 };
+
+    var out: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 4, .file = 0 }, .{}, ep, &out);
+
+    for (out.slice()) |mv| {
+        try testing.expect(!(mv.to.rank == 5 and mv.to.file == 7));
+    }
 }

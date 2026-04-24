@@ -337,8 +337,8 @@ test "move preserves board integrity under a scripted sequence" {
         .{ .{ .rank = 7, .file = 1 }, .{ .rank = 5, .file = 2 } }, // Nb8-c6
     };
 
-    for (moves) |m| {
-        board.move(m[0], m[1]);
+    for (moves) |move| {
+        board.move(move[0], move[1]);
     }
 
     // No captures — piece count must still be 32.
@@ -350,10 +350,10 @@ test "Piece.glyph returns distinct non-empty UTF-8 for each piece variant" {
     // 15 variants: empty + 7 white + 7 black (bishops split into light/dark squared)
     try testing.expectEqual(@as(usize, 15), fields.len);
 
-    inline for (fields) |f| {
-        const piece: Piece = @enumFromInt(f.value);
-        const g = piece.glyph();
-        try testing.expect(g.len > 0);
+    inline for (fields) |field| {
+        const piece: Piece = @enumFromInt(field.value);
+        const glyph = piece.glyph();
+        try testing.expect(glyph.len > 0);
     }
 
     // Glyphs for same role but different colour should be identical (both use filled set).
@@ -407,8 +407,8 @@ test "find_piece_position returns 8 white pawns on rank 1 for starting board" {
 
     const positions = board.find_piece_position(.white_pawn);
     try testing.expectEqual(@as(usize, 8), positions.len);
-    for (positions.slice()) |p| {
-        try testing.expectEqual(@as(u3, 1), p.rank);
+    for (positions.slice()) |position| {
+        try testing.expectEqual(@as(u3, 1), position.rank);
     }
 }
 
