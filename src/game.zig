@@ -14,6 +14,7 @@ const PromotionPiece = shared.PromotionPiece;
 const Piece = board_mod.Piece;
 const rules_engine = @import("rule_engine/rules.zig");
 const MoveEffect = rules_engine.MoveEffect;
+const zobrist = @import("rule_engine/zobrist.zig");
 
 pub const GameResult = enum {
     /// One of the players won by checkmating.
@@ -270,6 +271,7 @@ pub const Game = struct {
             .en_passant_square = null,
         };
         self.board.init();
+        self.position_hash.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
     }
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
@@ -366,26 +368,39 @@ pub const Game = struct {
             .white => .black,
         };
 
+        self.position_hash.append_assume_capacity(zobrist.hash_state(
+            &self.board,
+            self.turn,
+            self.castling_rights,
+            self.en_passant_square,
+        ));
+
         // TODO: final_seq should align with the RSM seq lifecycle once it's wired end-to-end.
         // Priority: checkmate > stalemate > 75-move auto-draw.
         if (rules_engine.is_checkmate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
-            self.state = .{ .game_over = .{
-                .result = .checkmate,
-                .winner = self.turn.opponent(),
-                .final_seq = self.expected_seq,
-            } };
+            self.state = .{
+                .game_over = .{
+                    .result = .checkmate,
+                    .winner = self.turn.opponent(),
+                    .final_seq = self.expected_seq,
+                },
+            };
         } else if (rules_engine.is_stalemate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
-            self.state = .{ .game_over = .{
-                .result = .stalemate,
-                .winner = null,
-                .final_seq = self.expected_seq,
-            } };
+            self.state = .{
+                .game_over = .{
+                    .result = .stalemate,
+                    .winner = null,
+                    .final_seq = self.expected_seq,
+                },
+            };
         } else if (self.halfmove_clock >= 150) {
-            self.state = .{ .game_over = .{
-                .result = .draw_seventy_five_moves,
-                .winner = null,
-                .final_seq = self.expected_seq,
-            } };
+            self.state = .{
+                .game_over = .{
+                    .result = .draw_seventy_five_moves,
+                    .winner = null,
+                    .final_seq = self.expected_seq,
+                },
+            };
         }
     }
 
@@ -508,7 +523,8 @@ test "inti sets the correct seq number, captures, and position hash" {
     try std.testing.expectEqual(game.en_passant_square, null);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
-    try std.testing.expectEqual(@as(usize, 0), game.position_hash.len);
+    try std.testing.expectEqual(@as(usize, 1), game.position_hash.len);
+    try std.testing.expectEqual(zobrist.INITIAL_BOARD_ZOBRIST_HASH, game.position_hash.slice()[0]);
 }
 
 // Smoke tests — primarily exist to force semantic analysis of play_move and friends. Without a
@@ -974,4 +990,5 @@ test {
     _ = @import("rule_engine/check_helper.zig");
     _ = @import("rule_engine/shared.zig");
     _ = @import("rule_engine/test_util.zig");
+    _ = @import("rule_engine/zobrist.zig");
 }

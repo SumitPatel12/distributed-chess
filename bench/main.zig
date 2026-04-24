@@ -348,7 +348,7 @@ pub fn main() void {
             const mv = ILLEGAL_MOVES[reject_count % ILLEGAL_MOVES.len];
 
             const t0 = timestamp_now(io);
-            const legal = if (rules_engine.preview_move(&game.board, game.turn, mv, game.en_passant_square, game.castling_rights)) |_| true else |_| false;
+            const legal = if (rules_engine.preview_move(&game.board, game.turn, mv, game.castling_rights, game.en_passant_square)) |_| true else |_| false;
             const t1 = timestamp_now(io);
 
             // Sanity: the chosen illegal moves originate on always-empty squares, so the rule

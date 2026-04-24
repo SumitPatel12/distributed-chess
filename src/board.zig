@@ -187,7 +187,7 @@ pub const Board = struct {
     // board, but rank_idx == (chess rank - 1), so the translation vanishes.
     //
     /// The starting position for a classical game. Sorted by rank and file so white side first.
-    const STARTING_BOARD_POSITION: [8][8]Piece = .{
+    pub const STARTING_BOARD_POSITION: [8][8]Piece = .{
         .{
             .white_rook, .white_knight,       .white_bishop_dark, .white_queen,
             .white_king, .white_bishop_light, .white_knight,      .white_rook,

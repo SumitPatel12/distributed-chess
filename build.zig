@@ -247,6 +247,27 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // zobrist_table.zig is a leaf data module (no engine deps).
+    const bench_zobrist_table_mod = b.createModule(.{
+        .root_source_file = b.path("src/zobrist_table.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // rule_engine/zobrist.zig consumes the table via "../zobrist_table.zig" and the rule engine
+    // via "rules.zig". Both need named wiring for the bench graph.
+    const bench_zobrist_mod = b.createModule(.{
+        .root_source_file = b.path("src/rule_engine/zobrist.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "../board.zig", .module = bench_board_mod },
+            .{ .name = "../shared.zig", .module = bench_shared_mod },
+            .{ .name = "../zobrist_table.zig", .module = bench_zobrist_table_mod },
+            .{ .name = "rules.zig", .module = bench_rules_mod },
+        },
+    });
+
     // game.zig has a file-level test block that does `_ = @import("rule_engine/check_helper.zig")`,
     // `"rule_engine/shared.zig"`, and `"rule_engine/test_util.zig"` (these force the rule engine's
     // own tests into the test runner). Zig evaluates these imports during non-test compilation
@@ -264,6 +285,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rule_engine/check_helper.zig", .module = bench_check_helper_mod },
             .{ .name = "rule_engine/shared.zig", .module = bench_rule_engine_shared_mod },
             .{ .name = "rule_engine/test_util.zig", .module = bench_test_util_mod },
+            .{ .name = "rule_engine/zobrist.zig", .module = bench_zobrist_mod },
         },
     });
 

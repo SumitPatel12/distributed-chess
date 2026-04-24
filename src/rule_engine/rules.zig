@@ -669,9 +669,14 @@ fn apply_effect(scratch: *Board, move: Move, effect: MoveEffect) void {
 /// moving side's king in check. Works for all piece types — pinned pieces, king walking into
 /// attacked squares, discovered checks on yourself, etc. are all caught by the simulate-and-test
 /// approach.
+///
+/// `en_passant_square` is threaded in so EP candidates get the victim-pawn clear on the scratch
+/// board. Without it, a pinned en-passant (horizontal discovered-check puzzle) would slip
+/// through because the victim pawn stays on the scratch rank and blocks the pinning ray.
 fn filter_self_check(
     board: *const Board,
     turn: Color,
+    en_passant_square: ?Position,
     candidates: *const BoundedArray(Move, MAX_LEGAL_MOVES),
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
@@ -692,10 +697,89 @@ fn filter_self_check(
         var scratch = board.*;
         scratch.move(candidate.from, candidate.to);
 
+        // EP recognition by shape: pawn moving diagonally onto the declared ep square (which
+        // is guaranteed empty). The victim pawn sits on the candidate's starting rank, same
+        // file as the ep target — clear it so `in_check` sees the correct post-capture board.
+        if (en_passant_square) |ep| {
+            const mover = board.board_state[candidate.from.rank][candidate.from.file];
+            const mover_is_pawn = mover == .white_pawn or mover == .black_pawn;
+            const lands_on_ep = candidate.to.rank == ep.rank and candidate.to.file == ep.file;
+            const is_diagonal = candidate.from.file != candidate.to.file;
+            if (mover_is_pawn and lands_on_ep and is_diagonal and target == .empty) {
+                scratch.clear(.{ .rank = candidate.from.rank, .file = ep.file });
+            }
+        }
+
         if (!check_helper.in_check(&scratch, turn)) {
             out.append_assume_capacity(candidate);
         }
     }
+}
+
+/// Checks if there is any legal en passant move for the player given the board state and the en
+/// passant square.
+pub fn en_passant_capturable(
+    board: *const Board,
+    turn: Color,
+    en_passant_square: ?Position,
+) bool {
+    const ep = en_passant_square orelse return false;
+    // Invariant: ep target sits one square behind the last pawn double-push — rank 5 when white
+    // is to move (black just pushed rank 6 → 4) or rank 2 when black is to move (white just
+    // pushed rank 1 → 3). Mirrors the stronger assert in `en_passant_move`; catches a stale ep
+    // target leaking from the wrong side's window.
+    std.debug.assert(
+        (turn == .white and ep.rank == 5) or
+            (turn == .black and ep.rank == 2),
+    );
+
+    const captured_pawn_rank: u3 = if (turn == .white) 4 else 3;
+    const captured_pawn: Piece = if (turn == .white) .black_pawn else .white_pawn;
+    const own_pawn: Piece = if (turn == .white) .white_pawn else .black_pawn;
+
+    if (board.board_state[captured_pawn_rank][ep.file] != captured_pawn) {
+        return false;
+    }
+    const captured_pos = Position{ .rank = captured_pawn_rank, .file = ep.file };
+
+    // `file` is u3: bounds-guard before subtracting/adding 1 to avoid safe-mode overflow panics.
+    if (ep.file > 0) {
+        const from = Position{ .rank = captured_pawn_rank, .file = ep.file - 1 };
+        if (board.board_state[from.rank][from.file] == own_pawn and
+            ep_capture_leaves_king_safe(board, turn, from, ep, captured_pos))
+        {
+            return true;
+        }
+    }
+
+    if (ep.file < 7) {
+        const from = Position{ .rank = captured_pawn_rank, .file = ep.file + 1 };
+        if (board.board_state[from.rank][from.file] == own_pawn and
+            ep_capture_leaves_king_safe(board, turn, from, ep, captured_pos))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// True if the EP capture leaves the capturer's king out of check. Delegates the scratch-board
+/// mutation to `apply_effect` so the `.en_passant` handling stays single-sourced — see gotcha
+/// G9: parallel scratch-apply sites drift silently when MoveEffect semantics grow.
+fn ep_capture_leaves_king_safe(
+    board: *const Board,
+    turn: Color,
+    from: Position,
+    ep_target: Position,
+    captured_pawn_at: Position,
+) bool {
+    var scratch = board.*;
+    apply_effect(
+        &scratch,
+        .{ .from = from, .to = ep_target },
+        .{ .en_passant = .{ .captured_pawn_at = captured_pawn_at } },
+    );
+    return !check_helper.in_check(&scratch, turn);
 }
 
 // --- Aggregate per-color movegen — does NOT compute MoveEffect ----------------------------------
@@ -732,7 +816,7 @@ pub fn piece_legal_moves(
         .empty => unreachable,
     }
 
-    filter_self_check(board, turn, &pseudo_legal, out);
+    filter_self_check(board, turn, en_passant_square, &pseudo_legal, out);
 }
 
 /// Appends single-push and double-push forward moves for one pawn at `from`. Does not
@@ -1960,5 +2044,129 @@ test "piece_legal_moves: ep target on adjacent file but wrong distance emits no 
 
     for (out.slice()) |mv| {
         try testing.expect(!(mv.to.rank == 5 and mv.to.file == 7));
+    }
+}
+
+// --- en_passant_capturable --------------------------------------------------
+
+test "en_passant_capturable: null ep square returns false" {
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+
+    try testing.expect(!en_passant_capturable(&board, .white, null));
+    try testing.expect(!en_passant_capturable(&board, .black, null));
+}
+
+test "en_passant_capturable: white to move, adjacent white pawn can legally capture" {
+    // Black just played e7→e5. White pawn sits on d5 (rank 4, file 3). EP target = e6 (rank 5, file 4).
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 4 }); // e5 captured pawn
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 3 }); // d5 capturer
+
+    try testing.expect(en_passant_capturable(&board, .white, .{ .rank = 5, .file = 4 }));
+}
+
+test "en_passant_capturable: black to move, adjacent black pawn can legally capture" {
+    // White just played e2→e4. Black pawn sits on d4 (rank 3, file 3). EP target = e3 (rank 2, file 4).
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 3, .file = 4 }); // e4 captured pawn
+    test_util.place(&board, .black_pawn, .{ .rank = 3, .file = 3 }); // d4 capturer
+
+    try testing.expect(en_passant_capturable(&board, .black, .{ .rank = 2, .file = 4 }));
+}
+
+test "en_passant_capturable: no adjacent own pawn returns false" {
+    // Black just pushed e7→e5 but no white pawn is on d5 or f5.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 4 });
+
+    try testing.expect(!en_passant_capturable(&board, .white, .{ .rank = 5, .file = 4 }));
+}
+
+test "en_passant_capturable: pin-bound capture (discovered check) returns false" {
+    // Classic horizontal-pin EP puzzle. White king, capturing pawn, captured pawn, and a
+    // black rook all share rank 5 (rank-index 4). The EP capture removes both pawns from
+    // that rank, exposing a clear line from the white king to the rook — illegal.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 4, .file = 0 }); // a5
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 1 }); // b5 capturer
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 2 }); // c5 captured
+    test_util.place(&board, .black_rook, .{ .rank = 4, .file = 7 }); // h5 pinning
+
+    // EP target is c6 (rank-index 5, file 2). Only candidate is white's b5×c6.
+    try testing.expect(!en_passant_capturable(&board, .white, .{ .rank = 5, .file = 2 }));
+}
+
+test "en_passant_capturable: a-file EP target, only right-neighbour path valid" {
+    // Black pushed a7→a5. White pawn on b5 captures via a6.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 0 }); // a5
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 1 }); // b5
+
+    try testing.expect(en_passant_capturable(&board, .white, .{ .rank = 5, .file = 0 }));
+}
+
+test "en_passant_capturable: h-file EP target, only left-neighbour path valid" {
+    // Black pushed h7→h5. White pawn on g5 captures via h6.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 4 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 4 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 7 }); // h5
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 6 }); // g5
+
+    try testing.expect(en_passant_capturable(&board, .white, .{ .rank = 5, .file = 7 }));
+}
+
+test "en_passant_capturable: capturers on BOTH adjacent files still returns true" {
+    // Two white pawns flank the victim; either can make the capture. Guards against a
+    // refactor that accidentally early-exits after inspecting only one branch.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 4 }); // e5 victim
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 3 }); // d5 left capturer
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 5 }); // f5 right capturer
+
+    try testing.expect(en_passant_capturable(&board, .white, .{ .rank = 5, .file = 4 }));
+}
+
+test "en_passant_capturable: capturer present but victim pawn missing returns false" {
+    // Adjacent own pawn exists, but nothing on the captured-pawn-rank at ep.file.
+    // Covers the `board_state[captured_pawn_rank][ep.file] != captured_pawn` early-exit.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 3 }); // d5 capturer only
+
+    try testing.expect(!en_passant_capturable(&board, .white, .{ .rank = 5, .file = 4 }));
+}
+
+test "piece_legal_moves: pin-bound EP is filtered out (horizontal discovered-check)" {
+    // Same fixture as the pin-bound `en_passant_capturable` test. Before the
+    // `filter_self_check` fix, the victim pawn stayed on the scratch board and blocked the
+    // pinning ray, so `piece_legal_moves` wrongly accepted the EP. The fix clears the victim
+    // on the scratch copy when a pawn lands diagonally on the declared ep target.
+    var board = test_util.empty_board();
+    test_util.place(&board, .white_king, .{ .rank = 4, .file = 0 }); // a5
+    test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
+    test_util.place(&board, .white_pawn, .{ .rank = 4, .file = 1 }); // b5 capturer
+    test_util.place(&board, .black_pawn, .{ .rank = 4, .file = 2 }); // c5 victim
+    test_util.place(&board, .black_rook, .{ .rank = 4, .file = 7 }); // h5 pinner
+
+    var legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
+    piece_legal_moves(&board, .{ .rank = 4, .file = 1 }, .{}, .{ .rank = 5, .file = 2 }, &legal);
+
+    for (legal.slice()) |mv| {
+        try testing.expect(!(mv.to.rank == 5 and mv.to.file == 2));
     }
 }
