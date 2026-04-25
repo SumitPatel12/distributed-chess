@@ -32,6 +32,8 @@ pub const BoardRenderer = struct {
 
     const LIGHT_BG = terminal_io.EscapeSequences.bg_rgb(184, 201, 134);
     const DARK_BG = terminal_io.EscapeSequences.bg_rgb(106, 138, 61);
+    const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
+    const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
     const RESET = terminal_io.EscapeSequences.RESET_STYLE_AND_COLOR;
 
     /// Upper bound on the rendered buffer size. With the largest cell size (11x5), worst case is
@@ -268,6 +270,30 @@ pub const BoardRenderer = struct {
         self.writer.append_slice_assume_capacity(seq);
     }
 
+    /// Returns the foreground SGR sequence that should precede the glyph for
+    /// this piece. Empty returns "" since nothing is drawn.
+    fn piece_fg(piece: Piece) []const u8 {
+        return switch (piece) {
+            .empty => "",
+            .white_pawn,
+            .white_knight,
+            .white_bishop_light,
+            .white_bishop_dark,
+            .white_rook,
+            .white_queen,
+            .white_king,
+            => WHITE_PIECE_FG,
+            .black_pawn,
+            .black_knight,
+            .black_bishop_light,
+            .black_bishop_dark,
+            .black_rook,
+            .black_queen,
+            .black_king,
+            => BLACK_PIECE_FG,
+        };
+    }
+
     /// Writes the rank labels and piece cells for the entire board, honoring the current
     /// perspective. Rank labels are the numbers 1 through 8 you see on the physical boards.
     ///
@@ -318,7 +344,7 @@ pub const BoardRenderer = struct {
                     self.writer.append_slice_assume_capacity(bg);
                     if (sub_row == mid_sub) {
                         self.writer.append_n_times_assume_capacity(' ', padding);
-                        self.writer.append_slice_assume_capacity(piece.fg());
+                        self.writer.append_slice_assume_capacity(piece_fg(piece));
                         self.writer.append_slice_assume_capacity(piece.glyph());
                         self.writer.append_n_times_assume_capacity(' ', padding);
                     } else {
@@ -413,4 +439,13 @@ test "draw produces non-empty output and begins with expected ANSI prelude" {
     try testing.expect(output.len > 0);
     // Output should start with the clear-screen escape sequence.
     try testing.expect(std.mem.startsWith(u8, output, terminal_io.EscapeSequences.CLEAR_SCREEN));
+}
+
+test "piece_fg differs for white vs black same-role pieces" {
+    // White and black pieces must receive different foreground SGR sequences.
+    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg(.white_pawn), BoardRenderer.piece_fg(.black_pawn)));
+    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg(.white_king), BoardRenderer.piece_fg(.black_king)));
+
+    // Empty piece should have an empty fg string.
+    try testing.expectEqual(@as(usize, 0), BoardRenderer.piece_fg(.empty).len);
 }

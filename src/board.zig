@@ -3,14 +3,10 @@
 //! check detection, ray walking, and turn enforcement live in `rule_engine/`.
 
 const std = @import("std");
-const terminal_io = @import("terminal_io.zig");
 const shared = @import("shared.zig");
 const Color = shared.Color;
 const Position = shared.Position;
 const BoundedArray = @import("bounded_array.zig").BoundedArray;
-
-const WHITE_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(255, 255, 255);
-const BLACK_PIECE_FG = terminal_io.EscapeSequences.fg_rgb(0, 0, 0);
 
 // White: ♔ U+2654   ♕ U+2655   ♖ U+2656   ♗ U+2657   ♘ U+2658   ♙ U+2659
 // Black: ♚ U+265A   ♛ U+265B   ♜ U+265C   ♝ U+265D   ♞ U+265E   ♟ U+265F
@@ -68,30 +64,6 @@ pub const Piece = enum(i8) {
             .white_rook, .black_rook => "\u{265C}",
             .white_queen, .black_queen => "\u{265B}",
             .white_king, .black_king => "\u{265A}",
-        };
-    }
-
-    /// Returns the foreground SGR sequence that should precede the glyph for
-    /// this piece. Empty returns "" since nothing is drawn.
-    pub fn fg(self: Piece) []const u8 {
-        return switch (self) {
-            .empty => "",
-            .white_pawn,
-            .white_knight,
-            .white_bishop_light,
-            .white_bishop_dark,
-            .white_rook,
-            .white_queen,
-            .white_king,
-            => WHITE_PIECE_FG,
-            .black_pawn,
-            .black_knight,
-            .black_bishop_light,
-            .black_bishop_dark,
-            .black_rook,
-            .black_queen,
-            .black_king,
-            => BLACK_PIECE_FG,
         };
     }
 };
@@ -355,15 +327,6 @@ test "Piece.glyph returns distinct non-empty UTF-8 for each piece variant" {
     // Glyphs for same role but different colour should be identical (both use filled set).
     try testing.expectEqualStrings(Piece.white_king.glyph(), Piece.black_king.glyph());
     try testing.expectEqualStrings(Piece.white_queen.glyph(), Piece.black_queen.glyph());
-}
-
-test "Piece.fg differs for white vs black same-role pieces" {
-    // White and black pieces must receive different foreground SGR sequences.
-    try testing.expect(!std.mem.eql(u8, Piece.white_pawn.fg(), Piece.black_pawn.fg()));
-    try testing.expect(!std.mem.eql(u8, Piece.white_king.fg(), Piece.black_king.fg()));
-
-    // Empty piece should have an empty fg string.
-    try testing.expectEqual(@as(usize, 0), Piece.empty.fg().len);
 }
 
 test "find_king_position returns e1 for white on the starting board" {
