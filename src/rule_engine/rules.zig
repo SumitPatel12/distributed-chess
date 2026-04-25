@@ -457,7 +457,6 @@ fn pseudo_legal_sliding(
         return error.InvalidMove;
     }
 
-    // Determine the direction.
     const direction: Direction = blk: {
         if (file_delta == 0) {
             break :blk if (rank_delta > 0) .north else .south;
@@ -478,7 +477,6 @@ fn pseudo_legal_sliding(
         break :blk .south_west;
     };
 
-    // Check the direction is in the allowed set.
     var allowed = false;
     for (allowed_directions) |allowed_direction| {
         if (allowed_direction == direction) {
@@ -490,7 +488,6 @@ fn pseudo_legal_sliding(
         return error.InvalidMove;
     }
 
-    // Walk the ray from `from` toward `to`, checking that all intermediate squares are empty.
     const delta = direction.deltas();
     var rank: i8 = @as(i8, @intCast(from.rank)) + delta.rank;
     var file: i8 = @as(i8, @intCast(from.file)) + delta.file;

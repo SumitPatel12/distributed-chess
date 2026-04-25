@@ -51,13 +51,10 @@ pub const Direction = enum {
     }
 };
 
-// Rooks have horizontal and vertical movement.
 pub const ROOK_DIRECTIONS: [4]Direction = .{ .north, .south, .east, .west };
 
-// Bishops have diagonal movement.
 pub const BISHOP_DIRECTIONS: [4]Direction = .{ .north_east, .north_west, .south_east, .south_west };
 
-// Queen can move in any of the 8 directions.
 pub const ALL_DIRECTIONS: [8]Direction = .{ .north, .south, .east, .west, .north_east, .north_west, .south_east, .south_west };
 
 // Knights are special since they jump pieces not slide, so ray-tracing type of thing that we do for
@@ -104,7 +101,6 @@ pub fn ray_find_piece(board: *const Board, start: Position, direction: Direction
     var rank: i8 = @as(i8, @intCast(start.rank)) + delta.rank;
     var file: i8 = @as(i8, @intCast(start.file)) + delta.file;
 
-    // Loop until we find a piece or reach a boundary.
     while (rank >= 0 and rank <= 7 and file >= 0 and file <= 7) {
         // intCast since indexing requires a usize.
         const piece = board.board_state[@intCast(rank)][@intCast(file)];
@@ -146,14 +142,11 @@ pub fn collect_ray_moves(
         const piece = board.board_state[target_rank][target_file];
 
         if (piece == .empty) {
-            // Empty square — keep walking after adding it.
             out.append_assume_capacity(.{
                 .from = from,
                 .to = .{ .rank = target_rank, .file = target_file },
             });
         } else {
-            // Hit a piece — capture if it's the opponent's, then stop either way. The ray ends
-            // here because nothing can slide past an occupied square.
             if (piece.color().? != turn) {
                 out.append_assume_capacity(.{
                     .from = from,

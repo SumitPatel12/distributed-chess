@@ -227,11 +227,9 @@ pub const Board = struct {
     /// Mutates `board_state` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
     /// new state to be visible call the redraw function.
     pub fn move(self: *Board, from: Position, to: Position) void {
-        // A move that doesn't change the square is not a move.
         std.debug.assert(from.rank != to.rank or from.file != to.file);
 
         const piece = self.board_state[from.rank][from.file];
-        // Can't move a piece that isn't there.
         std.debug.assert(piece != .empty);
 
         self.board_state[from.rank][from.file] = .empty;
@@ -251,8 +249,6 @@ pub const Board = struct {
         self.board_state[position.rank][position.file] = .empty;
     }
 
-    // Kings position is so commonly required to check if it's under check that it warranted its own
-    // method.
     /// Returns the position of the king of the given color.
     /// According to the rules of chess there's always a king on the board for both sides, so this
     /// function is always guaranteed to return as valid position.

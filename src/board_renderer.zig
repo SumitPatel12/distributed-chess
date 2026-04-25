@@ -19,7 +19,6 @@ pub const BoardRenderer = struct {
     /// window size so the fallback render can show the user how far off they are.
     state: State,
 
-    // 8x8 bits, each bit represents whether that square is valid for the selected piece or not.
     /// Highlights legal moves/squares once a piece is selected
     board_overlay: u64,
 
@@ -186,7 +185,9 @@ pub const BoardRenderer = struct {
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
         // Centered 5-char label: (total - 5) / 2 spaces of left padding.
         const total_width: usize = 6 + 8 * dims.width;
-        // Min width is 3 so 6 + 8 * 3 = 30, at a bare minimun it's going to be 30
+        // Lower bound matches MIN_COLS: smallest cell width in ALLOWED_SIZES is 3, so
+        // 6 + 8*3 = 30 — the same threshold compute_cell_dimensions uses to admit a
+        // CellDimensions, which is why reaching this branch guarantees the assert holds.
         std.debug.assert(total_width >= 30);
         const label_padding_len: usize = (total_width - 5) / 2;
         std.debug.assert(label_padding_len < total_width);
@@ -315,7 +316,6 @@ pub const BoardRenderer = struct {
                     const piece = board.board_state[rank][file];
                     const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
                     self.writer.append_slice_assume_capacity(bg);
-                    // Middle row holds the glyph with some padding to center it
                     if (sub_row == mid_sub) {
                         self.writer.append_n_times_assume_capacity(' ', padding);
                         self.writer.append_slice_assume_capacity(piece.fg());
