@@ -16,6 +16,7 @@ const board_renderer = @import("board_renderer");
 const game_mod = @import("game");
 const rules_engine = @import("rules");
 const shared = @import("shared.zig");
+const zobrist = @import("zobrist");
 
 const Clock = std.Io.Clock;
 const Threaded = std.Io.Threaded;
@@ -38,6 +39,11 @@ const ILLEGAL_MOVE_EVERY_N: usize = 10;
 
 /// Length of one full replay of The Immortal Game (45 half-moves; see `IMMORTAL_GAME` below).
 const MOVE_CYCLE_LEN: usize = IMMORTAL_GAME.len;
+
+/// Standalone hash_state samples collected after the main loop. play_move already computes the
+/// hash internally for repetition tracking; this section times a *separate* hash_state call per
+/// position so the cost shows up on its own. ~22 full Immortal Game replays to reach 1000.
+const ZOBRIST_SAMPLES: usize = 1000;
 
 /// Size of the stack buffer that accumulates the full result report. Four stat blocks
 /// (apply / reject / cycle / renderer) at ~210 bytes each ≈ 850 bytes, plus the header /
@@ -331,10 +337,14 @@ pub fn main() void {
     var render_samples: [ITERATIONS]u64 = undefined;
     var reject_samples: [ITERATIONS / ILLEGAL_MOVE_EVERY_N]u64 = undefined;
     var cycle_samples: [ITERATIONS / MOVE_CYCLE_LEN + 1]u64 = undefined;
+    var zobrist_samples: [ZOBRIST_SAMPLES]u64 = undefined;
+    var zobrist_play_move_samples: [ZOBRIST_SAMPLES]u64 = undefined;
 
     var legal_count: usize = 0;
     var reject_count: usize = 0;
     var cycle_count: usize = 0;
+    var zobrist_count: usize = 0;
+    var zobrist_play_move_count: usize = 0;
 
     // Cycle accumulator — rolled into `cycle_samples` on the last half-move of each replay.
     // Illegal-move rejection time is deliberately excluded so the full-game stat is independent
@@ -404,6 +414,110 @@ pub fn main() void {
     // without relying on the tests (there are no bench tests).
     std.debug.assert(legal_count + reject_count == ITERATIONS);
 
+    // Standalone zobrist hash bench. Replays the Immortal Game without invoking play_move so
+    // the timed hash_state call isn't preceded by play_move's internal hash on the same TABLE.
+    // Mirrors what play_move would have done (preview_move → effect, castling-rights update,
+    // board mutation, ep window, turn flip) minus the position_hash append and captures lists.
+    // Excluded from `wall_ns` and the apply/render/cycle stats so the main metrics stay
+    // independent.
+    game.init(.white);
+    var zobrist_cycle_idx: usize = 0;
+    while (zobrist_count < ZOBRIST_SAMPLES) {
+        if (zobrist_cycle_idx == MOVE_CYCLE_LEN) {
+            game.init(.white);
+            zobrist_cycle_idx = 0;
+        }
+        const mv = IMMORTAL_GAME[zobrist_cycle_idx];
+        const effect = rules_engine.preview_move(
+            &game.board,
+            game.turn,
+            mv,
+            game.castling_rights,
+            game.en_passant_square,
+        ) catch {
+            std.debug.print(
+                "zobrist bench: preview_move rejected at cycle_idx={d}\n",
+                .{zobrist_cycle_idx},
+            );
+            return;
+        };
+        game.castling_rights = rules_engine.castling_rights_after(
+            &game.board,
+            game.turn,
+            mv,
+            effect,
+            game.castling_rights,
+        );
+        game.board.move(mv.from, mv.to);
+        game.en_passant_square = null;
+        switch (effect) {
+            .capture, .move_only => {},
+            .promotion => unreachable, // The Immortal Game contains no promotions.
+            .en_passant => |ep| game.board.clear(ep.captured_pawn_at),
+            .castling => |castling| game.board.move(castling.rook_from, castling.rook_to),
+            .pawn_double_push => {
+                const mid_rank: u3 = switch (game.turn) {
+                    .white => mv.from.rank + 1,
+                    .black => mv.from.rank - 1,
+                };
+                game.en_passant_square = .{ .rank = mid_rank, .file = mv.from.file };
+            },
+        }
+        game.turn = game.turn.opponent();
+
+        const buf = renderer.draw(&game);
+        std.mem.doNotOptimizeAway(buf.len);
+
+        const z0 = timestamp_now(io);
+        const h = zobrist.hash_state(
+            &game.board,
+            game.turn,
+            game.castling_rights,
+            game.en_passant_square,
+        );
+        const z1 = timestamp_now(io);
+        std.mem.doNotOptimizeAway(h);
+
+        zobrist_samples[zobrist_count] = duration_ns_between(z0, z1);
+        zobrist_count += 1;
+        zobrist_cycle_idx += 1;
+    }
+
+    // Variant of the standalone bench above, but driven through play_move (which runs its
+    // own hash_state internally for repetition tracking just before our timed call).
+    game.init(.white);
+    zobrist_cycle_idx = 0;
+    while (zobrist_play_move_count < ZOBRIST_SAMPLES) {
+        if (zobrist_cycle_idx == MOVE_CYCLE_LEN) {
+            game.init(.white);
+            zobrist_cycle_idx = 0;
+        }
+        const mv = IMMORTAL_GAME[zobrist_cycle_idx];
+        game.play_move(mv) catch {
+            std.debug.print(
+                "zobrist bench (via play_move): play_move rejected at cycle_idx={d}\n",
+                .{zobrist_cycle_idx},
+            );
+            return;
+        };
+        const buf = renderer.draw(&game);
+        std.mem.doNotOptimizeAway(buf.len);
+
+        const z0 = timestamp_now(io);
+        const h = zobrist.hash_state(
+            &game.board,
+            game.turn,
+            game.castling_rights,
+            game.en_passant_square,
+        );
+        const z1 = timestamp_now(io);
+        std.mem.doNotOptimizeAway(h);
+
+        zobrist_play_move_samples[zobrist_play_move_count] = duration_ns_between(z0, z1);
+        zobrist_play_move_count += 1;
+        zobrist_cycle_idx += 1;
+    }
+
     // Build the report.
     var results: ResultWriter = .{};
     results.print("=== Benchmark ===\n", .{});
@@ -438,6 +552,16 @@ pub fn main() void {
     // Renderer is drawn after every legal move. Per-move samples, not a one-shot measurement.
     results.print("── renderer (drawn after every legal move) ───────────────────\n", .{});
     write_stat_block(&results, "renderer.draw", compute_stats(render_samples[0..legal_count]));
+
+    results.print("\n", .{});
+
+    results.print("── zobrist hash (standalone, no internal hash) ───────────────\n", .{});
+    write_stat_block(&results, "zobrist.hash_state", compute_stats(zobrist_samples[0..zobrist_count]));
+
+    results.print("\n", .{});
+
+    results.print("── zobrist hash (via play_move) ──────────────────────────────\n", .{});
+    write_stat_block(&results, "zobrist.hash_state", compute_stats(zobrist_play_move_samples[0..zobrist_play_move_count]));
 
     // Emit to stderr.
     std.debug.print("{s}", .{results.contents()});
