@@ -178,24 +178,24 @@ pub fn preview_move(
 
     const piece = board.board_state[from.rank][from.file];
     if (piece == .empty) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
     // Can't move an opponent's piece on your turn.
     if (piece.color().? != turn) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     const target = board.board_state[to.rank][to.file];
     if (target != .empty) {
         // Can't move to a square occupied by a friendly piece.
         if (target.color().? == turn) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
         // Kings are never captured — checkmate ends the game first. Reject any move that
         // targets the opposing king so hand-crafted positions (king left en-prise) can't
         // coax a "legal" king-capture out of the engine.
         if (target == .white_king or target == .black_king) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
     }
 
@@ -220,7 +220,7 @@ pub fn preview_move(
     var scratch = board.*;
     apply_effect(&scratch, move, effect);
     if (check_helper.in_check(&scratch, turn)) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     return effect;
@@ -305,7 +305,7 @@ fn pseudo_legal_pawn(
         }
     }
 
-    return error.InvalidMove;
+    return error.IllegalMove;
 }
 
 fn pseudo_legal_knight(
@@ -331,7 +331,7 @@ fn pseudo_legal_knight(
         }
     }
 
-    return error.InvalidMove;
+    return error.IllegalMove;
 }
 
 fn pseudo_legal_king(
@@ -363,20 +363,20 @@ fn pseudo_legal_king(
     if ((turn == .white and !std.meta.eql(from, rules_shared.WHITE_KING_HOME_POSITION)) or
         (turn == .black and !std.meta.eql(from, rules_shared.BLACK_KING_HOME_POSITION)))
     {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     // If no rights allow shortcircuit early.
     if (!castling_rights.white_kingside and !castling_rights.white_queenside and
         !castling_rights.black_kingside and !castling_rights.black_queenside)
     {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     if (abs_rank == 0 and abs_file == 2) {
         // If the king was under attack, you can't castle.
         if (check_helper.in_check(board, turn)) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
 
         const side: CastlingSide = if (file_delta > 0) .king_side else .queen_side;
@@ -392,7 +392,7 @@ fn pseudo_legal_king(
         };
     }
 
-    return error.InvalidMove;
+    return error.IllegalMove;
 }
 
 /// Runs the per-case castling checks given a `CastlingPlan`. The caller has already verified the
@@ -405,7 +405,7 @@ fn try_castle(
     right: bool,
 ) !MoveEffect {
     if (!right) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     // Rights imply the rook is home by invariant (any move off the corner, or capture of the rook
@@ -415,12 +415,12 @@ fn try_castle(
     // out of one array read instead of two full `in_check` sweeps.
     const expected_rook: Piece = if (turn == .white) .white_rook else .black_rook;
     if (board.board_state[plan.rank][plan.rook_from_file] != expected_rook) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     for (plan.between_files) |file| {
         if (board.board_state[plan.rank][file] != .empty) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
     }
 
@@ -428,7 +428,7 @@ fn try_castle(
         var scratch = board.*;
         scratch.move(from, .{ .rank = plan.rank, .file = file });
         if (check_helper.in_check(&scratch, turn)) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
     }
 
@@ -454,7 +454,7 @@ fn pseudo_legal_sliding(
     const file_delta: i8 = @as(i8, @intCast(to.file)) - @as(i8, @intCast(from.file));
 
     if (rank_delta == 0 and file_delta == 0) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     const direction: Direction = blk: {
@@ -468,7 +468,7 @@ fn pseudo_legal_sliding(
         const abs_rank = @abs(rank_delta);
         const abs_file = @abs(file_delta);
         if (abs_rank != abs_file) {
-            return error.InvalidMove;
+            return error.IllegalMove;
         }
 
         if (rank_delta > 0 and file_delta > 0) break :blk .north_east;
@@ -485,7 +485,7 @@ fn pseudo_legal_sliding(
         }
     }
     if (!allowed) {
-        return error.InvalidMove;
+        return error.IllegalMove;
     }
 
     const delta = direction.deltas();
@@ -506,13 +506,13 @@ fn pseudo_legal_sliding(
             break;
         }
         if (board.board_state[@intCast(rank)][@intCast(file)] != .empty) {
-            return error.InvalidMove; // Blocked.
+            return error.IllegalMove; // Blocked.
         }
         rank += delta.rank;
         file += delta.file;
     }
 
-    return error.InvalidMove; // Walked off the board without reaching target.
+    return error.IllegalMove; // Walked off the board without reaching target.
 }
 
 /// Returns the updated castling rights after `move` with `effect` is applied to a board whose
@@ -1358,7 +1358,7 @@ test "king_moves refuses to walk onto a friendly piece" {
     }
 }
 
-test "preview_move returns InvalidMove for a move from an empty square" {
+test "preview_move returns IllegalMove for a move from an empty square" {
     var board: Board = undefined;
     board.init();
     const castling: CastlingRights = .{};
@@ -1367,13 +1367,13 @@ test "preview_move returns InvalidMove for a move from an empty square" {
         .from = .{ .rank = 4, .file = 4 }, // e5, empty
         .to = .{ .rank = 5, .file = 4 }, // e6
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, castling, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, castling, null));
 }
 
 test "preview_move rejects a move that would leave own king in check" {
     // Pin scenario: white king d1, white rook d2 (pinned on the d-file), black rook d8.
     // The pinned rook moving off the d-file exposes the king — preview_move's self-check
-    // must catch this and return error.InvalidMove.
+    // must catch this and return error.IllegalMove.
     var board = test_util.empty_board();
     test_util.place(&board, .white_king, .{ .rank = 0, .file = 3 }); // d1
     test_util.place(&board, .white_rook, .{ .rank = 1, .file = 3 }); // d2
@@ -1384,7 +1384,7 @@ test "preview_move rejects a move that would leave own king in check" {
         .from = .{ .rank = 1, .file = 3 },
         .to = .{ .rank = 1, .file = 4 }, // d2 → e2, off the pin ray
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, illegal, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, illegal, .{}, null));
 
     // Sanity: a rook move *along* the pin ray remains legal.
     const legal = Move{
@@ -1469,7 +1469,7 @@ test "preview_move rejects capturing the opposing king" {
         .from = .{ .rank = 0, .file = 4 },
         .to = .{ .rank = 3, .file = 4 },
     };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, king_capture, castling, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, king_capture, castling, null));
 
     // Sanity: a non-king target along the same ray still validates.
     const quiet_move = Move{
@@ -1686,7 +1686,7 @@ test "preview_move: castling rejected when king is not on home square" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 3, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when all four rights are off" {
@@ -1702,7 +1702,7 @@ test "preview_move: castling rejected when all four rights are off" {
     };
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, all_off, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, all_off, null));
 }
 
 test "preview_move: castling rejected when king is currently in check" {
@@ -1714,7 +1714,7 @@ test "preview_move: castling rejected when king is currently in check" {
     test_util.place(&board, .black_rook, .{ .rank = 7, .file = 4 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when the matching side's right is false" {
@@ -1726,7 +1726,7 @@ test "preview_move: castling rejected when the matching side's right is false" {
     const rights: CastlingRights = .{ .white_kingside = false };
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, rights, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, rights, null));
 }
 
 test "preview_move: castling rejected when a between-files square is occupied" {
@@ -1738,7 +1738,7 @@ test "preview_move: castling rejected when a between-files square is occupied" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when a king-path square is attacked" {
@@ -1750,7 +1750,7 @@ test "preview_move: castling rejected when a king-path square is attacked" {
     test_util.place(&board, .black_rook, .{ .rank = 7, .file = 5 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: castling rejected when rook is missing from home corner" {
@@ -1760,7 +1760,7 @@ test "preview_move: castling rejected when rook is missing from home corner" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 test "preview_move: queenside castling rejected when b-file has a blocker" {
@@ -1773,7 +1773,7 @@ test "preview_move: queenside castling rejected when b-file has a blocker" {
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 7 });
 
     const mv = Move{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 2 } };
-    try testing.expectError(error.InvalidMove, preview_move(&board, .white, mv, .{}, null));
+    try testing.expectError(error.IllegalMove, preview_move(&board, .white, mv, .{}, null));
 }
 
 // ── is_checkmate / is_stalemate ───────────────────────────────────────────────

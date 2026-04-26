@@ -290,7 +290,7 @@ pub const Game = struct {
 
     /// Upper bound on effects emitted by a single tick(). 16 leaves headroom for paths that
     /// stack multiple effects (e.g. send_ack + apply + render + game_ended + start_*_timer).
-    const MAX_EFFECTS = 16;
+    pub const MAX_EFFECTS = 16;
 
     /// Upper bound on command-log and position-hash entries. 512 is ample for a real chess
     /// game (longest practical games run ~300 half-moves; the fifty-move rule caps growth).
@@ -471,7 +471,7 @@ pub const Game = struct {
             self.castling_rights,
             self.en_passant_square,
         ) catch |err| switch (err) {
-            error.InvalidMove => {
+            error.IllegalMove => {
                 out.append_assume_capacity(.{ .local_rejected = .{ .reason = .illegal_move } });
                 return;
             },
@@ -611,7 +611,7 @@ pub const Game = struct {
             self.castling_rights,
             self.en_passant_square,
         ) catch |err| switch (err) {
-            error.InvalidMove => {
+            error.IllegalMove => {
                 out.append_assume_capacity(.{
                     .send_nack = .{
                         .seq = entry.sequence_number,
@@ -677,48 +677,6 @@ pub const Game = struct {
         };
         out.append_assume_capacity(.{ .send_proposal = entry });
         self.unexpected_event_count = 0;
-    }
-
-    /// Tries to play the inputted move. If it's a legal move updates the board position and handles
-    /// the captures. Returns error.InvalidMove in case the move is illegal.
-    pub fn play_move(self: *Game, move: Move) !void {
-        if (self.state != .playing) {
-            return error.GameNotPlaying;
-        }
-        // When preview_move grows a new error variant the exhaustive switch below will fail
-        // to compile — that's the signal to add a TODO (or a proper handler) for it.
-        const move_effect = rules_engine.preview_move(
-            &self.board,
-            self.turn,
-            move,
-            self.castling_rights,
-            self.en_passant_square,
-        ) catch |err| switch (err) {
-            // TODO: Surface InvalidMove as a game effect (NACK) instead of propagating raw.
-            error.InvalidMove => return err,
-        };
-
-        if (move_effect == .promotion) {
-            return error.PromotionNotSupported;
-        }
-
-        const log_entry = LogEntry{
-            .sequence_number = self.expected_seq,
-            .move_number = self.fullmove_number,
-            .issued_by = self.local_color,
-            .command = .{
-                .play = .{
-                    .move = move,
-                    .promotion = null,
-                },
-            },
-            .time_taken_ms = 0,
-        };
-
-        const verdict = self.commit(log_entry, move_effect);
-        if (verdict) |game_verdict| {
-            self.state = .{ .game_over = game_verdict };
-        }
     }
 
     /// Commits the effects of the move to the board, and updates the relevant fields.
@@ -872,6 +830,7 @@ pub const Game = struct {
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 const test_util = @import("rule_engine/test_util.zig");
+const test_helpers = @import("test_helpers.zig");
 
 test "intial state white returns local turn idle" {
     var game: Game = undefined;
@@ -935,11 +894,11 @@ test "inti sets the correct seq number, captures, and position hash" {
     try std.testing.expectEqual(zobrist.INITIAL_BOARD_ZOBRIST_HASH, game.position_hash.slice()[0]);
 }
 
-// Smoke tests — primarily exist to force semantic analysis of play_move and friends. Without a
+// Smoke tests — primarily exist to force semantic analysis of apply_move and friends. Without a
 // test-side caller, Zig skips analyzing pub fns that aren't reached, and field/signature bugs
 // can sit in the file undetected.
 
-test "play_move applies e2-e4 from the starting position" {
+test "apply_move applies e2-e4 from the starting position" {
     var game: Game = undefined;
     game.init(.white);
 
@@ -947,7 +906,7 @@ test "play_move applies e2-e4 from the starting position" {
         .from = .{ .rank = 1, .file = 4 },
         .to = .{ .rank = 3, .file = 4 },
     };
-    try game.play_move(mv);
+    try test_helpers.apply_move(&game, mv);
 
     try std.testing.expectEqual(.empty, game.board.board_state[1][4]);
     try std.testing.expectEqual(.white_pawn, game.board.board_state[3][4]);
@@ -956,7 +915,7 @@ test "play_move applies e2-e4 from the starting position" {
     try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
 }
 
-test "play_move returns InvalidMove when source square is empty" {
+test "apply_move returns IllegalMove when source square is empty" {
     var game: Game = undefined;
     game.init(.white);
 
@@ -965,10 +924,10 @@ test "play_move returns InvalidMove when source square is empty" {
         .from = .{ .rank = 3, .file = 4 },
         .to = .{ .rank = 4, .file = 4 },
     };
-    try std.testing.expectError(error.InvalidMove, game.play_move(mv));
+    try std.testing.expectError(error.IllegalMove, test_helpers.apply_move(&game, mv));
 }
 
-test "play_move: black plays en-passant after white double-push, victim removed and recorded" {
+test "apply_move: black plays en-passant after white double-push, victim removed and recorded" {
     // Minimal fixture: both kings + the two pawns involved. Goes through the full game
     // state machine — preview_move detects en-passant, commit removes the victim
     // and appends to captures_by_black, the trailing switch clears the ep window.
@@ -981,12 +940,12 @@ test "play_move: black plays en-passant after white double-push, victim removed 
     test_util.place(&game.board, .black_pawn, .{ .rank = 3, .file = 3 }); // d4
 
     // 1. e2-e4 — double push, sets ep target to e3 = (2, 4).
-    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
     try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
 
     // 1... d4xe3 e.p. — black diagonal capture onto the (empty) ep target square; the
     // victim white pawn physically sits on e4 = (3, 4) and must be cleared.
-    try game.play_move(.{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 2, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 2, .file = 4 } });
 
     try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]); // e4 victim removed
     try std.testing.expectEqual(Piece.empty, game.board.board_state[3][3]); // d4 source empty
@@ -998,9 +957,9 @@ test "play_move: black plays en-passant after white double-push, victim removed 
     try std.testing.expectEqual(Color.white, game.turn);
 }
 
-test "play_move: regular capture appends the victim to captures_by_<turn>" {
+test "apply_move: regular capture appends the victim to captures_by_<turn>" {
     // Confirms the new MoveEffect.capture → Game.append_captured_piece plumbing actually
-    // populates the per-side captures list when a capturing move flows through play_move.
+    // populates the per-side captures list when a capturing move flows through apply_move.
     var game: Game = undefined;
     game.init(.white);
     game.board = test_util.empty_board();
@@ -1010,7 +969,7 @@ test "play_move: regular capture appends the victim to captures_by_<turn>" {
     test_util.place(&game.board, .black_pawn, .{ .rank = 5, .file = 4 }); // e6
 
     // White rook e4 → e6, captures black pawn.
-    try game.play_move(.{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 5, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 5, .file = 4 } });
 
     try std.testing.expectEqual(@as(usize, 1), game.captures_by_white.len);
     try std.testing.expectEqual(Piece.black_pawn, game.captures_by_white.slice()[0]);
@@ -1019,7 +978,7 @@ test "play_move: regular capture appends the victim to captures_by_<turn>" {
     try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]);
 }
 
-test "play_move: en_passant_square clears after a non-double-push reply to a double push" {
+test "apply_move: en_passant_square clears after a non-double-push reply to a double push" {
     // Regression guard for the trailing switch in commit — drop the `else => null`
     // arm and a stale ep target survives indefinitely. Two-move sequence (1. e4, 1... a6)
     // proves the clear leg fires for any non-double-push effect.
@@ -1027,15 +986,15 @@ test "play_move: en_passant_square clears after a non-double-push reply to a dou
     game.init(.white);
 
     // 1. e4 — sets ep target to e3.
-    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
     try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
 
     // 1... a6 — black single push, must clear the ep window.
-    try game.play_move(.{ .from = .{ .rank = 6, .file = 0 }, .to = .{ .rank = 5, .file = 0 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 6, .file = 0 }, .to = .{ .rank = 5, .file = 0 } });
     try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
 }
 
-test "play_move: white kingside castling moves king + rook and clears both white rights" {
+test "apply_move: white kingside castling moves king + rook and clears both white rights" {
     // End-to-end: preview_move → commit (castling arm moves the rook) → castling_rights_after
     // clears both white flags. Black rights must be untouched.
     var game: Game = undefined;
@@ -1045,7 +1004,7 @@ test "play_move: white kingside castling moves king + rook and clears both white
     test_util.place(&game.board, .white_rook, .{ .rank = 0, .file = 7 });
     test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 0 });
 
-    try game.play_move(.{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } });
 
     try std.testing.expectEqual(Piece.white_king, game.board.board_state[0][6]);
     try std.testing.expectEqual(Piece.white_rook, game.board.board_state[0][5]);
@@ -1059,7 +1018,7 @@ test "play_move: white kingside castling moves king + rook and clears both white
     try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
 }
 
-test "play_move: a mating move transitions state to game_over with checkmate result" {
+test "apply_move: a mating move transitions state to game_over with checkmate result" {
     // Setup: white queen on g3 ready to deliver Qg7#. White knight on f5 defends g7, so the
     // black king cannot capture the queen; white king on a1 keeps own king safe.
     // After the move:
@@ -1086,7 +1045,7 @@ test "play_move: a mating move transitions state to game_over with checkmate res
     };
 
     // Qg3-g7#: north slide by 4 ranks.
-    try game.play_move(.{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
 
     switch (game.state) {
         .game_over => |over| {
@@ -1097,7 +1056,7 @@ test "play_move: a mating move transitions state to game_over with checkmate res
     }
 }
 
-test "play_move: a stalemating move transitions state to game_over with stalemate result" {
+test "apply_move: a stalemating move transitions state to game_over with stalemate result" {
     // Setup: classic K+Q stalemate. White king on f7 controls g7/g8; white queen on g4
     // moves to g6 to take h7's diagonal and reinforce g6's row coverage. After Qg6:
     //   - black king h8 is NOT in check (queen on g6 doesn't reach h8)
@@ -1119,7 +1078,7 @@ test "play_move: a stalemating move transitions state to game_over with stalemat
     };
 
     // Qg4-g6: north slide by 2 ranks.
-    try game.play_move(.{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
 
     switch (game.state) {
         .game_over => |over| {
@@ -1130,7 +1089,7 @@ test "play_move: a stalemating move transitions state to game_over with stalemat
     }
 }
 
-test "play_move: 75-move rule auto-draws when halfmove_clock reaches 150" {
+test "apply_move: 75-move rule auto-draws when halfmove_clock reaches 150" {
     // Bare K vs K + bishop position; any non-pawn / non-capture move bumps the clock. Pre-set
     // halfmove_clock to 149 so the next quiet move pushes it to 150 and triggers the auto-draw.
     var game: Game = undefined;
@@ -1148,7 +1107,7 @@ test "play_move: 75-move rule auto-draws when halfmove_clock reaches 150" {
     game.halfmove_clock = 149;
 
     // Nb1-a3 — quiet knight move; non-pawn, non-capture, no check, no mate, no stalemate.
-    try game.play_move(.{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
 
     try std.testing.expectEqual(@as(u16, 150), game.halfmove_clock);
     switch (game.state) {
@@ -1160,7 +1119,7 @@ test "play_move: 75-move rule auto-draws when halfmove_clock reaches 150" {
     }
 }
 
-test "play_move: 75-move rule does NOT trigger when clock lands at 149" {
+test "apply_move: 75-move rule does NOT trigger when clock lands at 149" {
     // Same setup but pre-set to 148 — the move bumps the clock to 149, which is one short.
     var game: Game = undefined;
     game.init(.white);
@@ -1176,7 +1135,7 @@ test "play_move: 75-move rule does NOT trigger when clock lands at 149" {
     };
     game.halfmove_clock = 148;
 
-    try game.play_move(.{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
 
     try std.testing.expectEqual(@as(u16, 149), game.halfmove_clock);
     switch (game.state) {
@@ -1185,7 +1144,7 @@ test "play_move: 75-move rule does NOT trigger when clock lands at 149" {
     }
 }
 
-test "play_move: 75-move clock resets on a pawn move even when at 149" {
+test "apply_move: 75-move clock resets on a pawn move even when at 149" {
     // Tracking guard: the reset path still fires when the clock is one short of the threshold
     // — i.e. a pawn push at clock=149 doesn't accidentally tip into draw_seventy_five_moves.
     var game: Game = undefined;
@@ -1203,7 +1162,7 @@ test "play_move: 75-move clock resets on a pawn move even when at 149" {
     game.halfmove_clock = 149;
 
     // e2-e3 — pawn single push.
-    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 2, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 2, .file = 4 } });
 
     try std.testing.expectEqual(@as(u16, 0), game.halfmove_clock);
     switch (game.state) {
@@ -1212,7 +1171,7 @@ test "play_move: 75-move clock resets on a pawn move even when at 149" {
     }
 }
 
-test "play_move: checkmate beats 75-move rule when both fire on the same ply" {
+test "apply_move: checkmate beats 75-move rule when both fire on the same ply" {
     // Same Qg7# fixture as the checkmate test, but pre-set halfmove_clock to 149. The mating
     // queen move is non-pawn / non-capture so the clock would otherwise reach 150. Result must
     // be .checkmate, not .draw_seventy_five_moves.
@@ -1232,7 +1191,7 @@ test "play_move: checkmate beats 75-move rule when both fire on the same ply" {
     };
     game.halfmove_clock = 149;
 
-    try game.play_move(.{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
 
     switch (game.state) {
         .game_over => |over| {
@@ -1243,7 +1202,7 @@ test "play_move: checkmate beats 75-move rule when both fire on the same ply" {
     }
 }
 
-test "play_move: stalemate beats 75-move rule when both fire on the same ply" {
+test "apply_move: stalemate beats 75-move rule when both fire on the same ply" {
     // Same K+Q stalemate fixture, but pre-set halfmove_clock to 149. The stalemating queen
     // move is non-pawn / non-capture so the clock would otherwise reach 150. Result must be
     // .stalemate, not .draw_seventy_five_moves.
@@ -1261,7 +1220,7 @@ test "play_move: stalemate beats 75-move rule when both fire on the same ply" {
     };
     game.halfmove_clock = 149;
 
-    try game.play_move(.{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
 
     switch (game.state) {
         .game_over => |over| {
@@ -1272,13 +1231,13 @@ test "play_move: stalemate beats 75-move rule when both fire on the same ply" {
     }
 }
 
-test "play_move: a non-mating move keeps the game in playing state" {
-    // Regression guard: after the mate-detection logic was added to play_move, a quiet move
+test "apply_move: a non-mating move keeps the game in playing state" {
+    // Regression guard: after the mate-detection logic was added to commit, a quiet move
     // from the starting position must NOT flip state to game_over.
     var game: Game = undefined;
     game.init(.white);
 
-    try game.play_move(.{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
+    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
 
     switch (game.state) {
         .playing => {},
@@ -1286,7 +1245,7 @@ test "play_move: a non-mating move keeps the game in playing state" {
     }
 }
 
-test "play_move: replays the Immortal Game and detects Be7# as checkmate at move 45" {
+test "apply_move: replays the Immortal Game and detects Be7# as checkmate at move 45" {
     // Anderssen vs Kieseritzky, London 1851. 44 plies in `.playing` state plus a 45th mating
     // ply played separately. Mirrors the bench's IMMORTAL_GAME sequence. End-to-end coverage
     // of the engine: 45 ply through preview_move + commit across captures, sacrifices,
@@ -1367,20 +1326,21 @@ test "play_move: replays the Immortal Game and detects Be7# as checkmate at move
     game.init(.white);
 
     for (game_moves[0 .. game_moves.len - 1], 0..) |mv, i| {
-        // Turn BEFORE the move flips is what play_move will mutate.
+        // Turn BEFORE the move flips is what apply_move will mutate.
         const turn_before: Color = if (i % 2 == 0) .white else .black;
         try std.testing.expectEqual(turn_before, game.turn);
-        try game.play_move(mv);
+        try test_helpers.apply_move(&game, mv);
         switch (game.state) {
             .playing => {},
             else => try std.testing.expect(false),
         }
-        // play_move flips the turn at the end — confirm it landed on the opponent.
+        // The engine flips the turn at the end of each commit — confirm it landed on
+        // the opponent.
         try std.testing.expectEqual(turn_before.opponent(), game.turn);
     }
 
     // Final move: Be7# — engine must classify as mate.
-    try game.play_move(game_moves[game_moves.len - 1]);
+    try test_helpers.apply_move(&game, game_moves[game_moves.len - 1]);
     switch (game.state) {
         .game_over => |over| {
             try std.testing.expectEqual(GameResult.checkmate, over.result);
@@ -1390,8 +1350,28 @@ test "play_move: replays the Immortal Game and detects Be7# as checkmate at move
     }
 }
 
+test "apply_move_with_promotion: white pawn e7-e8 promotes to queen" {
+    // End-to-end of the promotion fork: local_command → prompt_for_promotion →
+    // local_promotion_choice → send_proposal → auto-ack → commit's promotion arm
+    // swaps the pawn for the chosen piece. Black king on h8 has g7/h7 escapes from the
+    // queen on e8, so commit returns no game-over and state lands in remote_turn.
+    var game: Game = undefined;
+    game.init(.white);
+    game.board = test_util.empty_board();
+    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
+    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
+    test_util.place(&game.board, .white_pawn, .{ .rank = 6, .file = 4 }); // e7
+
+    const mv = Move{ .from = .{ .rank = 6, .file = 4 }, .to = .{ .rank = 7, .file = 4 } };
+    try test_helpers.apply_move_with_promotion(&game, mv, .queen);
+
+    try std.testing.expectEqual(Piece.empty, game.board.board_state[6][4]);
+    try std.testing.expectEqual(Piece.white_queen, game.board.board_state[7][4]);
+    try std.testing.expectEqual(Color.black, game.turn);
+}
+
 test "tick: local_command with legal play transitions to proposing and emits send_proposal" {
-    // Smoke test for tick — same rationale as the play_move smoke tests above. Drives the
+    // Smoke test for tick — same rationale as the apply_move smoke tests above. Drives the
     // local_turn → local_command → .play arm so Zig analyzes the body; without a caller,
     // signature/field bugs in the arm sit undetected (e.g. a wrong GameEffect variant or a
     // value passed where a pointer is expected won't surface until something reaches it).
@@ -1436,4 +1416,5 @@ test {
     _ = @import("rule_engine/shared.zig");
     _ = @import("rule_engine/test_util.zig");
     _ = @import("rule_engine/zobrist.zig");
+    _ = @import("game_protocol_tests.zig");
 }
