@@ -138,7 +138,7 @@ fn has_any_legal_move(
     for (0..8) |rank| {
         for (0..8) |file| {
             const from: Position = .{ .rank = @intCast(rank), .file = @intCast(file) };
-            const piece = board.board_state[from.rank][from.file];
+            const piece = board.squares[from.rank][from.file];
             if (piece == .empty or piece.color().? != player_color) {
                 continue;
             }
@@ -176,7 +176,7 @@ pub fn preview_move(
     const from = move.from;
     const to = move.to;
 
-    const piece = board.board_state[from.rank][from.file];
+    const piece = board.squares[from.rank][from.file];
     if (piece == .empty) {
         return error.IllegalMove;
     }
@@ -185,7 +185,7 @@ pub fn preview_move(
         return error.IllegalMove;
     }
 
-    const target = board.board_state[to.rank][to.file];
+    const target = board.squares[to.rank][to.file];
     if (target != .empty) {
         // Can't move to a square occupied by a friendly piece.
         if (target.color().? == turn) {
@@ -249,7 +249,7 @@ fn pseudo_legal_pawn(
     };
 
     // Single push: one square forward, target must be empty.
-    if (rank_delta == forward and file_delta == 0 and board.board_state[to.rank][to.file] == .empty) {
+    if (rank_delta == forward and file_delta == 0 and board.squares[to.rank][to.file] == .empty) {
         // Back-rank push is a quiet promotion. Caller-supplied promotion piece lives on
         // GameCommand.move.promotion — the rule engine only reports that it's a promotion.
         if (to.rank == 0 or to.rank == 7) {
@@ -261,8 +261,8 @@ fn pseudo_legal_pawn(
     // Double push: two squares forward from start rank, both squares must be empty.
     if (rank_delta == forward * 2 and file_delta == 0 and from.rank == start_rank) {
         const intermediate_rank: u3 = @intCast(@as(i8, @intCast(from.rank)) + forward);
-        if (board.board_state[intermediate_rank][from.file] == .empty and
-            board.board_state[to.rank][to.file] == .empty)
+        if (board.squares[intermediate_rank][from.file] == .empty and
+            board.squares[to.rank][to.file] == .empty)
         {
             return .pawn_double_push;
         }
@@ -272,7 +272,7 @@ fn pseudo_legal_pawn(
     // target square must match the en-passant square (enemy pawn one rank behind is the
     // actual capture victim).
     if (rank_delta == forward and (file_delta == 1 or file_delta == -1)) {
-        const target = board.board_state[to.rank][to.file];
+        const target = board.squares[to.rank][to.file];
         if (en_passant_square) |en_passant_position| {
             // Caller contract: ep target rank matches "the square a pawn passed over on
             // the opponent's prior double push" — rank 5 when white is the mover (black
@@ -287,7 +287,7 @@ fn pseudo_legal_pawn(
                     .white => .black_pawn,
                     .black => .white_pawn,
                 };
-                std.debug.assert(board.board_state[from.rank][to.file] == expected_enemy_pawn);
+                std.debug.assert(board.squares[from.rank][to.file] == expected_enemy_pawn);
                 return .{
                     .en_passant = .{
                         .captured_pawn_at = .{ .rank = from.rank, .file = to.file },
@@ -321,7 +321,7 @@ fn pseudo_legal_knight(
     const abs_file = @abs(file_delta);
 
     if ((abs_rank == 2 and abs_file == 1) or (abs_rank == 1 and abs_file == 2)) {
-        const target_piece = board.board_state[to.rank][to.file];
+        const target_piece = board.squares[to.rank][to.file];
         if (target_piece == .empty) {
             return .move_only;
         }
@@ -347,7 +347,7 @@ fn pseudo_legal_king(
     const abs_rank = @abs(rank_delta);
     const abs_file = @abs(file_delta);
 
-    const target_piece = board.board_state[to.rank][to.file];
+    const target_piece = board.squares[to.rank][to.file];
 
     if (abs_rank <= 1 and abs_file <= 1 and (abs_rank + abs_file > 0)) {
         if (target_piece == .empty) {
@@ -402,9 +402,9 @@ fn try_castle(
     from: Position,
     turn: Color,
     plan: CastlingPlan,
-    right: bool,
+    right_active: bool,
 ) !MoveEffect {
-    if (!right) {
+    if (!right_active) {
         return error.IllegalMove;
     }
 
@@ -414,12 +414,12 @@ fn try_castle(
     // cold hand-crafted input. Checked before the attack simulation so malformed fixtures bail
     // out of one array read instead of two full `in_check` sweeps.
     const expected_rook: Piece = if (turn == .white) .white_rook else .black_rook;
-    if (board.board_state[plan.rank][plan.rook_from_file] != expected_rook) {
+    if (board.squares[plan.rank][plan.rook_from_file] != expected_rook) {
         return error.IllegalMove;
     }
 
     for (plan.between_files) |file| {
-        if (board.board_state[plan.rank][file] != .empty) {
+        if (board.squares[plan.rank][file] != .empty) {
             return error.IllegalMove;
         }
     }
@@ -488,13 +488,13 @@ fn pseudo_legal_sliding(
         return error.IllegalMove;
     }
 
-    const delta = direction.deltas();
+    const delta = direction.delta();
     var rank: i8 = @as(i8, @intCast(from.rank)) + delta.rank;
     var file: i8 = @as(i8, @intCast(from.file)) + delta.file;
 
     while (rank >= 0 and rank <= 7 and file >= 0 and file <= 7) {
         if (@as(u3, @intCast(rank)) == to.rank and @as(u3, @intCast(file)) == to.file) {
-            const target_piece = board.board_state[to.rank][to.file];
+            const target_piece = board.squares[to.rank][to.file];
             if (target_piece == .empty) {
                 return .move_only;
             }
@@ -505,7 +505,7 @@ fn pseudo_legal_sliding(
             // No need to travel any further this was the target square after all.
             break;
         }
-        if (board.board_state[@intCast(rank)][@intCast(file)] != .empty) {
+        if (board.squares[@intCast(rank)][@intCast(file)] != .empty) {
             return error.IllegalMove; // Blocked.
         }
         rank += delta.rank;
@@ -523,21 +523,21 @@ pub fn castling_rights_after(
     turn: Color,
     move: Move,
     effect: MoveEffect,
-    current: CastlingRights,
+    current_rights: CastlingRights,
 ) CastlingRights {
-    const moving_piece = board.board_state[move.from.rank][move.from.file];
+    const moving_piece = board.squares[move.from.rank][move.from.file];
     std.debug.assert(moving_piece != .empty);
     std.debug.assert(moving_piece.color().? == turn);
 
     // Once all four flags are off they're a fixed point — no later move can resurrect a right.
     // Skips the whole switch during late games where the rights are likely long gone.
-    if (!current.white_kingside and !current.white_queenside and
-        !current.black_kingside and !current.black_queenside)
+    if (!current_rights.white_kingside and !current_rights.white_queenside and
+        !current_rights.black_kingside and !current_rights.black_queenside)
     {
-        return current;
+        return current_rights;
     }
 
-    var rights = current;
+    var rights = current_rights;
     switch (effect) {
         // Castling forfeits both of the mover's rights. The opponent's rights can't change —
         // you can't castle onto an opposing rook's home square.
@@ -681,7 +681,7 @@ fn filter_self_check(
         // Kings are never captured — checkmate ends the game first. Drop pseudo-legal moves
         // that would take the opposing king (only reachable from hand-crafted positions where
         // the opponent left their king en-prise on their own turn).
-        const target = board.board_state[candidate.to.rank][candidate.to.file];
+        const target = board.squares[candidate.to.rank][candidate.to.file];
         if (target == .white_king or target == .black_king) {
             continue;
         }
@@ -698,7 +698,7 @@ fn filter_self_check(
         // is guaranteed empty). The victim pawn sits on the candidate's starting rank, same
         // file as the ep target — clear it so `in_check` sees the correct post-capture board.
         if (en_passant_square) |ep| {
-            const mover = board.board_state[candidate.from.rank][candidate.from.file];
+            const mover = board.squares[candidate.from.rank][candidate.from.file];
             const mover_is_pawn = mover == .white_pawn or mover == .black_pawn;
             const lands_on_ep = candidate.to.rank == ep.rank and candidate.to.file == ep.file;
             const is_diagonal = candidate.from.file != candidate.to.file;
@@ -734,7 +734,7 @@ pub fn en_passant_capturable(
     const captured_pawn: Piece = if (turn == .white) .black_pawn else .white_pawn;
     const own_pawn: Piece = if (turn == .white) .white_pawn else .black_pawn;
 
-    if (board.board_state[captured_pawn_rank][ep.file] != captured_pawn) {
+    if (board.squares[captured_pawn_rank][ep.file] != captured_pawn) {
         return false;
     }
     const captured_pos = Position{ .rank = captured_pawn_rank, .file = ep.file };
@@ -742,7 +742,7 @@ pub fn en_passant_capturable(
     // `file` is u3: bounds-guard before subtracting/adding 1 to avoid safe-mode overflow panics.
     if (ep.file > 0) {
         const from = Position{ .rank = captured_pawn_rank, .file = ep.file - 1 };
-        if (board.board_state[from.rank][from.file] == own_pawn and
+        if (board.squares[from.rank][from.file] == own_pawn and
             ep_capture_leaves_king_safe(board, turn, from, ep, captured_pos))
         {
             return true;
@@ -751,7 +751,7 @@ pub fn en_passant_capturable(
 
     if (ep.file < 7) {
         const from = Position{ .rank = captured_pawn_rank, .file = ep.file + 1 };
-        if (board.board_state[from.rank][from.file] == own_pawn and
+        if (board.squares[from.rank][from.file] == own_pawn and
             ep_capture_leaves_king_safe(board, turn, from, ep, captured_pos))
         {
             return true;
@@ -795,7 +795,7 @@ pub fn piece_legal_moves(
 
     var pseudo_legal: BoundedArray(Move, MAX_LEGAL_MOVES) = .{};
 
-    const piece = board.board_state[from.rank][from.file];
+    const piece = board.squares[from.rank][from.file];
     std.debug.assert(piece != .empty);
     const turn = piece.color().?;
 
@@ -829,7 +829,7 @@ fn pawn_forward_moves(
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     // Single push: target square must be empty.
-    if (board.board_state[target_rank][from.file] == .empty) {
+    if (board.squares[target_rank][from.file] == .empty) {
         out.append_assume_capacity(.{
             .from = from,
             .to = .{ .rank = target_rank, .file = from.file },
@@ -843,7 +843,7 @@ fn pawn_forward_moves(
                 .white => from.rank + 2,
                 .black => from.rank - 2,
             };
-            if (board.board_state[double_rank][from.file] == .empty) {
+            if (board.squares[double_rank][from.file] == .empty) {
                 out.append_assume_capacity(.{
                     .from = from,
                     .to = .{ .rank = double_rank, .file = from.file },
@@ -863,14 +863,14 @@ fn pawn_capture_moves(
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
     for (capture_directions) |direction| {
-        const file_delta = direction.deltas().file;
+        const file_delta = direction.delta().file;
         // File is the only axis that can fall off the edge (a/h files). Rank is caller-pinned safe.
         const diag_file_i8: i8 = @as(i8, @intCast(from.file)) + file_delta;
         if (diag_file_i8 < 0 or diag_file_i8 > 7) {
             continue;
         }
         const diag_file: u3 = @intCast(diag_file_i8);
-        const target_piece = board.board_state[target_rank][diag_file];
+        const target_piece = board.squares[target_rank][diag_file];
 
         // Regular capture — opponent piece on the diagonal.
         if (target_piece != .empty and target_piece.color().? != turn) {
@@ -897,7 +897,7 @@ fn en_passant_move(
     std.debug.assert((turn == .white and ep.rank == 5) or (turn == .black and ep.rank == 2));
 
     // Both capture diagonals share a rank delta, so either index works.
-    const rank_delta = directions[0].deltas().rank;
+    const rank_delta = directions[0].delta().rank;
 
     // The attacker sits one forward step behind the ep square — i.e. on the same rank as the
     // pushed pawn. i8 math dodges u3 overflow/underflow at the edges.
@@ -912,8 +912,8 @@ fn en_passant_move(
     // file 0 or 7.
     const from_file_i8: i8 = @intCast(from.file);
     const ep_file_i8: i8 = @intCast(ep.file);
-    const file_delta1 = directions[0].deltas().file;
-    const file_delta2 = directions[1].deltas().file;
+    const file_delta1 = directions[0].delta().file;
+    const file_delta2 = directions[1].delta().file;
     if (from_file_i8 != ep_file_i8 + file_delta1 and
         from_file_i8 != ep_file_i8 + file_delta2)
     {
@@ -926,7 +926,7 @@ fn en_passant_move(
         .white => .black_pawn,
         .black => .white_pawn,
     };
-    std.debug.assert(board.board_state[from.rank][ep.file] == expected_enemy_pawn);
+    std.debug.assert(board.squares[from.rank][ep.file] == expected_enemy_pawn);
 
     out.append_assume_capacity(.{ .from = from, .to = ep });
 }
@@ -963,7 +963,6 @@ fn pawn_moves_from(
     en_passant_move(board, turn, from, capture_directions, en_passant_square, out);
 }
 
-/// Pseudo-legal moves for a single knight at `from`.
 fn knight_moves_from(
     board: *const Board,
     from: Position,
@@ -981,7 +980,7 @@ fn knight_moves_from(
             continue;
         }
 
-        const target_piece = board.board_state[@intCast(target_rank)][@intCast(target_file)];
+        const target_piece = board.squares[@intCast(target_rank)][@intCast(target_file)];
         if (target_piece != .empty and target_piece.color().? == turn) {
             continue;
         }
@@ -993,7 +992,6 @@ fn knight_moves_from(
     }
 }
 
-/// Pseudo-legal moves for a single bishop at `from`.
 fn bishop_moves_from(
     board: *const Board,
     from: Position,
@@ -1005,7 +1003,6 @@ fn bishop_moves_from(
     }
 }
 
-/// Pseudo-legal moves for a single rook at `from`.
 fn rook_moves_from(
     board: *const Board,
     from: Position,
@@ -1017,7 +1014,6 @@ fn rook_moves_from(
     }
 }
 
-/// Pseudo-legal moves for a single queen at `from`.
 fn queen_moves_from(
     board: *const Board,
     from: Position,
@@ -1044,7 +1040,7 @@ fn king_moves_from(
     const file: i8 = @intCast(from.file);
 
     for (rules_shared.ALL_DIRECTIONS) |direction| {
-        const delta = direction.deltas();
+        const delta = direction.delta();
         const target_rank = rank + delta.rank;
         const target_file = file + delta.file;
 
@@ -1052,7 +1048,7 @@ fn king_moves_from(
             continue;
         }
 
-        const piece = board.board_state[@intCast(target_rank)][@intCast(target_file)];
+        const piece = board.squares[@intCast(target_rank)][@intCast(target_file)];
 
         if (piece != .empty and piece.color().? == turn) {
             continue;
@@ -1109,14 +1105,14 @@ fn king_castling_moves(
         return;
     }
 
-    const castling_options: [2]struct { plan: CastlingPlan, right: bool } = switch (turn) {
+    const castling_options: [2]struct { plan: CastlingPlan, right_active: bool } = switch (turn) {
         .white => .{
-            .{ .plan = WHITE_KING_SIDE_PLAN, .right = castling_rights.white_kingside },
-            .{ .plan = WHITE_QUEEN_SIDE_PLAN, .right = castling_rights.white_queenside },
+            .{ .plan = WHITE_KING_SIDE_PLAN, .right_active = castling_rights.white_kingside },
+            .{ .plan = WHITE_QUEEN_SIDE_PLAN, .right_active = castling_rights.white_queenside },
         },
         .black => .{
-            .{ .plan = BLACK_KING_SIDE_PLAN, .right = castling_rights.black_kingside },
-            .{ .plan = BLACK_QUEEN_SIDE_PLAN, .right = castling_rights.black_queenside },
+            .{ .plan = BLACK_KING_SIDE_PLAN, .right_active = castling_rights.black_kingside },
+            .{ .plan = BLACK_QUEEN_SIDE_PLAN, .right_active = castling_rights.black_queenside },
         },
     };
 
@@ -1126,7 +1122,7 @@ fn king_castling_moves(
     };
 
     option_loop: for (castling_options) |option| {
-        if (!option.right) {
+        if (!option.right_active) {
             continue;
         }
 
@@ -1135,12 +1131,12 @@ fn king_castling_moves(
         // Rights imply the rook is home by invariant (any move off the corner, or capture of
         // the rook on the corner, clears the matching right). Hand-crafted positions can still
         // set flags without the rook actually being there — guard against that here.
-        if (board.board_state[plan.rank][plan.rook_from_file] != expected_rook) {
+        if (board.squares[plan.rank][plan.rook_from_file] != expected_rook) {
             continue;
         }
 
         for (plan.between_files) |file| {
-            if (board.board_state[plan.rank][file] != .empty) {
+            if (board.squares[plan.rank][file] != .empty) {
                 continue :option_loop;
             }
         }
@@ -1180,7 +1176,7 @@ fn pawn_moves(
         .white => .white_pawn,
     };
 
-    const positions = board.find_piece_position(pawn_piece);
+    const positions = board.find_piece_positions(pawn_piece);
     for (positions.slice()) |position| {
         pawn_moves_from(board, position, turn, en_passant_square, out);
     }
@@ -1196,7 +1192,7 @@ fn knight_moves(board: *const Board, turn: Color, out: *BoundedArray(
         .black => .black_knight,
         .white => .white_knight,
     };
-    const knight_positions = board.find_piece_position(piece);
+    const knight_positions = board.find_piece_positions(piece);
     for (knight_positions.slice()) |position| {
         knight_moves_from(board, position, turn, out);
     }
@@ -1215,7 +1211,7 @@ fn bishop_moves(board: *const Board, turn: Color, out: *BoundedArray(
     };
 
     for (bishops) |bishop_piece| {
-        const positions = board.find_piece_position(bishop_piece);
+        const positions = board.find_piece_positions(bishop_piece);
         for (positions.slice()) |position| {
             bishop_moves_from(board, position, turn, out);
         }
@@ -1234,7 +1230,7 @@ fn rook_moves(board: *const Board, turn: Color, out: *BoundedArray(
         .white => .white_rook,
     };
 
-    const positions = board.find_piece_position(rook_piece);
+    const positions = board.find_piece_positions(rook_piece);
     for (positions.slice()) |position| {
         rook_moves_from(board, position, turn, out);
     }
@@ -1252,7 +1248,7 @@ fn queen_moves(board: *const Board, turn: Color, out: *BoundedArray(
         .white => .white_queen,
     };
 
-    const positions = board.find_piece_position(queen_piece);
+    const positions = board.find_piece_positions(queen_piece);
     for (positions.slice()) |position| {
         queen_moves_from(board, position, turn, out);
     }
@@ -1273,7 +1269,7 @@ fn king_moves(
         .black => .black_king,
     };
 
-    const positions = board.find_piece_position(king_piece);
+    const positions = board.find_piece_positions(king_piece);
     std.debug.assert(positions.len == 1);
 
     king_moves_from(board, positions.slice()[0], turn, castling_rights, out);
@@ -1426,7 +1422,7 @@ test "bishop_moves: lone white dark-squared bishop on d4 generates exactly 13 mo
     // d4 = (rank 3, file 3). rank + file = 6 (even) → dark square in this project's convention
     // (white_bishop_dark sits on c1 = 0+2 = 2 even in the starting layout). bishop_moves serves
     // both bishop variants through the same generator, so the count is 13 either way — the Piece
-    // variant just has to match what find_piece_position is asked for.
+    // variant just has to match what find_piece_positions is asked for.
     var board = test_util.empty_board();
     test_util.place(&board, .white_bishop_dark, .{ .rank = 3, .file = 3 });
 
@@ -2139,7 +2135,7 @@ test "en_passant_capturable: capturers on BOTH adjacent files still returns true
 
 test "en_passant_capturable: capturer present but victim pawn missing returns false" {
     // Adjacent own pawn exists, but nothing on the captured-pawn-rank at ep.file.
-    // Covers the `board_state[captured_pawn_rank][ep.file] != captured_pawn` early-exit.
+    // Covers the `squares[captured_pawn_rank][ep.file] != captured_pawn` early-exit.
     var board = test_util.empty_board();
     test_util.place(&board, .white_king, .{ .rank = 0, .file = 0 });
     test_util.place(&board, .black_king, .{ .rank = 7, .file = 0 });

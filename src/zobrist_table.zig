@@ -37,7 +37,7 @@ pub const WHITE_KING: usize = 11;
 // Segment bases, for callers that compute offsets directly.
 pub const PIECE_SQUARE_BASE: usize = 0;
 pub const CASTLING_BASE: usize = 768;
-pub const EP_FILE_BASE: usize = 772;
+pub const EN_PASSANT_FILE_BASE: usize = 772;
 pub const SIDE_TO_MOVE_INDEX: usize = 780;
 
 // --- Piece-square blocks --------------------------------------------------
@@ -219,8 +219,8 @@ comptime {
 test "segment offsets match Polyglot layout" {
     try std.testing.expectEqual(@as(usize, 781), TABLE.len);
     try std.testing.expectEqual(@as(usize, 768), CASTLING_BASE - PIECE_SQUARE_BASE);
-    try std.testing.expectEqual(@as(usize, 4), EP_FILE_BASE - CASTLING_BASE);
-    try std.testing.expectEqual(@as(usize, 8), SIDE_TO_MOVE_INDEX - EP_FILE_BASE);
+    try std.testing.expectEqual(@as(usize, 4), EN_PASSANT_FILE_BASE - CASTLING_BASE);
+    try std.testing.expectEqual(@as(usize, 8), SIDE_TO_MOVE_INDEX - EN_PASSANT_FILE_BASE);
     try std.testing.expectEqual(TABLE[SIDE_TO_MOVE_INDEX], SIDE_TO_MOVE);
 }
 

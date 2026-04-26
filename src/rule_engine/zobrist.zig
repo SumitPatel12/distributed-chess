@@ -18,8 +18,8 @@ const zobrist_table = @import("../zobrist_table.zig");
 
 pub const INITIAL_BOARD_ZOBRIST_HASH: u64 = blk: {
     const initial_board: Board = .{
-        .board_state = Board.STARTING_BOARD_POSITION,
-        .king_pos = .{
+        .squares = Board.STARTING_POSITION,
+        .king_positions = .{
             .{ .rank = 0, .file = 4 }, // white king e1
             .{ .rank = 7, .file = 4 }, // black king e8
         },
@@ -38,7 +38,6 @@ comptime {
 // the like, it turend out to be too complex and for a game that's supposed to be played between
 // humans recomputig doesn't add enough overhead to warrant that complexity. Maybe for an engine
 // that would make more sense? I don't know.
-/// Calculates the Zobrist hash for the given board state
 pub fn hash_state(
     board: *const Board,
     turn: Color,
@@ -47,7 +46,7 @@ pub fn hash_state(
 ) u64 {
     var hash: u64 = 0;
 
-    for (board.board_state, 0..) |rank_row, rank_idx| {
+    for (board.squares, 0..) |rank_row, rank_idx| {
         for (rank_row, 0..) |piece, file_idx| {
             if (polyglot_kind(piece)) |kind| {
                 hash ^= zobrist_table.TABLE[64 * kind + 8 * rank_idx + file_idx];
@@ -70,7 +69,7 @@ pub fn hash_state(
 
     if (en_passant_square) |ep| {
         if (rules.en_passant_capturable(board, turn, en_passant_square)) {
-            hash ^= zobrist_table.TABLE[zobrist_table.EP_FILE_BASE + ep.file];
+            hash ^= zobrist_table.TABLE[zobrist_table.EN_PASSANT_FILE_BASE + ep.file];
         }
     }
 

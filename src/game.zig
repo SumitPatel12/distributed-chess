@@ -86,19 +86,16 @@ pub const PausedDisconnected = struct {
 pub const GameOver = struct {
     result: GameResult,
     winner: ?Color,
-    final_seq: u32,
+    final_sequence_number: u32,
 };
 
-/// The state of the game. Can be playing, ended, or disconnected.
 const GameState = union(enum) {
-    /// The game is still ongoing.
     playing: Playing,
 
-    /// One of the players is disconnected.
     paused_disconnected: PausedDisconnected,
 
-    /// Game is over with the result stored in the enum. `final_seq` pins the exact RSM
-    /// command that ended the game — used for rematch setup (start from final_seq + 1), for
+    /// Game is over with the result stored in the enum. `final_sequence_number` pins the exact RSM
+    /// command that ended the game — used for rematch setup (start from final_sequence_number + 1), for
     /// persistence, and for disambiguating commands that share a move_number (e.g. a move
     /// and a resignation both issued during move 30 are distinct commands, distinct seqs).
     game_over: GameOver,
@@ -123,13 +120,10 @@ pub const LogEntry = struct {
     /// Monotonically increasing sequence number for ordering.
     sequence_number: u32,
 
-    /// The full move number
     move_number: u16,
 
-    /// That game command that corresponds to this entry.
     command: GameCommand,
 
-    /// Which player initiated this log entry.
     issued_by: Color,
 
     // We don't send the original clock times because it would be unnecessary in my opinion, what we
@@ -145,11 +139,11 @@ pub const LocalRejectionReason = enum {
     out_of_turn,
     already_proposing,
     game_ended,
-    awiaiting_promotion_piece,
+    awaiting_promotion_piece,
 
     /// Represents a rejection when a promotion piece choice arrives outside of
     /// awaiting_promotion_piece.
-    unsolocited_promotion_choice,
+    unsolicited_promotion_choice,
 };
 
 pub const NackReason = enum {
@@ -163,7 +157,7 @@ pub const NackReason = enum {
 };
 
 pub const Nack = struct {
-    seq: u32,
+    sequence_number: u32,
     reason: NackReason,
 };
 
@@ -222,7 +216,7 @@ pub const GameEffect = union(enum) {
     prompt_for_promotion: struct { color: Color },
 
     request_resync: struct {
-        last_known_seq: u32,
+        last_known_sequence_number: u32,
         peer_nack_reason: ?NackReason,
     },
 
@@ -234,10 +228,8 @@ pub const GameEffect = union(enum) {
 /// Represents the game being played. Holds the complete data of the game including players move
 /// history, game state, the log for the RSM.
 pub const Game = struct {
-    /// Stores the current state of the Board.
     board: Board,
 
-    /// Stores whose turn it is, either black or white.
     turn: Color,
 
     // I bounced between player_color and local_color and local_color seems the better option. After
@@ -255,7 +247,6 @@ pub const Game = struct {
     /// Required when one of the players want's to propose/claim a draw under the 50 move rule.
     halfmove_clock: u16,
 
-    /// Game state, showing if playing, disconnected or ended.
     state: GameState,
 
     /// Pieces white has captured from black. Bounded to 15 since white can capture at most 15 of
@@ -267,12 +258,10 @@ pub const Game = struct {
 
     /// Position has that tracks if the position has been repeated, required for three-fold
     /// repetition draw rule.
-    position_hash: BoundedArray(u64, MAX_LOG),
+    position_hashes: BoundedArray(u64, MAX_LOG),
 
-    /// The next expected sequence number.
-    expected_seq: u32,
+    expected_sequence_number: u32,
 
-    /// Castling Rights, whether a player has them or not.
     castling_rights: CastlingRights,
 
     /// The square an opposing pawn could capture to, if the last move was a two-square pawn
@@ -301,10 +290,8 @@ pub const Game = struct {
     /// compounding the divergence.
     const MAX_RETRIES: u8 = 3;
 
-    /// Max number of unexpected events acceptable per iteration.
     const MAX_UNEXPECTED_EVENTS: u8 = 3;
 
-    /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
         return switch (color) {
             .white => GameState{ .playing = .local_turn },
@@ -312,7 +299,6 @@ pub const Game = struct {
         };
     }
 
-    /// Initializes the Game struct in place.
     pub fn init(self: *Game, local_color: Color) void {
         self.* = .{
             .board = undefined,
@@ -323,15 +309,15 @@ pub const Game = struct {
             .local_color = local_color,
             .captures_by_white = .{},
             .captures_by_black = .{},
-            .position_hash = .{},
-            .expected_seq = 1,
+            .position_hashes = .{},
+            .expected_sequence_number = 1,
             .castling_rights = .{},
             .en_passant_square = null,
             .command_log = .{},
             .unexpected_event_count = 0,
         };
         self.board.init();
-        self.position_hash.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
+        self.position_hashes.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
     }
 
     fn handle_unexpected_event(self: *Game, out: *BoundedArray(GameEffect, MAX_EFFECTS)) void {
@@ -342,7 +328,7 @@ pub const Game = struct {
         self.unexpected_event_count += 1;
         out.append_assume_capacity(.{
             .request_resync = .{
-                .last_known_seq = self.expected_seq,
+                .last_known_sequence_number = self.expected_sequence_number,
                 .peer_nack_reason = null,
             },
         });
@@ -350,12 +336,9 @@ pub const Game = struct {
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
     /// and tracked state and returns the side-effects.
-    ///
-    /// For now invalid events will end in panic, will be handled down the line.
     pub fn tick(self: *Game, event: GameEvent, out: *BoundedArray(GameEffect, MAX_EFFECTS)) void {
-        // TODO: Wire up logic for each event
-        std.debug.assert(self.expected_seq >= 1);
-        std.debug.assert(self.position_hash.len <= MAX_LOG);
+        std.debug.assert(self.expected_sequence_number >= 1);
+        std.debug.assert(self.position_hashes.len <= MAX_LOG);
 
         switch (self.state) {
             .playing => |playing| switch (playing) {
@@ -367,14 +350,21 @@ pub const Game = struct {
                     .local_promotion_choice => {
                         out.append_assume_capacity(.{
                             .local_rejected = .{
-                                .reason = .unsolocited_promotion_choice,
+                                .reason = .unsolicited_promotion_choice,
                             },
                         });
                     },
                     .remote_ack, .remote_nack => self.handle_unexpected_event(out),
+                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
                     .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    else => {
-                        // TODO: Add other arms.
+                    .clock_tick => {
+                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
+                    },
+                    .peer_disconnected => {
+                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
+                    },
+                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
+                        // No-op: these only fire in paused_disconnected / proposing.
                     },
                 },
                 .remote_turn => switch (event) {
@@ -389,17 +379,25 @@ pub const Game = struct {
                     .local_promotion_choice => {
                         out.append_assume_capacity(.{
                             .local_rejected = .{
-                                .reason = .unsolocited_promotion_choice,
+                                .reason = .unsolicited_promotion_choice,
                             },
                         });
                     },
                     .remote_ack, .remote_nack => {
                         self.handle_unexpected_event(out);
                     },
-                    else => {},
+                    .clock_tick => {
+                        // TODO: Decrement the remote player's clock; transition to game_over{timeout} on zero.
+                    },
+                    .peer_disconnected => {
+                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
+                    },
+                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
+                        // No-op: these only fire in paused_disconnected / proposing.
+                    },
                 },
                 .proposing => |proposal| switch (event) {
-                    .remote_ack => |acked_seq| self.handle_remote_ack(proposal, acked_seq, out),
+                    .remote_ack => |acked_sequence_number| self.handle_remote_ack(proposal, acked_sequence_number, out),
                     .remote_nack => |nack| self.handle_remote_nack(proposal, nack, out),
                     .local_command => {
                         out.append_assume_capacity(.{
@@ -411,31 +409,69 @@ pub const Game = struct {
                     .local_promotion_choice => {
                         out.append_assume_capacity(.{
                             .local_rejected = .{
-                                .reason = .unsolocited_promotion_choice,
+                                .reason = .unsolicited_promotion_choice,
                             },
                         });
                     },
+                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
                     .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    else => {},
+                    .proposal_timeout => {
+                        // TODO: Trigger retry via request_resync, or panic when the retry budget is exhausted.
+                    },
+                    .clock_tick => {
+                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
+                    },
+                    .peer_disconnected => {
+                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
+                    },
+                    .peer_reconnected, .disconnect_timer_expired => {
+                        // No-op: these only fire in paused_disconnected.
+                    },
                 },
                 .awaiting_promotion_piece => |held| switch (event) {
                     .local_promotion_choice => |choice| self.handle_promotion_choice(held, choice, out),
                     .local_command => {
                         out.append_assume_capacity(.{
                             .local_rejected = .{
-                                .reason = .awiaiting_promotion_piece,
+                                .reason = .awaiting_promotion_piece,
                             },
                         });
                     },
                     .remote_ack, .remote_nack => {
                         self.handle_unexpected_event(out);
                     },
+                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
                     .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    else => {
-                        // TODO: Handle other arms.
+                    .clock_tick => {
+                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
+                    },
+                    .peer_disconnected => {
+                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
+                    },
+                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
+                        // No-op: these only fire in paused_disconnected / proposing.
                     },
                 },
-                .awaiting_draw_response => {},
+                .awaiting_draw_response => switch (event) {
+                    .local_command, .local_promotion_choice => {
+                        // TODO: A move from the offerer withdraws the offer; from the other side declines it.
+                    },
+                    .remote_proposal => {
+                        // TODO: Opponent's move implicitly accepts/declines the offer per DEC-***.
+                    },
+                    .remote_ack, .remote_nack => {
+                        // TODO: Forward to the resync layer — these can arrive while waiting for a draw response.
+                    },
+                    .clock_tick => {
+                        // TODO: Decrement clocks; offer lapses on timeout.
+                    },
+                    .peer_disconnected => {
+                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
+                    },
+                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
+                        // No-op: these only fire in paused_disconnected / proposing.
+                    },
+                },
             },
             .paused_disconnected => switch (event) {
                 .local_command, .local_promotion_choice => {
@@ -443,7 +479,18 @@ pub const Game = struct {
                         .local_rejected = .{ .reason = .game_ended },
                     });
                 },
-                else => {},
+                .peer_reconnected => {
+                    // TODO: Restore the snapshotted `was` state and cancel the disconnect timer.
+                },
+                .disconnect_timer_expired => {
+                    // TODO: Award the win to the connected player — transition to game_over{disconnect}.
+                },
+                .remote_proposal, .remote_ack, .remote_nack => {
+                    // TODO: Buffer or forward to the resync layer once we re-emerge from paused_disconnected.
+                },
+                .clock_tick, .peer_disconnected, .proposal_timeout => {
+                    // No-op: clocks are paused, peer can't disconnect twice, no proposal pending.
+                },
             },
             .game_over => switch (event) {
                 .local_command, .local_promotion_choice => {
@@ -452,7 +499,9 @@ pub const Game = struct {
                     });
                 },
                 .remote_ack, .remote_nack, .remote_proposal => self.handle_unexpected_event(out),
-                else => {},
+                .clock_tick, .peer_disconnected, .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
+                    // No-op: game's over, nothing to do.
+                },
             },
         }
     }
@@ -492,7 +541,7 @@ pub const Game = struct {
         }
 
         const log_entry = LogEntry{
-            .sequence_number = self.expected_seq,
+            .sequence_number = self.expected_sequence_number,
             .move_number = self.fullmove_number,
             .issued_by = self.local_color,
             .command = .{ .play = play },
@@ -508,7 +557,7 @@ pub const Game = struct {
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
         const log_entry = LogEntry{
-            .sequence_number = self.expected_seq,
+            .sequence_number = self.expected_sequence_number,
             .move_number = self.fullmove_number,
             .issued_by = self.local_color,
             .command = .{
@@ -529,10 +578,10 @@ pub const Game = struct {
     fn handle_remote_ack(
         self: *Game,
         proposal: @FieldType(Playing, "proposing"),
-        acked_seq: u32,
+        acked_sequence_number: u32,
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
-        if (acked_seq != proposal.pending.sequence_number) {
+        if (acked_sequence_number != proposal.pending.sequence_number) {
             if (proposal.retry_count < MAX_RETRIES) {
                 self.request_resync(proposal, null, out);
             } else {
@@ -566,7 +615,7 @@ pub const Game = struct {
     }
 
     /// Arm: `playing.proposing × remote_nack`. Any nack is a divergence signal regardless of
-    /// `nack.seq` — peer rejected the proposal so our state is suspect. Reuse Arm 2's
+    /// `nack.sequence_number` — peer rejected the proposal so our state is suspect. Reuse Arm 2's
     /// shared retry budget (any mix of seq mismatches and nacks counts toward the same
     /// MAX_RETRIES cap), pass the peer's reason through for the wire layer to pick a
     /// recovery strategy, or panic when the budget is exhausted.
@@ -594,10 +643,10 @@ pub const Game = struct {
         entry: LogEntry,
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
-        if (entry.sequence_number != self.expected_seq) {
+        if (entry.sequence_number != self.expected_sequence_number) {
             out.append_assume_capacity(.{
                 .send_nack = .{
-                    .seq = entry.sequence_number,
+                    .sequence_number = entry.sequence_number,
                     .reason = .state_desync,
                 },
             });
@@ -614,7 +663,7 @@ pub const Game = struct {
             error.IllegalMove => {
                 out.append_assume_capacity(.{
                     .send_nack = .{
-                        .seq = entry.sequence_number,
+                        .sequence_number = entry.sequence_number,
                         .reason = .illegal_move,
                     },
                 });
@@ -653,7 +702,7 @@ pub const Game = struct {
             .retry_count = proposal.retry_count + 1,
         } } };
         out.append_assume_capacity(.{ .request_resync = .{
-            .last_known_seq = proposal.pending.sequence_number,
+            .last_known_sequence_number = proposal.pending.sequence_number,
             .peer_nack_reason = peer_nack_reason,
         } });
     }
@@ -690,7 +739,7 @@ pub const Game = struct {
 
         // Snapshot the mover's piece identity BEFORE `board.move` below mutates the source square
         // — the 50-move clock further down needs to know whether this was a pawn move.
-        const moving_piece = self.board.board_state[move.from.rank][move.from.file];
+        const moving_piece = self.board.squares[move.from.rank][move.from.file];
         const is_pawn_move = moving_piece == .white_pawn or moving_piece == .black_pawn;
 
         self.castling_rights = rules_engine.castling_rights_after(
@@ -715,7 +764,7 @@ pub const Game = struct {
 
                 const promotion_piece = log_entry.command.play.promotion.?;
                 const is_dark_square = (@as(u4, move.to.rank) + @as(u4, move.to.file)) % 2 == 0;
-                self.board.board_state[move.to.rank][move.to.file] = switch (self.turn) {
+                self.board.squares[move.to.rank][move.to.file] = switch (self.turn) {
                     .white => switch (promotion_piece) {
                         .queen => .white_queen,
                         .rook => .white_rook,
@@ -782,34 +831,34 @@ pub const Game = struct {
             .white => .black,
         };
 
-        self.position_hash.append_assume_capacity(zobrist.hash_state(
+        self.position_hashes.append_assume_capacity(zobrist.hash_state(
             &self.board,
             self.turn,
             self.castling_rights,
             self.en_passant_square,
         ));
         self.command_log.append_assume_capacity(log_entry);
-        self.expected_seq += 1;
+        self.expected_sequence_number += 1;
 
-        // TODO: final_seq should align with the RSM seq lifecycle once it's wired end-to-end.
+        // TODO: final_sequence_number should align with the RSM seq lifecycle once it's wired end-to-end.
         // Priority: checkmate > stalemate > 75-move auto-draw.
         if (rules_engine.is_checkmate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
             return GameOver{
                 .result = .checkmate,
                 .winner = self.turn.opponent(),
-                .final_seq = log_entry.sequence_number,
+                .final_sequence_number = log_entry.sequence_number,
             };
         } else if (rules_engine.is_stalemate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
             return GameOver{
                 .result = .stalemate,
                 .winner = null,
-                .final_seq = log_entry.sequence_number,
+                .final_sequence_number = log_entry.sequence_number,
             };
         } else if (self.halfmove_clock >= 150) {
             return GameOver{
                 .result = .draw_seventy_five_moves,
                 .winner = null,
-                .final_seq = log_entry.sequence_number,
+                .final_sequence_number = log_entry.sequence_number,
             };
         }
 
@@ -832,14 +881,14 @@ pub const Game = struct {
 const test_util = @import("rule_engine/test_util.zig");
 const test_helpers = @import("test_helpers.zig");
 
-test "intial state white returns local turn idle" {
+test "initial state white returns local turn idle" {
     var game: Game = undefined;
     game.init(.white);
 
     try std.testing.expectEqual(GameState{ .playing = .local_turn }, game.state);
 }
 
-test "intial state black returns remote turn waiting" {
+test "initial state black returns remote turn waiting" {
     var game: Game = undefined;
     game.init(.black);
 
@@ -850,7 +899,7 @@ test "init sets board state to initial board state" {
     var game: Game = undefined;
     game.init(.white);
 
-    const b = game.board.board_state;
+    const b = game.board.squares;
 
     // White back rank (rank 1 = index 0)
     try std.testing.expectEqual(.white_rook, b[0][0]);
@@ -882,16 +931,16 @@ test "init sets board state to initial board state" {
     try std.testing.expectEqual(.black_rook, b[7][7]);
 }
 
-test "inti sets the correct seq number, captures, and position hash" {
+test "init sets the correct seq number, captures, and position hash" {
     var game: Game = undefined;
     game.init(.white);
 
-    try std.testing.expectEqual(game.expected_seq, 1);
+    try std.testing.expectEqual(game.expected_sequence_number, 1);
     try std.testing.expectEqual(game.en_passant_square, null);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
-    try std.testing.expectEqual(@as(usize, 1), game.position_hash.len);
-    try std.testing.expectEqual(zobrist.INITIAL_BOARD_ZOBRIST_HASH, game.position_hash.slice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), game.position_hashes.len);
+    try std.testing.expectEqual(zobrist.INITIAL_BOARD_ZOBRIST_HASH, game.position_hashes.slice()[0]);
 }
 
 // Smoke tests — primarily exist to force semantic analysis of apply_move and friends. Without a
@@ -908,8 +957,8 @@ test "apply_move applies e2-e4 from the starting position" {
     };
     try test_helpers.apply_move(&game, mv);
 
-    try std.testing.expectEqual(.empty, game.board.board_state[1][4]);
-    try std.testing.expectEqual(.white_pawn, game.board.board_state[3][4]);
+    try std.testing.expectEqual(.empty, game.board.squares[1][4]);
+    try std.testing.expectEqual(.white_pawn, game.board.squares[3][4]);
     try std.testing.expectEqual(Color.black, game.turn);
     // Double push registers the passed-over square (e3) as the en-passant target.
     try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
@@ -947,9 +996,9 @@ test "apply_move: black plays en-passant after white double-push, victim removed
     // victim white pawn physically sits on e4 = (3, 4) and must be cleared.
     try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 2, .file = 4 } });
 
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]); // e4 victim removed
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][3]); // d4 source empty
-    try std.testing.expectEqual(Piece.black_pawn, game.board.board_state[2][4]); // e3 ep destination
+    try std.testing.expectEqual(Piece.empty, game.board.squares[3][4]); // e4 victim removed
+    try std.testing.expectEqual(Piece.empty, game.board.squares[3][3]); // d4 source empty
+    try std.testing.expectEqual(Piece.black_pawn, game.board.squares[2][4]); // e3 ep destination
     try std.testing.expectEqual(@as(usize, 1), game.captures_by_black.len);
     try std.testing.expectEqual(Piece.white_pawn, game.captures_by_black.slice()[0]);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
@@ -974,8 +1023,8 @@ test "apply_move: regular capture appends the victim to captures_by_<turn>" {
     try std.testing.expectEqual(@as(usize, 1), game.captures_by_white.len);
     try std.testing.expectEqual(Piece.black_pawn, game.captures_by_white.slice()[0]);
     try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
-    try std.testing.expectEqual(Piece.white_rook, game.board.board_state[5][4]);
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[3][4]);
+    try std.testing.expectEqual(Piece.white_rook, game.board.squares[5][4]);
+    try std.testing.expectEqual(Piece.empty, game.board.squares[3][4]);
 }
 
 test "apply_move: en_passant_square clears after a non-double-push reply to a double push" {
@@ -1006,10 +1055,10 @@ test "apply_move: white kingside castling moves king + rook and clears both whit
 
     try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } });
 
-    try std.testing.expectEqual(Piece.white_king, game.board.board_state[0][6]);
-    try std.testing.expectEqual(Piece.white_rook, game.board.board_state[0][5]);
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[0][4]);
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[0][7]);
+    try std.testing.expectEqual(Piece.white_king, game.board.squares[0][6]);
+    try std.testing.expectEqual(Piece.white_rook, game.board.squares[0][5]);
+    try std.testing.expectEqual(Piece.empty, game.board.squares[0][4]);
+    try std.testing.expectEqual(Piece.empty, game.board.squares[0][7]);
     try std.testing.expect(!game.castling_rights.white_kingside);
     try std.testing.expect(!game.castling_rights.white_queenside);
     try std.testing.expect(game.castling_rights.black_kingside);
@@ -1365,8 +1414,8 @@ test "apply_move_with_promotion: white pawn e7-e8 promotes to queen" {
     const mv = Move{ .from = .{ .rank = 6, .file = 4 }, .to = .{ .rank = 7, .file = 4 } };
     try test_helpers.apply_move_with_promotion(&game, mv, .queen);
 
-    try std.testing.expectEqual(Piece.empty, game.board.board_state[6][4]);
-    try std.testing.expectEqual(Piece.white_queen, game.board.board_state[7][4]);
+    try std.testing.expectEqual(Piece.empty, game.board.squares[6][4]);
+    try std.testing.expectEqual(Piece.white_queen, game.board.squares[7][4]);
     try std.testing.expectEqual(Color.black, game.turn);
 }
 

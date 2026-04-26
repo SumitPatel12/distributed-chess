@@ -21,11 +21,11 @@ pub fn main() !void {
     std.debug.assert(game.local_color == .white);
 
     var renderer: BoardRenderer = undefined;
-    renderer.init(io.window_config);
+    renderer.init(io.window_size);
 
-    const write_result = io.write(renderer.draw(&game));
+    const bytes_written = io.write(renderer.draw(&game));
 
-    if (write_result == -1) {
+    if (bytes_written == -1) {
         std.debug.print("Error rendering board.", .{});
     }
 }

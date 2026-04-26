@@ -70,7 +70,7 @@ fn apply_remote_move(game: *Game, move: Move) ApplyMoveError!void {
     var out: BoundedArray(GameEffect, Game.MAX_EFFECTS) = .{};
 
     const entry = LogEntry{
-        .sequence_number = game.expected_seq,
+        .sequence_number = game.expected_sequence_number,
         .move_number = game.fullmove_number,
         .issued_by = game.turn,
         .command = .{ .play = .{ .move = move, .promotion = null } },
@@ -143,7 +143,7 @@ fn map_rejection_reason(reason: game_mod.LocalRejectionReason) ApplyMoveError {
         .out_of_turn => error.OutOfTurn,
         .already_proposing => error.AlreadyProposing,
         .game_ended => error.GameEnded,
-        .awiaiting_promotion_piece => error.AwaitingPromotionPiece,
-        .unsolocited_promotion_choice => error.UnsolicitedPromotionChoice,
+        .awaiting_promotion_piece => error.AwaitingPromotionPiece,
+        .unsolicited_promotion_choice => error.UnsolicitedPromotionChoice,
     };
 }

@@ -16,7 +16,6 @@ const BoundedArray = @import("bounded_array.zig").BoundedArray;
 //  2. Piece Color
 // Positive would be white and negative would be black. And since we only have 6 unique pieces i8 is
 // more than enough.
-/// Enum for pieces, the board_state will make use of this to encode the board state.
 pub const Piece = enum(i8) {
     empty = 0,
     white_pawn = 1,
@@ -68,23 +67,19 @@ pub const Piece = enum(i8) {
     }
 };
 
-/// Encodes the current board.
-/// Keeps track of the board state with piece positions.
 pub const Board = struct {
-    /// Current State of the board with piece positions.
-    /// Row 0 is black's back rank and row 7 is white's back rank.
-    board_state: [8][8]Piece,
+    squares: [8][8]Piece,
 
-    /// Cached king positions — maintained in lockstep with `board_state` so `find_king_position`
-    /// is O(1). Indexed as `king_pos[@intFromEnum(color)]` (white = 0, black = 1).
+    /// Cached king positions — maintained in lockstep with `squares` so `find_king_position`
+    /// is O(1). Indexed as `king_positions[@intFromEnum(color)]` (white = 0, black = 1).
     ///
     /// Coherence contract: `Board.move` updates this cache automatically, and `Board.clear`
-    /// asserts its target is not a king. Any code path that writes directly into `board_state`
-    /// (test fixtures bypassing `move`, low-level state patching) MUST maintain `king_pos` by
+    /// asserts its target is not a king. Any code path that writes directly into `squares`
+    /// (test fixtures bypassing `move`, low-level state patching) MUST maintain `king_positions` by
     /// hand — see `src/rule_engine/test_util.zig` (`place`) and `src/game.zig`'s pin-scenario
     /// test for examples. A stale cache trips the `expected_king` assert in
     /// `check_helper.in_check`.
-    king_pos: [2]Position,
+    king_positions: [2]Position,
 
     // Chess board anatomy:
     //
@@ -115,15 +110,15 @@ pub const Board = struct {
     //             a     b     c     d     e     f     g     h
     //                             WHITE
     //
-    // board_state is indexed as board_state[rank_idx][file_idx], with rank_idx 0 mapping to chess
+    // squares is indexed as squares[rank_idx][file_idx], with rank_idx 0 mapping to chess
     // rank 1 (white's back rank) and rank_idx 7 to chess rank 8 (black's back rank). The array
     // layout is flipped vertically relative to the anatomy diagram above, so "e4" translates
-    // directly to board_state[3][4] — no mental flip, rank_idx and chess rank line up exactly.
+    // directly to squares[3][4] — no mental flip, rank_idx and chess rank line up exactly.
     //
     // I initially had this encoded as we see in the anatomy diagram above: for the 2D array, white
     // sat at the bottom (high rank_idx) and black at the top (low rank_idx). That inverted every
-    // rank lookup — a pawn push from e2 -> e4 read as board_state[6][4] -> board_state[4][4]
-    // instead of the natural board_state[1][4] -> board_state[3][4]. I'd be paying that translation
+    // rank lookup — a pawn push from e2 -> e4 read as squares[6][4] -> squares[4][4]
+    // instead of the natural squares[1][4] -> squares[3][4]. I'd be paying that translation
     // cost at every call site for white's position, and moves are what the whole game is built on,
     // so I flipped the convention once here rather than forever at every access.
     //
@@ -159,7 +154,7 @@ pub const Board = struct {
     // board, but rank_idx == (chess rank - 1), so the translation vanishes.
     //
     /// The starting position for a classical game. Sorted by rank and file so white side first.
-    pub const STARTING_BOARD_POSITION: [8][8]Piece = .{
+    pub const STARTING_POSITION: [8][8]Piece = .{
         .{
             .white_rook, .white_knight,       .white_bishop_dark, .white_queen,
             .white_king, .white_bishop_light, .white_knight,      .white_rook,
@@ -179,11 +174,10 @@ pub const Board = struct {
     // NOTE: Since this is initialized in-place make sure that all of the things that it calls
     // during the init also support in-place initialization.
     /// Initialize the board with the starting position.
-    /// Initialization takes place in-place
     pub fn init(self: *Board) void {
         self.* = .{
-            .board_state = STARTING_BOARD_POSITION,
-            .king_pos = .{
+            .squares = STARTING_POSITION,
+            .king_positions = .{
                 Position{ .rank = 0, .file = 4 }, // white king e1
                 Position{ .rank = 7, .file = 4 }, // black king e8
             },
@@ -196,20 +190,20 @@ pub const Board = struct {
     // then move would have to return captured pieces, encode en-passant, castling and that gets
     // difficult fast. At least that's what I imagine, hence the dumb state board.
     //
-    /// Mutates `board_state` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
+    /// Mutates `squares` to move a piece from `from` to `to`. Doesn't re-draw, if you want the
     /// new state to be visible call the redraw function.
     pub fn move(self: *Board, from: Position, to: Position) void {
         std.debug.assert(from.rank != to.rank or from.file != to.file);
 
-        const piece = self.board_state[from.rank][from.file];
+        const piece = self.squares[from.rank][from.file];
         std.debug.assert(piece != .empty);
 
-        self.board_state[from.rank][from.file] = .empty;
-        self.board_state[to.rank][to.file] = piece;
+        self.squares[from.rank][from.file] = .empty;
+        self.squares[to.rank][to.file] = piece;
 
         switch (piece) {
-            .white_king => self.king_pos[@intFromEnum(Color.white)] = to,
-            .black_king => self.king_pos[@intFromEnum(Color.black)] = to,
+            .white_king => self.king_positions[@intFromEnum(Color.white)] = to,
+            .black_king => self.king_positions[@intFromEnum(Color.black)] = to,
             else => {},
         }
     }
@@ -221,21 +215,25 @@ pub const Board = struct {
     /// To clear the position use the `clear` method. This method fails if the piece is empty.
     pub fn set(self: *Board, position: Position, piece: Piece) void {
         std.debug.assert(piece != .empty);
-        self.board_state[position.rank][position.file] = piece;
+        self.squares[position.rank][position.file] = piece;
+        switch (piece) {
+            .white_king => self.king_positions[@intFromEnum(Color.white)] = position,
+            .black_king => self.king_positions[@intFromEnum(Color.black)] = position,
+            else => {},
+        }
     }
 
-    /// Set's the given position to empty. Will be required for en-passant.
     pub fn clear(self: *Board, position: Position) void {
-        const piece = self.board_state[position.rank][position.file];
+        const piece = self.squares[position.rank][position.file];
         std.debug.assert(piece != .white_king and piece != .black_king);
-        self.board_state[position.rank][position.file] = .empty;
+        self.squares[position.rank][position.file] = .empty;
     }
 
     /// Returns the position of the king of the given color.
     /// According to the rules of chess there's always a king on the board for both sides, so this
     /// function is always guaranteed to return as valid position.
     pub fn find_king_position(self: *const Board, color: Color) Position {
-        return self.king_pos[@intFromEnum(color)];
+        return self.king_positions[@intFromEnum(color)];
     }
 
     // Capacity 10 covers the worst case for any piece type: 2 starting rooks/knights plus up to 8
@@ -243,11 +241,11 @@ pub const Board = struct {
     //
     /// Returns every board square occupied by `piece`, in rank-major order. Result Location
     /// Semantics guarantees the returned aggregate is written directly to the caller's destination.
-    pub fn find_piece_position(self: *const Board, piece: Piece) BoundedArray(Position, 10) {
+    pub fn find_piece_positions(self: *const Board, piece: Piece) BoundedArray(Position, 10) {
         std.debug.assert(piece != .empty);
 
         var result: BoundedArray(Position, 10) = .{};
-        for (self.board_state, 0..) |rank, rank_idx| {
+        for (self.squares, 0..) |rank, rank_idx| {
             for (rank, 0..) |board_piece, file_idx| {
                 if (board_piece == piece) {
                     result.append_assume_capacity(.{
@@ -273,13 +271,13 @@ test "move applies piece from source to destination and clears source" {
     const from = Position{ .rank = 1, .file = 4 };
     const to = Position{ .rank = 3, .file = 4 };
 
-    try testing.expectEqual(Piece.white_pawn, board.board_state[from.rank][from.file]);
-    try testing.expectEqual(Piece.empty, board.board_state[to.rank][to.file]);
+    try testing.expectEqual(Piece.white_pawn, board.squares[from.rank][from.file]);
+    try testing.expectEqual(Piece.empty, board.squares[to.rank][to.file]);
 
     board.move(from, to);
 
-    try testing.expectEqual(Piece.empty, board.board_state[from.rank][from.file]);
-    try testing.expectEqual(Piece.white_pawn, board.board_state[to.rank][to.file]);
+    try testing.expectEqual(Piece.empty, board.squares[from.rank][from.file]);
+    try testing.expectEqual(Piece.white_pawn, board.squares[to.rank][to.file]);
 }
 
 test "clear zeroes target square and leaves adjacent squares untouched" {
@@ -289,14 +287,14 @@ test "clear zeroes target square and leaves adjacent squares untouched" {
     const target = Position{ .rank = 0, .file = 3 }; // white queen at d1
 
     // Snapshot neighbours before clearing.
-    const left = board.board_state[0][2]; // c1 bishop
-    const right = board.board_state[0][4]; // e1 king
+    const left = board.squares[0][2]; // c1 bishop
+    const right = board.squares[0][4]; // e1 king
 
     board.clear(target);
 
-    try testing.expectEqual(Piece.empty, board.board_state[target.rank][target.file]);
-    try testing.expectEqual(left, board.board_state[0][2]);
-    try testing.expectEqual(right, board.board_state[0][4]);
+    try testing.expectEqual(Piece.empty, board.squares[target.rank][target.file]);
+    try testing.expectEqual(left, board.squares[0][2]);
+    try testing.expectEqual(right, board.squares[0][4]);
 }
 
 test "move preserves board integrity under a scripted sequence" {
@@ -304,7 +302,7 @@ test "move preserves board integrity under a scripted sequence" {
     board.init();
 
     // Count non-empty pieces at the start — should be 32.
-    const initial_count = countPieces(&board);
+    const initial_count = count_pieces(&board);
     try testing.expectEqual(@as(usize, 32), initial_count);
 
     // Play a short scripted sequence (no captures).
@@ -320,7 +318,7 @@ test "move preserves board integrity under a scripted sequence" {
     }
 
     // No captures — piece count must still be 32.
-    try testing.expectEqual(@as(usize, 32), countPieces(&board));
+    try testing.expectEqual(@as(usize, 32), count_pieces(&board));
 }
 
 test "Piece.glyph returns distinct non-empty UTF-8 for each piece variant" {
@@ -370,20 +368,20 @@ test "find_king_position finds king after it moves e1 -> e2" {
     try testing.expectEqual(@as(u3, 4), pos.file);
 }
 
-test "find_piece_position returns 8 white pawns on rank 1 for starting board" {
+test "find_piece_positions returns 8 white pawns on rank 1 for starting board" {
     var board: Board = undefined;
     board.init();
 
-    const positions = board.find_piece_position(.white_pawn);
+    const positions = board.find_piece_positions(.white_pawn);
     try testing.expectEqual(@as(usize, 8), positions.len);
     for (positions.slice()) |position| {
         try testing.expectEqual(@as(u3, 1), position.rank);
     }
 }
 
-fn countPieces(board: *const Board) usize {
+fn count_pieces(board: *const Board) usize {
     var count: usize = 0;
-    for (board.board_state) |rank| {
+    for (board.squares) |rank| {
         for (rank) |square| {
             if (square != .empty) {
                 count += 1;

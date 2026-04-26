@@ -9,8 +9,7 @@ const Board = @import("../board.zig").Board;
 const Piece = @import("../board.zig").Piece;
 const rules_shared = @import("shared.zig");
 
-/// Verifies whether the king of the player/turn in question is in check or not. Returns bool value,
-/// true if the king is in check, false otherwise.
+/// Verifies whether the king of the player/turn in question is in check or not.
 pub fn in_check(board: *const Board, turn: Color) bool {
     const king_position = board.find_king_position(turn);
 
@@ -47,7 +46,7 @@ pub fn in_check(board: *const Board, turn: Color) bool {
 /// single pass — one `ray_find_piece` per direction, piece type matched against the ray's axis.
 fn is_checked_by_sliding_piece(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
-    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
+    std.debug.assert(board.squares[king_position.rank][king_position.file] == expected_king);
 
     for (rules_shared.ALL_DIRECTIONS) |direction| {
         const piece = rules_shared.ray_find_piece(board, king_position, direction);
@@ -84,7 +83,7 @@ fn is_checked_by_sliding_piece(board: *const Board, king_position: Position, tur
 fn is_checked_by_pawn(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
     // Caller contract: king_position must actually hold the king of the given turn color.
-    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
+    std.debug.assert(board.squares[king_position.rank][king_position.file] == expected_king);
 
     // If the king sits on its forward edge (rank 7 for white, rank 0 for black), there's no
     // rank where an attacking pawn could stand — bail early so the u3 arithmetic below stays safe.
@@ -120,14 +119,14 @@ fn is_checked_by_pawn(board: *const Board, king_position: Position, turn: Color)
     };
 
     for (pawn_threat_directions) |direction| {
-        const file_delta = direction.deltas().file;
-        const f_i8: i8 = @as(i8, @intCast(king_position.file)) + file_delta;
+        const file_delta = direction.delta().file;
+        const target_file: i8 = @as(i8, @intCast(king_position.file)) + file_delta;
 
-        if (f_i8 < 0 or f_i8 > 7) {
+        if (target_file < 0 or target_file > 7) {
             continue;
         }
 
-        if (board.board_state[attacker_rank][@intCast(f_i8)] == enemy_pawn) {
+        if (board.squares[attacker_rank][@intCast(target_file)] == enemy_pawn) {
             return true;
         }
     }
@@ -141,14 +140,14 @@ fn is_checked_by_pawn(board: *const Board, king_position: Position, turn: Color)
 /// enemy king sits on `e5`.
 fn is_checked_by_adjacent_king(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
-    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
+    std.debug.assert(board.squares[king_position.rank][king_position.file] == expected_king);
 
     const enemy_king: Piece = if (turn == .white) .black_king else .white_king;
     const rank: i8 = @intCast(king_position.rank);
     const file: i8 = @intCast(king_position.file);
 
     for (rules_shared.ALL_DIRECTIONS) |direction| {
-        const delta = direction.deltas();
+        const delta = direction.delta();
         const target_rank = rank + delta.rank;
         const target_file = file + delta.file;
 
@@ -156,7 +155,7 @@ fn is_checked_by_adjacent_king(board: *const Board, king_position: Position, tur
             continue;
         }
 
-        if (board.board_state[@intCast(target_rank)][@intCast(target_file)] == enemy_king) {
+        if (board.squares[@intCast(target_rank)][@intCast(target_file)] == enemy_king) {
             return true;
         }
     }
@@ -167,7 +166,7 @@ fn is_checked_by_adjacent_king(board: *const Board, king_position: Position, tur
 /// Returns true if an opponent knight occupies any of the eight L-shaped offsets from the king.
 fn is_checked_by_knight(board: *const Board, king_position: Position, turn: Color) bool {
     const expected_king: Piece = if (turn == .white) .white_king else .black_king;
-    std.debug.assert(board.board_state[king_position.rank][king_position.file] == expected_king);
+    std.debug.assert(board.squares[king_position.rank][king_position.file] == expected_king);
 
     const rank: i8 = @intCast(king_position.rank);
     const file: i8 = @intCast(king_position.file);
@@ -180,7 +179,7 @@ fn is_checked_by_knight(board: *const Board, king_position: Position, turn: Colo
             continue;
         }
 
-        const piece = board.board_state[@intCast(target_rank)][@intCast(target_file)];
+        const piece = board.squares[@intCast(target_rank)][@intCast(target_file)];
 
         if (piece != .empty and piece.color() != turn) {
             switch (piece) {

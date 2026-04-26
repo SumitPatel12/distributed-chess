@@ -7,9 +7,8 @@ const std = @import("std");
 /// No allocator needed — the buffer lives inline at comptime-known size.
 pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
     return struct {
-        buf: [capacity]T = undefined,
-        /// Number of elements currently held in `buf`.
-        /// Also the position where the next append will start.
+        buffer: [capacity]T = undefined,
+        /// Position where the next append will start.
         len: usize = 0,
 
         const Self = @This();
@@ -29,7 +28,7 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
                 return error.Overflow;
             }
 
-            @memcpy(self.buf[self.len .. self.len + items.len], items);
+            @memcpy(self.buffer[self.len .. self.len + items.len], items);
             self.len += items.len;
         }
 
@@ -41,7 +40,7 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
                 return error.Overflow;
             }
 
-            @memset(self.buf[self.len .. self.len + n], value);
+            @memset(self.buffer[self.len .. self.len + n], value);
             self.len += n;
         }
 
@@ -50,7 +49,7 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
         /// rather than returning an error.
         pub fn append_slice_assume_capacity(self: *Self, items: []const T) void {
             std.debug.assert(self.len + items.len <= capacity);
-            @memcpy(self.buf[self.len .. self.len + items.len], items);
+            @memcpy(self.buffer[self.len .. self.len + items.len], items);
             self.len += items.len;
         }
 
@@ -59,21 +58,21 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
         /// there's room for exactly one more.
         pub fn append_assume_capacity(self: *Self, item: T) void {
             std.debug.assert(self.len + 1 <= capacity);
-            self.buf[self.len] = item;
+            self.buffer[self.len] = item;
             self.len += 1;
         }
 
         /// Appends `n` copies of `value`. Capacity is a caller-proven precondition.
         pub fn append_n_times_assume_capacity(self: *Self, value: T, n: usize) void {
             std.debug.assert(self.len + n <= capacity);
-            @memset(self.buf[self.len .. self.len + n], value);
+            @memset(self.buffer[self.len .. self.len + n], value);
             self.len += n;
         }
 
         /// Returns the populated portion of the array.
         pub fn slice(self: *const Self) []const T {
             std.debug.assert(self.len <= capacity);
-            return self.buf[0..self.len];
+            return self.buffer[0..self.len];
         }
     };
 }
@@ -196,15 +195,15 @@ test "append_assume_capacity writes item at buf[len-1] across sequential calls" 
     var array: BoundedArray(u8, 6) = .{};
     array.append_assume_capacity(10);
     try std.testing.expectEqual(@as(usize, 1), array.len);
-    try std.testing.expectEqual(@as(u8, 10), array.buf[0]);
+    try std.testing.expectEqual(@as(u8, 10), array.buffer[0]);
 
     array.append_assume_capacity(20);
     try std.testing.expectEqual(@as(usize, 2), array.len);
-    try std.testing.expectEqual(@as(u8, 20), array.buf[1]);
+    try std.testing.expectEqual(@as(u8, 20), array.buffer[1]);
 
     array.append_assume_capacity(30);
     try std.testing.expectEqual(@as(usize, 3), array.len);
-    try std.testing.expectEqual(@as(u8, 30), array.buf[2]);
+    try std.testing.expectEqual(@as(u8, 30), array.buffer[2]);
 
     try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, array.slice());
 }

@@ -46,21 +46,21 @@ fn handle_sigwinch(_: std.posix.SIG) callconv(.c) void {
 /// Query current terminal window size via ioctl.
 /// Returns null if the ioctl fails or returns zero dimensions.
 fn query_winsize() ?std.posix.winsize {
-    var ws: std.posix.winsize = undefined;
+    var window_size: std.posix.winsize = undefined;
     const rc = std.posix.system.ioctl(
         std.posix.STDOUT_FILENO,
         std.posix.T.IOCGWINSZ,
-        &ws,
+        &window_size,
     );
     if (rc == -1) {
         return null;
     }
 
-    if (ws.row == 0 or ws.col == 0) {
+    if (window_size.row == 0 or window_size.col == 0) {
         return null;
     }
 
-    return ws;
+    return window_size;
 }
 
 /// Struct to control terminal io.
@@ -69,10 +69,9 @@ pub const TerminalIO = struct {
     /// The termios settings of the terminal at the time of initializing the TerminalIO struct.
     original_termios: std.posix.termios,
 
-    /// The window configuration of the terminal at the time of initializing the TerminalIO struct.
-    window_config: std.posix.winsize,
+    /// Current terminal window configuration. Updated by `check_resize` when SIGWINCH fires.
+    window_size: std.posix.winsize,
 
-    /// Tracks whether or not this session is operating in raw mode or not.
     raw_mode_enabled: bool = false,
 
     /// Atomic flag set by the SIGWINCH handler when the terminal is resized.
@@ -82,15 +81,15 @@ pub const TerminalIO = struct {
     /// Registers the SIGWINCH handler for terminal resize detection.
     pub fn init(self: *TerminalIO) !void {
         const original_termios = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-        const window_config = query_winsize() orelse return error.WindowSizeUnavailable;
+        const window_size = query_winsize() orelse return error.WindowSizeUnavailable;
 
         self.* = .{
             .original_termios = original_termios,
-            .window_config = window_config,
+            .window_size = window_size,
             .raw_mode_enabled = false,
         };
 
-        std.debug.assert(self.window_config.row > 0 and self.window_config.col > 0);
+        std.debug.assert(self.window_size.row > 0 and self.window_size.col > 0);
         std.debug.assert(!self.raw_mode_enabled);
 
         // Wire up the file-scope pointer so the signal handler can reach our flag.
@@ -106,7 +105,6 @@ pub const TerminalIO = struct {
         std.posix.sigaction(.WINCH, &act, null);
     }
 
-    /// Enables raw mode input processing.
     pub fn enable_raw_mode(self: *TerminalIO) !void {
         std.debug.assert(!self.raw_mode_enabled);
 
@@ -207,14 +205,14 @@ pub const TerminalIO = struct {
     }
 
     /// Checks if a terminal resize occurred since the last check. If so, re-queries the window size
-    /// and updates window_config. Returns the new winsize, or null if no resize happened.
+    /// and updates window_size. Returns the new winsize, or null if no resize happened.
     pub fn check_resize(self: *TerminalIO) ?std.posix.winsize {
         // Atomically read and clear the flag in one operation, preventing a race where a second
         // SIGWINCH arrives between a separate load and store.
         if (self.resize_pending.swap(false, .acquire)) {
-            if (query_winsize()) |ws| {
-                self.window_config = ws;
-                return ws;
+            if (query_winsize()) |window_size| {
+                self.window_size = window_size;
+                return window_size;
             }
         }
         return null;
@@ -234,9 +232,9 @@ pub const TerminalIO = struct {
         std.debug.assert(self.raw_mode_enabled);
 
         while (true) {
-            if (self.check_resize()) |new_ws| {
+            if (self.check_resize()) |new_window_size| {
                 if (on_resize) |callback| {
-                    callback(new_ws);
+                    callback(new_window_size);
                 }
             }
 
@@ -275,7 +273,6 @@ pub const TerminalIO = struct {
         }
     }
 
-    /// Write out given buffer to the terminal.
     pub fn write(self: *const TerminalIO, buffer: []const u8) isize {
         _ = self;
         std.debug.assert(buffer.len > 0);
@@ -287,11 +284,11 @@ pub const TerminalIO = struct {
 
 test "check_resize returns null when no resize pending and consumes the flag on read" {
     // We can test the pure atomic-flag logic by constructing a TerminalIO with
-    // zeroed fields — check_resize only touches resize_pending and window_config,
+    // zeroed fields — check_resize only touches resize_pending and window_size,
     // both of which we set up here. No pty required.
     var io: TerminalIO = undefined;
     io.resize_pending = std.atomic.Value(bool).init(false);
-    io.window_config = std.mem.zeroes(std.posix.winsize);
+    io.window_size = std.mem.zeroes(std.posix.winsize);
 
     // No resize pending → null.
     try std.testing.expectEqual(@as(?std.posix.winsize, null), io.check_resize());

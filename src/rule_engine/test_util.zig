@@ -11,25 +11,25 @@ const Position = shared.Position;
 /// Returns a board with every square set to `.empty`. Tests that only care about one or two
 /// pieces pair this with `place` to avoid the noise of a full starting position.
 ///
-/// Caller contract: `king_pos` is intentionally left `undefined`. Every test that calls
+/// Caller contract: `king_positions` is intentionally left `undefined`. Every test that calls
 /// `in_check`, `preview_move`, `piece_legal_moves`, or any other routine that reads the king
 /// cache MUST first `place` both a `.white_king` and a `.black_king` on the board — `place`
 /// updates the cache in sync. Skipping this is a test-author bug that will trip safety
 /// assertions on first use.
 pub fn empty_board() Board {
     return .{
-        .board_state = .{.{.empty} ** 8} ** 8,
-        .king_pos = undefined,
+        .squares = .{.{.empty} ** 8} ** 8,
+        .king_positions = undefined,
     };
 }
 
-/// Sets `board.board_state[pos.rank][pos.file] = piece`. Useful for building hand-crafted
+/// Sets `board.squares[pos.rank][pos.file] = piece`. Useful for building hand-crafted
 /// positions in tests.
 pub fn place(board: *Board, piece: Piece, position: Position) void {
-    board.board_state[position.rank][position.file] = piece;
+    board.squares[position.rank][position.file] = piece;
     switch (piece) {
-        .white_king => board.king_pos[@intFromEnum(shared.Color.white)] = position,
-        .black_king => board.king_pos[@intFromEnum(shared.Color.black)] = position,
+        .white_king => board.king_positions[@intFromEnum(shared.Color.white)] = position,
+        .black_king => board.king_positions[@intFromEnum(shared.Color.black)] = position,
         else => {},
     }
 }

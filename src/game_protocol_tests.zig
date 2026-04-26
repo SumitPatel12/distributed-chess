@@ -186,10 +186,10 @@ test "Arm 2: matching remote_ack commits, transitions to remote_turn, emits rend
 
     const out = drive_event(&game, .{ .remote_ack = 1 });
 
-    try testing.expectEqual(Piece.empty, game.board.board_state[1][4]);
-    try testing.expectEqual(Piece.white_pawn, game.board.board_state[3][4]);
+    try testing.expectEqual(Piece.empty, game.board.squares[1][4]);
+    try testing.expectEqual(Piece.white_pawn, game.board.squares[3][4]);
     try testing.expectEqual(Color.black, game.turn);
-    try testing.expectEqual(@as(u32, 2), game.expected_seq);
+    try testing.expectEqual(@as(u32, 2), game.expected_sequence_number);
 
     switch (game.state) {
         .playing => |playing| switch (playing) {
@@ -223,12 +223,12 @@ test "Arm 2: ack with non-matching seq bumps retry_count and emits request_resyn
     }
 
     // Board untouched — commit didn't run.
-    try testing.expectEqual(Piece.white_pawn, game.board.board_state[1][4]);
+    try testing.expectEqual(Piece.white_pawn, game.board.squares[1][4]);
 
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
         .request_resync => |req| {
-            try testing.expectEqual(@as(u32, 1), req.last_known_seq);
+            try testing.expectEqual(@as(u32, 1), req.last_known_sequence_number);
             try testing.expectEqual(@as(?game_mod.NackReason, null), req.peer_nack_reason);
         },
         else => try testing.expect(false),
@@ -279,7 +279,7 @@ test "Arm 3: nack bumps retry_count and emits request_resync with peer_nack_reas
     _ = drive_event(&game, local_play(e2_e4));
 
     const out = drive_event(&game, .{ .remote_nack = .{
-        .seq = 1,
+        .sequence_number = 1,
         .reason = .state_desync,
     } });
 
@@ -294,7 +294,7 @@ test "Arm 3: nack bumps retry_count and emits request_resync with peer_nack_reas
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
         .request_resync => |req| {
-            try testing.expectEqual(@as(u32, 1), req.last_known_seq);
+            try testing.expectEqual(@as(u32, 1), req.last_known_sequence_number);
             try testing.expectEqual(@as(?game_mod.NackReason, .state_desync), req.peer_nack_reason);
         },
         else => try testing.expect(false),
@@ -312,7 +312,7 @@ test "Arm 2+3: ack mismatches and nacks share retry_count on the same proposal" 
 
     _ = drive_event(&game, .{ .remote_ack = 999 });
     _ = drive_event(&game, .{ .remote_ack = 999 });
-    _ = drive_event(&game, .{ .remote_nack = .{ .seq = 1, .reason = .illegal_move } });
+    _ = drive_event(&game, .{ .remote_nack = .{ .sequence_number = 1, .reason = .illegal_move } });
 
     switch (game.state) {
         .playing => |playing| switch (playing) {
@@ -340,8 +340,8 @@ test "Arm 4: legal remote_proposal commits, emits send_ack + render, transitions
     };
     const out = drive_event(&game, .{ .remote_proposal = entry });
 
-    try testing.expectEqual(Piece.empty, game.board.board_state[1][4]);
-    try testing.expectEqual(Piece.white_pawn, game.board.board_state[3][4]);
+    try testing.expectEqual(Piece.empty, game.board.squares[1][4]);
+    try testing.expectEqual(Piece.white_pawn, game.board.squares[3][4]);
     try testing.expectEqual(Color.black, game.turn);
 
     switch (game.state) {
@@ -389,7 +389,7 @@ test "Arm 4: illegal remote_proposal emits send_nack{illegal_move}, state unchan
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
         .send_nack => |nack| {
-            try testing.expectEqual(@as(u32, 1), nack.seq);
+            try testing.expectEqual(@as(u32, 1), nack.sequence_number);
             try testing.expectEqual(game_mod.NackReason.illegal_move, nack.reason);
         },
         else => try testing.expect(false),
@@ -402,7 +402,7 @@ test "Arm 4: remote_proposal with seq mismatch emits send_nack{state_desync}" {
 
     const e2_e4 = Move{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } };
     const entry = LogEntry{
-        // expected_seq is 1, but the proposal claims 5 — desync.
+        // expected_sequence_number is 1, but the proposal claims 5 — desync.
         .sequence_number = 5,
         .move_number = 1,
         .issued_by = .white,
@@ -414,7 +414,7 @@ test "Arm 4: remote_proposal with seq mismatch emits send_nack{state_desync}" {
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
         .send_nack => |nack| {
-            try testing.expectEqual(@as(u32, 5), nack.seq);
+            try testing.expectEqual(@as(u32, 5), nack.sequence_number);
             try testing.expectEqual(game_mod.NackReason.state_desync, nack.reason);
         },
         else => try testing.expect(false),
@@ -497,7 +497,7 @@ test "Arm 6: local_command in game_over emits local_rejected{game_ended}" {
     }
 }
 
-test "Arm 6: local_promotion_choice in local_turn emits local_rejected{unsolocited_promotion_choice}" {
+test "Arm 6: local_promotion_choice in local_turn emits local_rejected{unsolicited_promotion_choice}" {
     var game: Game = undefined;
     game.init(.white);
 
@@ -509,7 +509,7 @@ test "Arm 6: local_promotion_choice in local_turn emits local_rejected{unsolocit
 
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
-        .local_rejected => |rej| try testing.expectEqual(game_mod.LocalRejectionReason.unsolocited_promotion_choice, rej.reason),
+        .local_rejected => |rej| try testing.expectEqual(game_mod.LocalRejectionReason.unsolicited_promotion_choice, rej.reason),
         else => try testing.expect(false),
     }
 }
@@ -538,7 +538,7 @@ test "top-level retry: unsolicited remote_ack in local_turn bumps counter and em
     try testing.expectEqual(@as(usize, 1), out.len);
     switch (out.slice()[0]) {
         .request_resync => |req| {
-            try testing.expectEqual(@as(u32, 1), req.last_known_seq);
+            try testing.expectEqual(@as(u32, 1), req.last_known_sequence_number);
             try testing.expectEqual(@as(?game_mod.NackReason, null), req.peer_nack_reason);
         },
         else => try testing.expect(false),

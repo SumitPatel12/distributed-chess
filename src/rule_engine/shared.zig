@@ -37,7 +37,7 @@ pub const Direction = enum {
     //
     // TODO: Check what are the implications if any of using i2.
     /// Returns the delta for navigation in that direction.
-    pub fn deltas(self: Direction) struct { rank: i2, file: i2 } {
+    pub fn delta(self: Direction) struct { rank: i2, file: i2 } {
         return switch (self) {
             .north => .{ .rank = 1, .file = 0 },
             .south => .{ .rank = -1, .file = 0 },
@@ -93,7 +93,7 @@ pub const BLACK_PAWN_CAPTURE_DIRECTIONS: [2]Direction = .{ .south_east, .south_w
 /// Searchs in 8 directions with deltas give as +-1 or 0 for both rank files.
 pub fn ray_find_piece(board: *const Board, start: Position, direction: Direction) Piece {
     // Get the delta for the direction and tick by one so we're not on the starting position.
-    const delta = direction.deltas();
+    const delta = direction.delta();
 
     // We need i8's because our rank and file's are 0-7 and if we go with u8 or some other
     // variant, the bounds check become a bit complicated since wrap arounds can happen.
@@ -103,7 +103,7 @@ pub fn ray_find_piece(board: *const Board, start: Position, direction: Direction
 
     while (rank >= 0 and rank <= 7 and file >= 0 and file <= 7) {
         // intCast since indexing requires a usize.
-        const piece = board.board_state[@intCast(rank)][@intCast(file)];
+        const piece = board.squares[@intCast(rank)][@intCast(file)];
         if (piece != .empty) {
             return piece;
         }
@@ -129,7 +129,7 @@ pub fn collect_ray_moves(
     turn: Color,
     out: *BoundedArray(Move, MAX_LEGAL_MOVES),
 ) void {
-    const delta = direction.deltas();
+    const delta = direction.delta();
 
     // i8 for the same reason ray_find_piece uses it: u3/u8 wrap on negatives, so bounds checks get
     // awkward. With i8 we just guard `< 0` and `> 7`.
@@ -139,7 +139,7 @@ pub fn collect_ray_moves(
     while (rank >= 0 and rank <= 7 and file >= 0 and file <= 7) {
         const target_rank: u3 = @intCast(rank);
         const target_file: u3 = @intCast(file);
-        const piece = board.board_state[target_rank][target_file];
+        const piece = board.squares[target_rank][target_file];
 
         if (piece == .empty) {
             out.append_assume_capacity(.{

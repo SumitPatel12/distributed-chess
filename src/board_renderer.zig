@@ -17,14 +17,13 @@ pub const BoardRenderer = struct {
     /// Rendering state. Cell dimensions live inside `.ok` so they can't be queried when the
     /// terminal is too small to hold a board; in the `.too_small` case we carry the offending
     /// window size so the fallback render can show the user how far off they are.
-    state: State,
+    layout: Layout,
 
     /// Highlights legal moves/squares once a piece is selected
     board_overlay: u64,
 
-    /// Buffer for building the rendered board frame. Takes care of storing the byte sequence
-    /// used to render the board to the terminal.
-    writer: BoundedArray(u8, RENDER_BUFFER_SIZE) = .{},
+    /// Buffer for building the rendered board frame.
+    buffer: BoundedArray(u8, RENDER_BUFFER_SIZE) = .{},
 
     /// The perspective from which the board will be rendered. Defaults to White.
     /// Whichever is selected will be drawn on the lower side of the screen.
@@ -63,22 +62,22 @@ pub const BoardRenderer = struct {
         height: u16,
     };
 
-    const State = union(enum) {
+    const Layout = union(enum) {
         ok: CellDimensions,
         too_small: std.posix.winsize,
     };
 
-    pub fn init(self: *BoardRenderer, window_config: std.posix.winsize) void {
+    pub fn init(self: *BoardRenderer, window_size: std.posix.winsize) void {
         self.* = .{
-            .state = resolve_state(window_config),
+            .layout = compute_layout(window_size),
             .board_overlay = 0,
-            .writer = .{},
+            .buffer = .{},
             .perspective = .white,
         };
 
         std.debug.assert(self.perspective == .white);
         std.debug.assert(self.board_overlay == 0);
-        std.debug.assert(self.writer.len == 0);
+        std.debug.assert(self.buffer.len == 0);
     }
 
     /// Flips the perspective of the board. Doesn't redraw.
@@ -92,17 +91,17 @@ pub const BoardRenderer = struct {
 
     /// Picks the largest allowed cell size that fits in the current terminal window, or null if
     /// even the smallest size doesn't fit.
-    fn compute_cell_dimensions(ws: std.posix.winsize) ?CellDimensions {
+    fn compute_cell_dimensions(window_size: std.posix.winsize) ?CellDimensions {
         // Horizontal overhead: 3-col rank margin on each side = 6 cols.
         // Vertical overhead: 2 file-letter rows + 2 title rows + 2 spacer rows = 6 rows.
-        if (ws.col < MIN_COLS or ws.row < MIN_ROWS) {
+        if (window_size.col < MIN_COLS or window_size.row < MIN_ROWS) {
             return null;
         }
-        std.debug.assert(ws.col >= MIN_COLS);
-        std.debug.assert(ws.row >= MIN_ROWS);
+        std.debug.assert(window_size.col >= MIN_COLS);
+        std.debug.assert(window_size.row >= MIN_ROWS);
 
-        const max_w: u16 = (ws.col - 6) / 8;
-        const max_h: u16 = (ws.row - 6) / 8;
+        const max_w: u16 = (window_size.col - 6) / 8;
+        const max_h: u16 = (window_size.row - 6) / 8;
 
         for (ALLOWED_SIZES) |size| {
             if (size.width <= max_w and size.height <= max_h) {
@@ -113,35 +112,35 @@ pub const BoardRenderer = struct {
         return null;
     }
 
-    fn resolve_state(ws: std.posix.winsize) State {
-        if (compute_cell_dimensions(ws)) |dims| {
-            return .{ .ok = dims };
+    fn compute_layout(window_size: std.posix.winsize) Layout {
+        if (compute_cell_dimensions(window_size)) |cell_dimensions| {
+            return .{ .ok = cell_dimensions };
         }
-        return .{ .too_small = ws };
+        return .{ .too_small = window_size };
     }
 
     /// Re-computes cell dimensions after a terminal resize.
-    pub fn resize(self: *BoardRenderer, window_config: std.posix.winsize) void {
-        self.state = resolve_state(window_config);
+    pub fn resize(self: *BoardRenderer, window_size: std.posix.winsize) void {
+        self.layout = compute_layout(window_size);
     }
 
     /// Writes file letters (a..h) center aligned to cell width.
-    fn write_file_labels(self: *BoardRenderer, dims: CellDimensions) void {
-        std.debug.assert(dims.width >= 3);
+    fn write_file_labels(self: *BoardRenderer, cell_dimensions: CellDimensions) void {
+        std.debug.assert(cell_dimensions.width >= 3);
 
-        self.writer.append_slice_assume_capacity("   ");
-        const padding: usize = (dims.width - 1) / 2;
+        self.buffer.append_slice_assume_capacity("   ");
+        const padding: usize = (cell_dimensions.width - 1) / 2;
         const letters = switch (self.perspective) {
             .white => "abcdefgh",
             .black => "hgfedcba",
         };
 
         for (letters) |ch| {
-            self.writer.append_n_times_assume_capacity(' ', padding);
-            self.writer.append_slice_assume_capacity(&[_]u8{ch});
-            self.writer.append_n_times_assume_capacity(' ', padding);
+            self.buffer.append_n_times_assume_capacity(' ', padding);
+            self.buffer.append_slice_assume_capacity(&[_]u8{ch});
+            self.buffer.append_n_times_assume_capacity(' ', padding);
         }
-        self.writer.append_slice_assume_capacity("\r\n");
+        self.buffer.append_slice_assume_capacity("\r\n");
     }
 
     /// Builds the rendered buffer and returns it. Returns either the board frame or, when the
@@ -169,24 +168,24 @@ pub const BoardRenderer = struct {
         //
         // Sub millisecond times are not detectable by human eye. If you can, I think you're in the
         // wrong career. You shouldn't be reading this code heh.
-        self.writer.reset();
-        std.debug.assert(self.writer.len == 0);
+        self.buffer.reset();
+        std.debug.assert(self.buffer.len == 0);
 
-        switch (self.state) {
-            .ok => |dims| self.create_board_buffer(&game.board, dims),
-            .too_small => |ws| self.create_too_small_buffer(ws),
+        switch (self.layout) {
+            .ok => |cell_dimensions| self.write_board_frame(&game.board, cell_dimensions),
+            .too_small => |window_size| self.write_too_small_frame(window_size),
         }
-        std.debug.assert(self.writer.len > 0);
-        return self.writer.slice();
+        std.debug.assert(self.buffer.len > 0);
+        return self.buffer.slice();
     }
 
-    fn create_board_buffer(self: *BoardRenderer, board: *const Board, dims: CellDimensions) void {
-        std.debug.assert(dims.width >= 3);
-        std.debug.assert(dims.height >= 1);
+    fn write_board_frame(self: *BoardRenderer, board: *const Board, cell_dimensions: CellDimensions) void {
+        std.debug.assert(cell_dimensions.width >= 3);
+        std.debug.assert(cell_dimensions.height >= 1);
 
         // Board row = 3-col side margin + 8 * w-col cells + 3-col side margin.
         // Centered 5-char label: (total - 5) / 2 spaces of left padding.
-        const total_width: usize = 6 + 8 * dims.width;
+        const total_width: usize = 6 + 8 * cell_dimensions.width;
         // Lower bound matches MIN_COLS: smallest cell width in ALLOWED_SIZES is 3, so
         // 6 + 8*3 = 30 — the same threshold compute_cell_dimensions uses to admit a
         // CellDimensions, which is why reaching this branch guarantees the assert holds.
@@ -207,28 +206,28 @@ pub const BoardRenderer = struct {
         const clear_and_home = terminal_io.EscapeSequences.CLEAR_SCREEN ++
             terminal_io.EscapeSequences.CLEAR_SCROLLBACK ++
             terminal_io.EscapeSequences.SET_CURSOR_TO_HOME;
-        self.writer.append_slice_assume_capacity(clear_and_home);
-        self.writer.append_n_times_assume_capacity(' ', label_padding_len);
-        self.writer.append_slice_assume_capacity(top_label);
+        self.buffer.append_slice_assume_capacity(clear_and_home);
+        self.buffer.append_n_times_assume_capacity(' ', label_padding_len);
+        self.buffer.append_slice_assume_capacity(top_label);
 
-        self.write_file_labels(dims);
+        self.write_file_labels(cell_dimensions);
 
-        self.write_rank_and_pieces(board, dims);
+        self.write_rank_and_pieces(board, cell_dimensions);
 
-        self.write_file_labels(dims);
+        self.write_file_labels(cell_dimensions);
 
-        self.writer.append_slice_assume_capacity("\r\n");
-        self.writer.append_n_times_assume_capacity(' ', label_padding_len);
-        self.writer.append_slice_assume_capacity(bottom_label);
+        self.buffer.append_slice_assume_capacity("\r\n");
+        self.buffer.append_n_times_assume_capacity(' ', label_padding_len);
+        self.buffer.append_slice_assume_capacity(bottom_label);
     }
 
-    /// Writes a centered "terminal too small" fallback frame. Shows the minimum dimensions
+    /// Writes a centered "terminal too small" fallback frame. Showindow_size the minimum dimensions
     /// alongside the current window size so the user knows how much to grow the terminal.
-    fn create_too_small_buffer(self: *BoardRenderer, ws: std.posix.winsize) void {
+    fn write_too_small_frame(self: *BoardRenderer, window_size: std.posix.winsize) void {
         const clear_and_home = terminal_io.EscapeSequences.CLEAR_SCREEN ++
             terminal_io.EscapeSequences.CLEAR_SCROLLBACK ++
             terminal_io.EscapeSequences.SET_CURSOR_TO_HOME;
-        self.writer.append_slice_assume_capacity(clear_and_home);
+        self.buffer.append_slice_assume_capacity(clear_and_home);
 
         const line1 = "Terminal too small";
         var line2_storage: [64]u8 = undefined;
@@ -237,18 +236,18 @@ pub const BoardRenderer = struct {
         const line2 = std.fmt.bufPrint(
             &line2_storage,
             "Need at least {d}x{d}, got {d}x{d}",
-            .{ MIN_COLS, MIN_ROWS, ws.col, ws.row },
+            .{ MIN_COLS, MIN_ROWS, window_size.col, window_size.row },
         ) catch unreachable;
 
         // ANSI cursor positions are 1-based. Center 3 lines of content (line1, blank, line2).
         const content_rows: u16 = 3;
-        const top: u16 = if (ws.row > content_rows) (ws.row - content_rows) / 2 + 1 else 1;
+        const top: u16 = if (window_size.row > content_rows) (window_size.row - content_rows) / 2 + 1 else 1;
 
-        self.write_cursor_move(top, centered_col(ws.col, line1.len));
-        self.writer.append_slice_assume_capacity(line1);
+        self.write_cursor_move(top, centered_col(window_size.col, line1.len));
+        self.buffer.append_slice_assume_capacity(line1);
 
-        self.write_cursor_move(top + 2, centered_col(ws.col, line2.len));
-        self.writer.append_slice_assume_capacity(line2);
+        self.write_cursor_move(top + 2, centered_col(window_size.col, line2.len));
+        self.buffer.append_slice_assume_capacity(line2);
     }
 
     /// Column at which `content_len` bytes would sit centered within `total_cols`. Falls back to
@@ -266,13 +265,13 @@ pub const BoardRenderer = struct {
     fn write_cursor_move(self: *BoardRenderer, row: u16, col: u16) void {
         var buf: [16]u8 = undefined;
         // Max output is `\x1b[65535;65535H` at 14 bytes, fits the 16-byte backing buffer.
-        const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ row, col }) catch unreachable;
-        self.writer.append_slice_assume_capacity(seq);
+        const escape_sequence = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ row, col }) catch unreachable;
+        self.buffer.append_slice_assume_capacity(escape_sequence);
     }
 
     /// Returns the foreground SGR sequence that should precede the glyph for
     /// this piece. Empty returns "" since nothing is drawn.
-    fn piece_fg(piece: Piece) []const u8 {
+    fn piece_fg_color(piece: Piece) []const u8 {
         return switch (piece) {
             .empty => "",
             .white_pawn,
@@ -302,9 +301,9 @@ pub const BoardRenderer = struct {
     /// board coordinates is the only thing that depends on perspective:
     ///   White: rank = 7 - row_draw, file = col_draw      (rank 8 on top, file a on left)
     ///   Black: rank = row_draw,     file = 7 - col_draw  (rank 1 on top, file h on left)
-    fn write_rank_and_pieces(self: *BoardRenderer, board: *const Board, dims: CellDimensions) void {
-        std.debug.assert(dims.width >= 3);
-        std.debug.assert(dims.height >= 1);
+    fn write_rank_and_pieces(self: *BoardRenderer, board: *const Board, cell_dimensions: CellDimensions) void {
+        std.debug.assert(cell_dimensions.width >= 3);
+        std.debug.assert(cell_dimensions.height >= 1);
 
         const rank_margins = [_][]const u8{
             " 1 ",
@@ -317,8 +316,8 @@ pub const BoardRenderer = struct {
             " 8 ",
         };
 
-        const mid_sub: usize = dims.height / 2;
-        const padding: usize = (dims.width - 1) / 2;
+        const mid_sub_row: usize = cell_dimensions.height / 2;
+        const padding: usize = (cell_dimensions.width - 1) / 2;
 
         for (0..8) |row_draw| {
             const rank: usize = switch (self.perspective) {
@@ -327,11 +326,11 @@ pub const BoardRenderer = struct {
             };
 
             var sub_row: usize = 0;
-            while (sub_row < dims.height) : (sub_row += 1) {
+            while (sub_row < cell_dimensions.height) : (sub_row += 1) {
                 // Rank digit on the middle sub-row only, blank margin otherwise.
-                const side_margin = if (sub_row == mid_sub) rank_margins[rank] else "   ";
+                const side_margin = if (sub_row == mid_sub_row) rank_margins[rank] else "   ";
 
-                self.writer.append_slice_assume_capacity(side_margin);
+                self.buffer.append_slice_assume_capacity(side_margin);
 
                 for (0..8) |col_draw| {
                     const file: usize = switch (self.perspective) {
@@ -339,23 +338,23 @@ pub const BoardRenderer = struct {
                         .black => 7 - col_draw,
                     };
 
-                    const piece = board.board_state[rank][file];
+                    const piece = board.squares[rank][file];
                     const bg = if ((rank + file) % 2 == 0) LIGHT_BG else DARK_BG;
-                    self.writer.append_slice_assume_capacity(bg);
-                    if (sub_row == mid_sub) {
-                        self.writer.append_n_times_assume_capacity(' ', padding);
-                        self.writer.append_slice_assume_capacity(piece_fg(piece));
-                        self.writer.append_slice_assume_capacity(piece.glyph());
-                        self.writer.append_n_times_assume_capacity(' ', padding);
+                    self.buffer.append_slice_assume_capacity(bg);
+                    if (sub_row == mid_sub_row) {
+                        self.buffer.append_n_times_assume_capacity(' ', padding);
+                        self.buffer.append_slice_assume_capacity(piece_fg_color(piece));
+                        self.buffer.append_slice_assume_capacity(piece.glyph());
+                        self.buffer.append_n_times_assume_capacity(' ', padding);
                     } else {
-                        self.writer.append_n_times_assume_capacity(' ', dims.width);
+                        self.buffer.append_n_times_assume_capacity(' ', cell_dimensions.width);
                     }
                 }
 
                 // The labeling is on both sides.
-                self.writer.append_slice_assume_capacity(RESET);
-                self.writer.append_slice_assume_capacity(side_margin);
-                self.writer.append_slice_assume_capacity("\r\n");
+                self.buffer.append_slice_assume_capacity(RESET);
+                self.buffer.append_slice_assume_capacity(side_margin);
+                self.buffer.append_slice_assume_capacity("\r\n");
             }
         }
     }
@@ -385,18 +384,18 @@ test "compute_cell_dimensions returns null when window too small" {
 }
 
 test "compute_cell_dimensions returns non-null above threshold" {
-    const dims = BoardRenderer.compute_cell_dimensions(make_winsize(30, 14));
-    try testing.expect(dims != null);
-    try testing.expectEqual(@as(u16, 3), dims.?.width);
-    try testing.expectEqual(@as(u16, 1), dims.?.height);
+    const cell_dimensions = BoardRenderer.compute_cell_dimensions(make_winsize(30, 14));
+    try testing.expect(cell_dimensions != null);
+    try testing.expectEqual(@as(u16, 3), cell_dimensions.?.width);
+    try testing.expectEqual(@as(u16, 1), cell_dimensions.?.height);
 }
 
 test "compute_cell_dimensions picks largest fitting size" {
     // 6 + 8*11 = 94 cols, 6 + 8*5 = 46 rows → should pick 11x5
-    const dims = BoardRenderer.compute_cell_dimensions(make_winsize(94, 46));
-    try testing.expect(dims != null);
-    try testing.expectEqual(@as(u16, 11), dims.?.width);
-    try testing.expectEqual(@as(u16, 5), dims.?.height);
+    const cell_dimensions = BoardRenderer.compute_cell_dimensions(make_winsize(94, 46));
+    try testing.expect(cell_dimensions != null);
+    try testing.expectEqual(@as(u16, 11), cell_dimensions.?.width);
+    try testing.expectEqual(@as(u16, 5), cell_dimensions.?.height);
 }
 
 test "centered_col(80, 10) == 36" {
@@ -410,10 +409,10 @@ test "centered_col returns 1 when content wider than window" {
 }
 
 test "resolve_state transitions between ok and too_small at the boundary" {
-    const too_small = BoardRenderer.resolve_state(make_winsize(10, 10));
+    const too_small = BoardRenderer.compute_layout(make_winsize(10, 10));
     try testing.expect(too_small == .too_small);
 
-    const ok = BoardRenderer.resolve_state(make_winsize(30, 14));
+    const ok = BoardRenderer.compute_layout(make_winsize(30, 14));
     try testing.expect(ok == .ok);
 }
 
@@ -443,9 +442,9 @@ test "draw produces non-empty output and begins with expected ANSI prelude" {
 
 test "piece_fg differs for white vs black same-role pieces" {
     // White and black pieces must receive different foreground SGR sequences.
-    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg(.white_pawn), BoardRenderer.piece_fg(.black_pawn)));
-    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg(.white_king), BoardRenderer.piece_fg(.black_king)));
+    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg_color(.white_pawn), BoardRenderer.piece_fg_color(.black_pawn)));
+    try testing.expect(!std.mem.eql(u8, BoardRenderer.piece_fg_color(.white_king), BoardRenderer.piece_fg_color(.black_king)));
 
     // Empty piece should have an empty fg string.
-    try testing.expectEqual(@as(usize, 0), BoardRenderer.piece_fg(.empty).len);
+    try testing.expectEqual(@as(usize, 0), BoardRenderer.piece_fg_color(.empty).len);
 }
