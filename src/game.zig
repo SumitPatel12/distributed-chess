@@ -347,17 +347,40 @@ pub const Game = struct {
             error.InvalidMove => return err,
         };
 
-        // Rejected here, not inside apply_effect: both play_move (castling_rights assignment
-        // below) and apply_effect (pre-switch board.move + en_passant_square reset) mutate state
-        // before a `.promotion` arm would run. Erroring from either spot would leave the game
-        // half-applied; gating up front keeps the reject path mutation-free.
         if (move_effect == .promotion) {
             return error.PromotionNotSupported;
         }
 
-        // Snapshot the mover's piece identity BEFORE `apply_effect` mutates the board — the 50-move
-        // clock below needs to know whether this was a pawn move, and the source square is about to
-        // change.
+        const log_entry = LogEntry{
+            .sequence_number = self.expected_seq,
+            .move_number = self.fullmove_number,
+            .issued_by = self.local_color,
+            .command = .{
+                .play = .{
+                    .move = move,
+                    .promotion = null,
+                },
+            },
+            .time_taken_ms = 0,
+        };
+
+        const verdict = self.commit(log_entry, move_effect);
+        if (verdict) |game_verdict| {
+            self.state = .{ .game_over = game_verdict };
+        }
+    }
+
+    /// Commits the effects of the move to the board, and updates the relevant fields.
+    /// In case of a terminal state returns an optional GameOver struct. It's the caller's
+    /// responsibility to update the game state to represent the terminal state.
+    fn commit(self: *Game, log_entry: LogEntry, move_effect: MoveEffect) ?GameOver {
+        const move = switch (log_entry.command) {
+            .play => |play| play.move,
+            else => unreachable,
+        };
+
+        // Snapshot the mover's piece identity BEFORE `board.move` below mutates the source square
+        // — the 50-move clock further down needs to know whether this was a pawn move.
         const moving_piece = self.board.board_state[move.from.rank][move.from.file];
         const is_pawn_move = moving_piece == .white_pawn or moving_piece == .black_pawn;
 
@@ -368,80 +391,18 @@ pub const Game = struct {
             move_effect,
             self.castling_rights,
         );
-        self.apply_effect(move, move_effect);
-
-        // 50-move / draw-claim clock: resets on any pawn move or capture, bumps otherwise.
-        // `.en_passant` and `.pawn_double_push` both imply a pawn mover (covered by `is_pawn_move`);
-        // `.capture` is the only reset path that can fire for a non-pawn.
-        if (is_pawn_move or move_effect == .capture) {
-            self.halfmove_clock = 0;
-        } else {
-            self.halfmove_clock += 1;
-        }
-
-        // Fullmove number bumps once per full round of play — after black completes a ply. Checked
-        // before the turn flip below so "it was black's move just now".
-        if (self.turn == .black) {
-            self.fullmove_number += 1;
-        }
-
-        // TODO: This should likely be something a game effect would enforce, not sure, keeping
-        // as is for now for testing purposes.
-        self.turn = switch (self.turn) {
-            .black => .white,
-            .white => .black,
-        };
-
-        self.position_hash.append_assume_capacity(zobrist.hash_state(
-            &self.board,
-            self.turn,
-            self.castling_rights,
-            self.en_passant_square,
-        ));
-
-        // TODO: final_seq should align with the RSM seq lifecycle once it's wired end-to-end.
-        // Priority: checkmate > stalemate > 75-move auto-draw.
-        if (rules_engine.is_checkmate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
-            self.state = .{
-                .game_over = .{
-                    .result = .checkmate,
-                    .winner = self.turn.opponent(),
-                    .final_seq = self.expected_seq,
-                },
-            };
-        } else if (rules_engine.is_stalemate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
-            self.state = .{
-                .game_over = .{
-                    .result = .stalemate,
-                    .winner = null,
-                    .final_seq = self.expected_seq,
-                },
-            };
-        } else if (self.halfmove_clock >= 150) {
-            self.state = .{
-                .game_over = .{
-                    .result = .draw_seventy_five_moves,
-                    .winner = null,
-                    .final_seq = self.expected_seq,
-                },
-            };
-        }
-    }
-
-    /// Applies the move effect to the game.
-    fn apply_effect(self: *Game, move: Move, effect: MoveEffect) void {
         self.board.move(move.from, move.to);
 
         // En-passant target is a one-ply window: only valid immediately after a double push.
         // Reset here; the pawn_double_push arm below re-sets it to the square the pawn passed over.
         self.en_passant_square = null;
 
-        switch (effect) {
+        switch (move_effect) {
             .capture => |captured_piece| self.append_captured_piece(captured_piece),
-            // play_move rejects `.promotion` with error.PromotionNotSupported before this
-            // switch runs — reaching here means the guard was removed without wiring up
-            // the promotion apply logic (pawn clear + promoted-piece set + captured-piece
-            // append conditional on ep.capture). Keep these linked so the TODO can't rot.
+            // play_move rejects `.promotion` with error.PromotionNotSupported before commit
+            // runs — reaching here means the guard was removed without wiring up the
+            // promotion apply logic (pawn clear + promoted-piece set + captured-piece append
+            // conditional on ep.capture). Keep these linked so the TODO can't rot.
             .promotion => unreachable,
             .en_passant => |ep| {
                 const captured_pawn: Piece = switch (self.turn) {
@@ -472,6 +433,61 @@ pub const Game = struct {
             // We've already moved the piece at the start, there are no other side effects.
             .move_only => {},
         }
+
+        // 50-move / draw-claim clock: resets on any pawn move or capture, bumps otherwise.
+        // `.en_passant` and `.pawn_double_push` both imply a pawn mover (covered by `is_pawn_move`);
+        // `.capture` is the only reset path that can fire for a non-pawn.
+        if (is_pawn_move or move_effect == .capture) {
+            self.halfmove_clock = 0;
+        } else {
+            self.halfmove_clock += 1;
+        }
+
+        // Fullmove number bumps once per full round of play — after black completes a ply. Checked
+        // before the turn flip below so "it was black's move just now".
+        if (self.turn == .black) {
+            self.fullmove_number += 1;
+        }
+
+        // TODO: This should likely be something a game effect would enforce, not sure, keeping
+        // as is for now for testing purposes.
+        self.turn = switch (self.turn) {
+            .black => .white,
+            .white => .black,
+        };
+
+        self.position_hash.append_assume_capacity(zobrist.hash_state(
+            &self.board,
+            self.turn,
+            self.castling_rights,
+            self.en_passant_square,
+        ));
+        self.command_log.append_assume_capacity(log_entry);
+        self.expected_seq += 1;
+
+        // TODO: final_seq should align with the RSM seq lifecycle once it's wired end-to-end.
+        // Priority: checkmate > stalemate > 75-move auto-draw.
+        if (rules_engine.is_checkmate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
+            return GameOver{
+                .result = .checkmate,
+                .winner = self.turn.opponent(),
+                .final_seq = log_entry.sequence_number,
+            };
+        } else if (rules_engine.is_stalemate(&self.board, self.turn, self.castling_rights, self.en_passant_square)) {
+            return GameOver{
+                .result = .stalemate,
+                .winner = null,
+                .final_seq = log_entry.sequence_number,
+            };
+        } else if (self.halfmove_clock >= 150) {
+            return GameOver{
+                .result = .draw_seventy_five_moves,
+                .winner = null,
+                .final_seq = log_entry.sequence_number,
+            };
+        }
+
+        return null;
     }
 
     fn append_captured_piece(self: *Game, piece: Piece) void {
@@ -586,7 +602,7 @@ test "play_move returns InvalidMove when source square is empty" {
 
 test "play_move: black plays en-passant after white double-push, victim removed and recorded" {
     // Minimal fixture: both kings + the two pawns involved. Goes through the full game
-    // state machine — preview_move detects en-passant, apply_effect removes the victim
+    // state machine — preview_move detects en-passant, commit removes the victim
     // and appends to captures_by_black, the trailing switch clears the ep window.
     var game: Game = undefined;
     game.init(.white);
@@ -636,7 +652,7 @@ test "play_move: regular capture appends the victim to captures_by_<turn>" {
 }
 
 test "play_move: en_passant_square clears after a non-double-push reply to a double push" {
-    // Regression guard for the trailing switch in apply_effect — drop the `else => null`
+    // Regression guard for the trailing switch in commit — drop the `else => null`
     // arm and a stale ep target survives indefinitely. Two-move sequence (1. e4, 1... a6)
     // proves the clear leg fires for any non-double-push effect.
     var game: Game = undefined;
@@ -652,7 +668,7 @@ test "play_move: en_passant_square clears after a non-double-push reply to a dou
 }
 
 test "play_move: white kingside castling moves king + rook and clears both white rights" {
-    // End-to-end: preview_move → apply_effect (castling arm moves the rook) → castling_rights_after
+    // End-to-end: preview_move → commit (castling arm moves the rook) → castling_rights_after
     // clears both white flags. Black rights must be untouched.
     var game: Game = undefined;
     game.init(.white);
@@ -905,7 +921,7 @@ test "play_move: a non-mating move keeps the game in playing state" {
 test "play_move: replays the Immortal Game and detects Be7# as checkmate at move 45" {
     // Anderssen vs Kieseritzky, London 1851. 44 plies in `.playing` state plus a 45th mating
     // ply played separately. Mirrors the bench's IMMORTAL_GAME sequence. End-to-end coverage
-    // of the engine: 45 ply through preview_move + apply_effect across captures, sacrifices,
+    // of the engine: 45 ply through preview_move + commit across captures, sacrifices,
     // knight forks, with a real checkmate at the end that exercises the new `is_checkmate`
     // plumbing.
     const game_moves = [_]Move{

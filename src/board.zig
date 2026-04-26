@@ -214,6 +214,16 @@ pub const Board = struct {
         }
     }
 
+    /// Sets the given position on the board to the given piece.
+    /// It is the callers responsibility to ensure that the board doesn't end up in a illegal state
+    /// after calling this method.
+    ///
+    /// To clear the position use the `clear` method. This method fails if the piece is empty.
+    pub fn set(self: *Board, position: Position, piece: Piece) void {
+        std.debug.assert(piece != .empty);
+        self.board_state[position.rank][position.file] = piece;
+    }
+
     /// Set's the given position to empty. Will be required for en-passant.
     pub fn clear(self: *Board, position: Position) void {
         const piece = self.board_state[position.rank][position.file];
