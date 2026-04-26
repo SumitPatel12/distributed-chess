@@ -750,11 +750,28 @@ pub const Game = struct {
 
         switch (move_effect) {
             .capture => |captured_piece| self.append_captured_piece(captured_piece),
-            // play_move rejects `.promotion` with error.PromotionNotSupported before commit
-            // runs — reaching here means the guard was removed without wiring up the
-            // promotion apply logic (pawn clear + promoted-piece set + captured-piece append
-            // conditional on ep.capture). Keep these linked so the TODO can't rot.
-            .promotion => unreachable,
+            .promotion => |promotion| {
+                if (promotion.capture) |captured_piece| {
+                    self.append_captured_piece(captured_piece);
+                }
+
+                const promotion_piece = log_entry.command.play.promotion.?;
+                const is_dark_square = (@as(u4, move.to.rank) + @as(u4, move.to.file)) % 2 == 0;
+                self.board.board_state[move.to.rank][move.to.file] = switch (self.turn) {
+                    .white => switch (promotion_piece) {
+                        .queen => .white_queen,
+                        .rook => .white_rook,
+                        .knight => .white_knight,
+                        .bishop => if (is_dark_square) .white_bishop_dark else .white_bishop_light,
+                    },
+                    .black => switch (promotion_piece) {
+                        .queen => .black_queen,
+                        .rook => .black_rook,
+                        .knight => .black_knight,
+                        .bishop => if (is_dark_square) .black_bishop_dark else .black_bishop_light,
+                    },
+                };
+            },
             .en_passant => |ep| {
                 const captured_pawn: Piece = switch (self.turn) {
                     .white => .black_pawn,
