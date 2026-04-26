@@ -64,6 +64,12 @@ pub const Playing = union(enum) {
         retry_count: u8 = 0,
     },
 
+    /// Awaiting the users input for the selecting the pawns promotion piece.
+    awaiting_promotion_piece: struct {
+        pending_move: Move,
+        issued_at_ms: u32,
+    },
+
     /// A draw has been offered and we're waiting on the other side to accept/decline.
     /// `offered_by` is the color that sent the offer — either side can be the offerer
     /// (both replicas enter this state on the same command, differing only in local_color).
@@ -182,6 +188,13 @@ pub const GameEvent = union(enum) {
         now_ms: u32,
     },
 
+    /// The local player has chosen a promotion piece for a pawn.
+    local_promotion_choice: struct {
+        piece: PromotionPiece,
+        think_time_ms: u32,
+        now_ms: u32,
+    },
+
     remote_proposal: LogEntry,
 
     /// The sequence number of the log entry/move that's being acknowledged by the opponent.
@@ -206,6 +219,12 @@ pub const GameEffect = union(enum) {
     local_rejected: struct { reason: LocalRejectionReason },
     render,
     game_ended: GameResult,
+    prompt_for_promotion: struct { color: Color },
+
+    request_resync: struct {
+        last_known_seq: u32,
+        peer_nack_reason: ?NackReason,
+    },
 
     /// Starts the auto timer when the opponent disconnects. The current player is directly awarded
     /// the win if the opponent fails to reconnect within a certain time period.
@@ -265,6 +284,10 @@ pub const Game = struct {
     /// sending them the logs.
     command_log: BoundedArray(LogEntry, MAX_LOG),
 
+    /// Keeps track of the number of unexpected events received, panics when they reach the threshold
+    /// of `MAX_UNEXPECTED_EVENTS` for a given iteration.
+    unexpected_event_count: u8 = 0,
+
     /// Upper bound on effects emitted by a single tick(). 16 leaves headroom for paths that
     /// stack multiple effects (e.g. send_ack + apply + render + game_ended + start_*_timer).
     const MAX_EFFECTS = 16;
@@ -272,6 +295,14 @@ pub const Game = struct {
     /// Upper bound on command-log and position-hash entries. 512 is ample for a real chess
     /// game (longest practical games run ~300 half-moves; the fifty-move rule caps growth).
     const MAX_LOG = 512;
+
+    /// Shared cap on resync attempts for a single proposal — counts any mix of ack-seq mismatches
+    /// and peer nacks. Past this we panic; recovery has failed enough times that staying live risks
+    /// compounding the divergence.
+    const MAX_RETRIES: u8 = 3;
+
+    /// Max number of unexpected events acceptable per iteration.
+    const MAX_UNEXPECTED_EVENTS: u8 = 3;
 
     /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
@@ -297,9 +328,24 @@ pub const Game = struct {
             .castling_rights = .{},
             .en_passant_square = null,
             .command_log = .{},
+            .unexpected_event_count = 0,
         };
         self.board.init();
         self.position_hash.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
+    }
+
+    fn handle_unexpected_event(self: *Game, out: *BoundedArray(GameEffect, MAX_EFFECTS)) void {
+        if (self.unexpected_event_count >= MAX_UNEXPECTED_EVENTS) {
+            @panic("too many unexpected events");
+        }
+
+        self.unexpected_event_count += 1;
+        out.append_assume_capacity(.{
+            .request_resync = .{
+                .last_known_seq = self.expected_seq,
+                .peer_nack_reason = null,
+            },
+        });
     }
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
@@ -311,21 +357,326 @@ pub const Game = struct {
         std.debug.assert(self.expected_seq >= 1);
         std.debug.assert(self.position_hash.len <= MAX_LOG);
 
-        _ = event;
-        _ = out;
-
         switch (self.state) {
             .playing => |playing| switch (playing) {
-                .local_turn => {},
-                .remote_turn => {},
-                .proposing => |proposal| {
-                    _ = proposal;
+                .local_turn => switch (event) {
+                    .local_command => |payload| switch (payload.command) {
+                        .play => |play| self.handle_local_play(play, payload.think_time_ms, payload.now_ms, out),
+                        else => @panic("non-play GameCommand variants not yet implemented in tick"),
+                    },
+                    .local_promotion_choice => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .unsolocited_promotion_choice,
+                            },
+                        });
+                    },
+                    .remote_ack, .remote_nack => self.handle_unexpected_event(out),
+                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
+                    else => {
+                        // TODO: Add other arms.
+                    },
+                },
+                .remote_turn => switch (event) {
+                    .remote_proposal => |entry| self.handle_remote_proposal(entry, out),
+                    .local_command => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .out_of_turn,
+                            },
+                        });
+                    },
+                    .local_promotion_choice => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .unsolocited_promotion_choice,
+                            },
+                        });
+                    },
+                    .remote_ack, .remote_nack => {
+                        self.handle_unexpected_event(out);
+                    },
+                    else => {},
+                },
+                .proposing => |proposal| switch (event) {
+                    .remote_ack => |acked_seq| self.handle_remote_ack(proposal, acked_seq, out),
+                    .remote_nack => |nack| self.handle_remote_nack(proposal, nack, out),
+                    .local_command => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .already_proposing,
+                            },
+                        });
+                    },
+                    .local_promotion_choice => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .unsolocited_promotion_choice,
+                            },
+                        });
+                    },
+                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
+                    else => {},
+                },
+                .awaiting_promotion_piece => |held| switch (event) {
+                    .local_promotion_choice => |choice| self.handle_promotion_choice(held, choice, out),
+                    .local_command => {
+                        out.append_assume_capacity(.{
+                            .local_rejected = .{
+                                .reason = .awiaiting_promotion_piece,
+                            },
+                        });
+                    },
+                    .remote_ack, .remote_nack => {
+                        self.handle_unexpected_event(out);
+                    },
+                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
+                    else => {
+                        // TODO: Handle other arms.
+                    },
                 },
                 .awaiting_draw_response => {},
             },
-            .paused_disconnected => {},
-            .game_over => {},
+            .paused_disconnected => switch (event) {
+                .local_command, .local_promotion_choice => {
+                    out.append_assume_capacity(.{
+                        .local_rejected = .{ .reason = .game_ended },
+                    });
+                },
+                else => {},
+            },
+            .game_over => switch (event) {
+                .local_command, .local_promotion_choice => {
+                    out.append_assume_capacity(.{
+                        .local_rejected = .{ .reason = .game_ended },
+                    });
+                },
+                .remote_ack, .remote_nack, .remote_proposal => self.handle_unexpected_event(out),
+                else => {},
+            },
         }
+    }
+
+    fn handle_local_play(
+        self: *Game,
+        play: @FieldType(GameCommand, "play"),
+        think_time_ms: u32,
+        now_ms: u32,
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        const move_effect = rules_engine.preview_move(
+            &self.board,
+            self.turn,
+            play.move,
+            self.castling_rights,
+            self.en_passant_square,
+        ) catch |err| switch (err) {
+            error.InvalidMove => {
+                out.append_assume_capacity(.{ .local_rejected = .{ .reason = .illegal_move } });
+                return;
+            },
+        };
+
+        if (move_effect == .promotion and play.promotion == null) {
+            self.state = .{
+                .playing = .{
+                    .awaiting_promotion_piece = .{
+                        .pending_move = play.move,
+                        .issued_at_ms = now_ms,
+                    },
+                },
+            };
+            out.append_assume_capacity(.{ .prompt_for_promotion = .{ .color = self.local_color } });
+            self.unexpected_event_count = 0;
+            return;
+        }
+
+        const log_entry = LogEntry{
+            .sequence_number = self.expected_seq,
+            .move_number = self.fullmove_number,
+            .issued_by = self.local_color,
+            .command = .{ .play = play },
+            .time_taken_ms = think_time_ms,
+        };
+        self.submit_proposal(log_entry, now_ms, out);
+    }
+
+    fn handle_promotion_choice(
+        self: *Game,
+        held: @FieldType(Playing, "awaiting_promotion_piece"),
+        choice: @FieldType(GameEvent, "local_promotion_choice"),
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        const log_entry = LogEntry{
+            .sequence_number = self.expected_seq,
+            .move_number = self.fullmove_number,
+            .issued_by = self.local_color,
+            .command = .{
+                .play = .{
+                    .move = held.pending_move,
+                    .promotion = choice.piece,
+                },
+            },
+            .time_taken_ms = choice.think_time_ms,
+        };
+        self.submit_proposal(log_entry, held.issued_at_ms, out);
+    }
+
+    /// Arm: `playing.proposing × remote_ack`. On matching seq, re-derives the MoveEffect on
+    /// the (still unchanged) local board, commits, and transitions to `remote_turn` (or
+    /// `game_over`). On mismatched seq the proposal is alive but the peer's view drifted —
+    /// bump the retry counter and request a resync, or panic if the budget is exhausted.
+    fn handle_remote_ack(
+        self: *Game,
+        proposal: @FieldType(Playing, "proposing"),
+        acked_seq: u32,
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        if (acked_seq != proposal.pending.sequence_number) {
+            if (proposal.retry_count < MAX_RETRIES) {
+                self.request_resync(proposal, null, out);
+            } else {
+                @panic("desync recovery exhausted: ack seq mismatch");
+            }
+            return;
+        }
+
+        // Pre-issue validation already accepted this move on this exact board, so preview
+        // can't refuse it now — any error here means a real invariant break, not a
+        // recoverable rejection.
+        const move_effect = rules_engine.preview_move(
+            &self.board,
+            self.turn,
+            proposal.pending.command.play.move,
+            self.castling_rights,
+            self.en_passant_square,
+        ) catch unreachable;
+
+        const verdict = self.commit(proposal.pending, move_effect);
+
+        if (verdict) |game_over| {
+            self.state = .{ .game_over = game_over };
+            out.append_assume_capacity(.render);
+            out.append_assume_capacity(.{ .game_ended = game_over.result });
+        } else {
+            self.state = .{ .playing = .remote_turn };
+            out.append_assume_capacity(.render);
+        }
+        self.unexpected_event_count = 0;
+    }
+
+    /// Arm: `playing.proposing × remote_nack`. Any nack is a divergence signal regardless of
+    /// `nack.seq` — peer rejected the proposal so our state is suspect. Reuse Arm 2's
+    /// shared retry budget (any mix of seq mismatches and nacks counts toward the same
+    /// MAX_RETRIES cap), pass the peer's reason through for the wire layer to pick a
+    /// recovery strategy, or panic when the budget is exhausted.
+    fn handle_remote_nack(
+        self: *Game,
+        proposal: @FieldType(Playing, "proposing"),
+        nack: @FieldType(GameEvent, "remote_nack"),
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        if (proposal.retry_count < MAX_RETRIES) {
+            self.request_resync(proposal, nack.reason, out);
+        } else {
+            @panic("desync recovery exhausted: peer nack");
+        }
+    }
+
+    /// Arm: `playing.remote_turn × remote_proposal`. Receive-side mirror of Arms 1+2:
+    /// validate seq, validate via the rule engine, commit, then ack and transition to
+    /// `local_turn` (or `game_over`). Commit deliberately runs BEFORE `send_ack` — local
+    /// state must be consistent before the peer is told their move landed; otherwise a
+    /// crash between ack and apply would leave the peer thinking we're ahead when we
+    /// aren't.
+    fn handle_remote_proposal(
+        self: *Game,
+        entry: LogEntry,
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        if (entry.sequence_number != self.expected_seq) {
+            out.append_assume_capacity(.{
+                .send_nack = .{
+                    .seq = entry.sequence_number,
+                    .reason = .state_desync,
+                },
+            });
+            return;
+        }
+
+        const move_effect = rules_engine.preview_move(
+            &self.board,
+            self.turn,
+            entry.command.play.move,
+            self.castling_rights,
+            self.en_passant_square,
+        ) catch |err| switch (err) {
+            error.InvalidMove => {
+                out.append_assume_capacity(.{
+                    .send_nack = .{
+                        .seq = entry.sequence_number,
+                        .reason = .illegal_move,
+                    },
+                });
+                return;
+            },
+        };
+
+        const verdict = self.commit(entry, move_effect);
+
+        out.append_assume_capacity(.{ .send_ack = entry.sequence_number });
+
+        if (verdict) |game_over| {
+            self.state = .{ .game_over = game_over };
+            out.append_assume_capacity(.render);
+            out.append_assume_capacity(.{ .game_ended = game_over.result });
+        } else {
+            self.state = .{ .playing = .local_turn };
+            out.append_assume_capacity(.render);
+        }
+        self.unexpected_event_count = 0;
+    }
+
+    /// Bumps the proposal's `retry_count` and emits a `request_resync` effect carrying the
+    /// peer's nack reason (null when triggered by an ack-seq mismatch instead of a nack).
+    /// Shared between Arm 2 (ack mismatch) and Arm 3 (peer nack) — they fund the same
+    /// retry budget.
+    fn request_resync(
+        self: *Game,
+        proposal: @FieldType(Playing, "proposing"),
+        peer_nack_reason: ?NackReason,
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        self.state = .{ .playing = .{ .proposing = .{
+            .pending = proposal.pending,
+            .proposed_at_ms = proposal.proposed_at_ms,
+            .retry_count = proposal.retry_count + 1,
+        } } };
+        out.append_assume_capacity(.{ .request_resync = .{
+            .last_known_seq = proposal.pending.sequence_number,
+            .peer_nack_reason = peer_nack_reason,
+        } });
+    }
+
+    /// Transitions to `playing.proposing` with the given entry and emits the `send_proposal`
+    /// effect.
+    fn submit_proposal(
+        self: *Game,
+        entry: LogEntry,
+        proposed_at_ms: u32,
+        out: *BoundedArray(GameEffect, MAX_EFFECTS),
+    ) void {
+        self.state = .{
+            .playing = .{
+                .proposing = .{
+                    .pending = entry,
+                    .proposed_at_ms = proposed_at_ms,
+                    .retry_count = 0,
+                },
+            },
+        };
+        out.append_assume_capacity(.{ .send_proposal = entry });
+        self.unexpected_event_count = 0;
     }
 
     /// Tries to play the inputted move. If it's a legal move updates the board position and handles
@@ -1018,6 +1369,43 @@ test "play_move: replays the Immortal Game and detects Be7# as checkmate at move
             try std.testing.expectEqual(GameResult.checkmate, over.result);
             try std.testing.expectEqual(@as(?Color, .white), over.winner);
         },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "tick: local_command with legal play transitions to proposing and emits send_proposal" {
+    // Smoke test for tick — same rationale as the play_move smoke tests above. Drives the
+    // local_turn → local_command → .play arm so Zig analyzes the body; without a caller,
+    // signature/field bugs in the arm sit undetected (e.g. a wrong GameEffect variant or a
+    // value passed where a pointer is expected won't surface until something reaches it).
+    var game: Game = undefined;
+    game.init(.white);
+
+    var out: BoundedArray(GameEffect, Game.MAX_EFFECTS) = .{};
+    const event = GameEvent{ .local_command = .{
+        .command = .{ .play = .{
+            .move = .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } },
+            .promotion = null,
+        } },
+        .think_time_ms = 0,
+        .now_ms = 0,
+    } };
+    game.tick(event, &out);
+
+    switch (game.state) {
+        .playing => |playing| switch (playing) {
+            .proposing => |prop| {
+                try std.testing.expectEqual(@as(u32, 1), prop.pending.sequence_number);
+                try std.testing.expectEqual(Color.white, prop.pending.issued_by);
+            },
+            else => try std.testing.expect(false),
+        },
+        else => try std.testing.expect(false),
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    switch (out.slice()[0]) {
+        .send_proposal => |entry| try std.testing.expectEqual(@as(u32, 1), entry.sequence_number),
         else => try std.testing.expect(false),
     }
 }
