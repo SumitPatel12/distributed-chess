@@ -18,7 +18,7 @@ pub fn main() !void {
 
     var game: Game = undefined;
     game.init(.white);
-    std.debug.assert(game.player_color == .white);
+    std.debug.assert(game.local_color == .white);
 
     var renderer: BoardRenderer = undefined;
     renderer.init(io.window_config);

@@ -54,24 +54,15 @@ pub const GameResult = enum {
     disconnect_both,
 };
 
-/// It's this players turn.
-pub const LocalTurn = enum {
-    /// The player has yet to make a move.
-    idle,
-
-    /// The player has made his move and is waiting for acknowledgement from the opponent.
-    proposing,
-};
-
-/// It's the opponents turn to move, we're just waiting on them.
-pub const RemoteTurn = enum {
-    waiting,
-};
-
 /// Playing represents either local or opponents turn, depending on whose turn it is.
 pub const Playing = union(enum) {
-    local_turn: LocalTurn,
-    remote_turn: RemoteTurn,
+    local_turn,
+    remote_turn,
+    proposing: struct {
+        pending: LogEntry,
+        proposed_at_ms: u32,
+        retry_count: u8 = 0,
+    },
 
     /// A draw has been offered and we're waiting on the other side to accept/decline.
     /// `offered_by` is the color that sent the offer — either side can be the offerer
@@ -86,6 +77,12 @@ pub const PausedDisconnected = struct {
     deadline_ms: u32,
 };
 
+pub const GameOver = struct {
+    result: GameResult,
+    winner: ?Color,
+    final_seq: u32,
+};
+
 /// The state of the game. Can be playing, ended, or disconnected.
 const GameState = union(enum) {
     /// The game is still ongoing.
@@ -98,7 +95,7 @@ const GameState = union(enum) {
     /// command that ended the game — used for rematch setup (start from final_seq + 1), for
     /// persistence, and for disambiguating commands that share a move_number (e.g. a move
     /// and a resignation both issued during move 30 are distinct commands, distinct seqs).
-    game_over: struct { result: GameResult, winner: ?Color, final_seq: u32 },
+    game_over: GameOver,
 };
 
 pub const DrawClaim = enum {
@@ -107,7 +104,7 @@ pub const DrawClaim = enum {
 };
 
 pub const GameCommand = union(enum) {
-    move: struct { move: Move, promotion: ?PromotionPiece },
+    play: struct { move: Move, promotion: ?PromotionPiece },
     resign,
     offer_draw,
     accept_draw,
@@ -137,6 +134,18 @@ pub const LogEntry = struct {
     time_taken_ms: u32,
 };
 
+pub const LocalRejectionReason = enum {
+    illegal_move,
+    out_of_turn,
+    already_proposing,
+    game_ended,
+    awiaiting_promotion_piece,
+
+    /// Represents a rejection when a promotion piece choice arrives outside of
+    /// awaiting_promotion_piece.
+    unsolocited_promotion_choice,
+};
+
 pub const NackReason = enum {
     illegal_move,
     out_of_turn,
@@ -163,7 +172,16 @@ pub const WireMessage = union(enum) {
 };
 
 pub const GameEvent = union(enum) {
-    local_command: GameCommand,
+    local_command: struct {
+        command: GameCommand,
+
+        /// Amount of time player took to make this move.
+        think_time_ms: u32,
+
+        /// The Loop's clock at dispatch. Used when proposing a move.
+        now_ms: u32,
+    },
+
     remote_proposal: LogEntry,
 
     /// The sequence number of the log entry/move that's being acknowledged by the opponent.
@@ -185,6 +203,7 @@ pub const GameEffect = union(enum) {
     send_proposal: LogEntry,
     send_ack: u32,
     send_nack: Nack,
+    local_rejected: struct { reason: LocalRejectionReason },
     render,
     game_ended: GameResult,
 
@@ -202,8 +221,11 @@ pub const Game = struct {
     /// Stores whose turn it is, either black or white.
     turn: Color,
 
-    /// What player does this game instance belong to, either black or white.
-    player_color: Color,
+    // I bounced between player_color and local_color and local_color seems the better option. After
+    // sketching out the rule engine and all it was getting quite easy to conflate the name
+    // `player_color` with some other things.
+    /// The color of the local/process owning player.
+    local_color: Color,
 
     // Description copied with care from the internet :p
     /// A full move consists of two consecutive turns—one by White and one by Black—whereas a
@@ -238,6 +260,11 @@ pub const Game = struct {
     /// advance. Cleared on every move that doesn't create a new en-passant target.
     en_passant_square: ?Position,
 
+    /// Keeps track of each command fired. Includes the moves, draw offers, etc.
+    /// Can be replayed to get to the same state. Will be used to get an observer up to speed by
+    /// sending them the logs.
+    command_log: BoundedArray(LogEntry, MAX_LOG),
+
     /// Upper bound on effects emitted by a single tick(). 16 leaves headroom for paths that
     /// stack multiple effects (e.g. send_ack + apply + render + game_ended + start_*_timer).
     const MAX_EFFECTS = 16;
@@ -249,26 +276,27 @@ pub const Game = struct {
     /// Returns the initial game state based on the color of the pieces.
     pub fn initial_state(color: Color) GameState {
         return switch (color) {
-            .white => GameState{ .playing = .{ .local_turn = .idle } },
-            .black => GameState{ .playing = .{ .remote_turn = .waiting } },
+            .white => GameState{ .playing = .local_turn },
+            .black => GameState{ .playing = .remote_turn },
         };
     }
 
     /// Initializes the Game struct in place.
-    pub fn init(self: *Game, player_color: Color) void {
+    pub fn init(self: *Game, local_color: Color) void {
         self.* = .{
             .board = undefined,
-            .state = initial_state(player_color),
+            .state = initial_state(local_color),
             .turn = .white,
             .halfmove_clock = 0,
             .fullmove_number = 1,
-            .player_color = player_color,
+            .local_color = local_color,
             .captures_by_white = .{},
             .captures_by_black = .{},
             .position_hash = .{},
             .expected_seq = 1,
             .castling_rights = .{},
             .en_passant_square = null,
+            .command_log = .{},
         };
         self.board.init();
         self.position_hash.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
@@ -278,30 +306,26 @@ pub const Game = struct {
     /// and tracked state and returns the side-effects.
     ///
     /// For now invalid events will end in panic, will be handled down the line.
-    pub fn tick(self: *Game, event: GameEvent) BoundedArray(GameEffect, MAX_EFFECTS) {
+    pub fn tick(self: *Game, event: GameEvent, out: *BoundedArray(GameEffect, MAX_EFFECTS)) void {
         // TODO: Wire up logic for each event
         std.debug.assert(self.expected_seq >= 1);
         std.debug.assert(self.position_hash.len <= MAX_LOG);
 
         _ = event;
-        const effects: BoundedArray(GameEffect, MAX_EFFECTS) = .{};
+        _ = out;
 
         switch (self.state) {
             .playing => |playing| switch (playing) {
-                .local_turn => |local_turn| switch (local_turn) {
-                    .idle => {},
-                    .proposing => {},
-                },
-                .remote_turn => |remote_turn| switch (remote_turn) {
-                    .waiting => {},
+                .local_turn => {},
+                .remote_turn => {},
+                .proposing => |proposal| {
+                    _ = proposal;
                 },
                 .awaiting_draw_response => {},
             },
             .paused_disconnected => {},
             .game_over => {},
         }
-
-        return effects;
     }
 
     /// Tries to play the inputted move. If it's a legal move updates the board position and handles
@@ -469,14 +493,14 @@ test "intial state white returns local turn idle" {
     var game: Game = undefined;
     game.init(.white);
 
-    try std.testing.expectEqual(GameState{ .playing = .{ .local_turn = .idle } }, game.state);
+    try std.testing.expectEqual(GameState{ .playing = .local_turn }, game.state);
 }
 
 test "intial state black returns remote turn waiting" {
     var game: Game = undefined;
     game.init(.black);
 
-    try std.testing.expectEqual(GameState{ .playing = .{ .remote_turn = .waiting } }, game.state);
+    try std.testing.expectEqual(GameState{ .playing = .remote_turn }, game.state);
 }
 
 test "init sets board state to initial board state" {
