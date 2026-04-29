@@ -17,7 +17,9 @@ pub fn main() !void {
     defer io.restore_termios();
 
     var game: Game = undefined;
-    game.init(.white);
+    // game_id is cluster-assigned via CREATE_GAME. 0 here is a placeholder until the main loop
+    // wires up handshake + CREATE_GAME against a real coord cluster.
+    game.init(0, .white);
     std.debug.assert(game.local_color == .white);
 
     var renderer: BoardRenderer = undefined;

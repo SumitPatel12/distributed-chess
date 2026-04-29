@@ -54,50 +54,56 @@ pub const GameResult = enum {
     disconnect_both,
 };
 
-/// Playing represents either local or opponents turn, depending on whose turn it is.
-pub const Playing = union(enum) {
-    local_turn,
-    remote_turn,
-    proposing: struct {
-        pending: LogEntry,
-        proposed_at_ms: u32,
-        retry_count: u8 = 0,
-    },
+pub const GameOver = struct {
+    result: GameResult,
+    winner: ?Color,
+    /// Pins the exact RSM command that ended the game — used for rematch setup
+    /// (start from final_sequence_number + 1), for persistence, and for disambiguating commands
+    /// that share a move_number (e.g. a move and a resignation both issued during move 30 are
+    /// distinct commands, distinct seqs).
+    final_sequence_number: u32,
+};
 
-    /// Awaiting the users input for the selecting the pawns promotion piece.
+/// In-flight transaction the player is participating in. Held while waiting for the cluster's
+/// COMMIT or ABORT after the player voted yes on PREPARE. From `prepared` onward the player can
+/// never voluntarily abort — the durable `prepared(seq)` record commits us to honoring the cluster's
+/// eventual decision.
+pub const InFlight = struct {
+    sequence_number: u32,
+    entry: LogEntry,
+    /// Predicted zobrist after applying `entry.command`. Sent in VOTE; the cluster cross-checks
+    /// against followers and the opponent's predicted hash before deciding COMMIT vs ABORT.
+    my_post_apply_zobrist: u64,
+    prepared_at_ms: u32,
+};
+
+pub const PlayerState = union(enum) {
+    /// Not currently in a transaction. Local input flows from here on our turn; PREPAREs for
+    /// either side's move land here too.
+    idle,
+
+    /// User picked a move that requires a promotion piece. Holding the half-formed move until
+    /// the user supplies the piece, then we SUBMIT.
     awaiting_promotion_piece: struct {
         pending_move: Move,
         issued_at_ms: u32,
     },
 
-    /// A draw has been offered and we're waiting on the other side to accept/decline.
-    /// `offered_by` is the color that sent the offer — either side can be the offerer
-    /// (both replicas enter this state on the same command, differing only in local_color).
-    /// Any move by the offerer implicitly withdraws the offer; any move by the other side
-    /// implicitly declines.
-    awaiting_draw_response: struct { offered_by: Color },
-};
+    /// SUBMIT sent; waiting for PREPARE from the leader.
+    awaiting_prepare: struct {
+        submitted_command: GameCommand,
+        submitted_at_ms: u32,
+    },
 
-pub const PausedDisconnected = struct {
-    was: Playing,
-    deadline_ms: u32,
-};
+    /// Voted yes; fsynced `prepared(seq)`. Waiting for COMMIT or ABORT.
+    prepared: InFlight,
 
-pub const GameOver = struct {
-    result: GameResult,
-    winner: ?Color,
-    final_sequence_number: u32,
-};
+    /// Cluster (or the leader specifically) unreachable. Reconnect goes via HELLO + RESUME_GAME,
+    /// so we don't snapshot any prior protocol substate here — the durable log is the source of
+    /// truth on reconnect.
+    paused_disconnected: struct { deadline_ms: u32 },
 
-const GameState = union(enum) {
-    playing: Playing,
-
-    paused_disconnected: PausedDisconnected,
-
-    /// Game is over with the result stored in the enum. `final_sequence_number` pins the exact RSM
-    /// command that ended the game — used for rematch setup (start from final_sequence_number + 1), for
-    /// persistence, and for disambiguating commands that share a move_number (e.g. a move
-    /// and a resignation both issued during move 30 are distinct commands, distinct seqs).
+    /// Game is over with the result stored in the inner struct.
     game_over: GameOver,
 };
 
@@ -115,7 +121,8 @@ pub const GameCommand = union(enum) {
     claim_draw: DrawClaim,
 };
 
-/// For the RSM to keep in sync. Sent to the opponent while making a move.
+/// The canonical RSM command record. Carried inside PREPARE; on the coord side every committed
+/// LogEntry maps to one Raft log entry.
 pub const LogEntry = struct {
     /// Monotonically increasing sequence number for ordering.
     sequence_number: u32,
@@ -130,15 +137,26 @@ pub const LogEntry = struct {
     // measure is how much time was spent on a move and the clock is decremented based off of that
     // metric, when you think like that sending the delta makes more sense.
     //
-    /// Duration the player spent on this move.
+    /// Duration the player spent on this move. UI hint — the coord's `commit_ts_ms` is the
+    /// authoritative timestamp for the commit.
     time_taken_ms: u32,
 };
 
 pub const LocalRejectionReason = enum {
     illegal_move,
     out_of_turn,
-    already_proposing,
+
+    /// A new SUBMIT-bound action was attempted while we already have an in-flight transaction
+    /// (awaiting_prepare or prepared).
+    already_in_flight,
+
     game_ended,
+
+    /// Cluster (or the leader specifically) is currently unreachable. Distinct from `game_ended`:
+    /// the game is still live, the player just can't progress until reconnect or until the
+    /// disconnect-grace timer expires and converts this into a real game-over.
+    disconnected,
+
     awaiting_promotion_piece,
 
     /// Represents a rejection when a promotion piece choice arrives outside of
@@ -146,29 +164,65 @@ pub const LocalRejectionReason = enum {
     unsolicited_promotion_choice,
 };
 
+/// VOTE-no rejection reason.
 pub const NackReason = enum {
     illegal_move,
-    out_of_turn,
 
-    /// Receiver's state diverged from sender's — the command was valid on the sender's view
-    /// but not on the receiver's. Triggers the resync recovery path (request_resync effect,
-    /// transition to paused_disconnected). Not a bug — a distributed-systems runtime condition.
-    state_desync,
+    /// PREPARE's `prior_state_hash` doesn't match our local zobrist — our state diverged from
+    /// the leader's.
+    prior_state_drift,
+
+    /// PREPARE's seq isn't `expected_sequence_number`.
+    seq_gap,
+
+    /// PREPARE's `entry.issued_by` doesn't match the player whose turn it is.
+    wrong_issuer,
 };
 
-pub const Nack = struct {
+/// Reason the leader carries in an ABORT message.
+pub const AbortReason = enum {
+    player_voted_no,
+    vote_timeout,
+    zobrist_mismatch,
+    coordinator_rejected,
+    stepped_down,
+    manual,
+};
+
+pub const Vote = enum { yes, no };
+
+/// Authoritative chess clock state delivered by the coord on every COMMIT. The player holds it
+/// for rendering only; the cluster owns the canonical clock.
+pub const ClockState = struct {
+    white_remaining_ms: u32,
+    black_remaining_ms: u32,
+    /// The color whose clock is currently counting down. Null when paused (between commits or
+    /// during disconnect grace).
+    running: ?Color,
+};
+
+pub const StatusDecision = enum { commit, abort, unknown };
+
+pub const PrepareReceived = struct {
     sequence_number: u32,
-    reason: NackReason,
+    entry: LogEntry,
+    /// Leader's pre-apply zobrist for this game. Players vote no if it diverges.
+    prior_state_hash: u64,
 };
 
-pub const WireMessage = union(enum) {
-    propose: LogEntry,
+pub const CommitReceived = struct {
+    sequence_number: u32,
+    post_clock_state: ClockState,
+};
 
-    /// The sequence number being acknowledged
-    ack: u32,
+pub const AbortReceived = struct {
+    sequence_number: u32,
+    reason: AbortReason,
+};
 
-    /// Sequence number being rejected, along with the reason for doing so.
-    nack: Nack,
+pub const StatusReply = struct {
+    sequence_number: u32,
+    decision: StatusDecision,
 };
 
 pub const GameEvent = union(enum) {
@@ -178,7 +232,7 @@ pub const GameEvent = union(enum) {
         /// Amount of time player took to make this move.
         think_time_ms: u32,
 
-        /// The Loop's clock at dispatch. Used when proposing a move.
+        /// The Loop's clock at dispatch.
         now_ms: u32,
     },
 
@@ -189,45 +243,89 @@ pub const GameEvent = union(enum) {
         now_ms: u32,
     },
 
-    remote_proposal: LogEntry,
+    prepare_received: PrepareReceived,
+    commit_received: CommitReceived,
+    abort_received: AbortReceived,
+    status_reply_received: StatusReply,
+    resume_ack_received,
 
-    /// The sequence number of the log entry/move that's being acknowledged by the opponent.
-    remote_ack: u32,
-
-    /// Sequence number and Nack reason from the opponent for rejecting the move.
-    remote_nack: Nack,
-
-    /// For timed matches represents a clock tick, the unit of which will default to second.
+    /// Render-only tick. Authoritative clock advancement happens on the coord; the local clock
+    /// here is for UI countdown only.
     clock_tick,
 
-    peer_disconnected,
-    peer_reconnected,
+    /// Local guard: PREPARE→COMMIT stalled past `VOTE_TIMEOUT_MS`. Drives a STATUS query.
+    vote_timeout,
+
+    coordinator_disconnected,
+    coordinator_reconnected,
     disconnect_timer_expired,
-    proposal_timeout,
+};
+
+/// Player-side durable log record. Fsynced before the corresponding wire message goes out.
+pub const FsyncRecord = union(enum) {
+    prepared: struct {
+        sequence_number: u32,
+        entry: LogEntry,
+        prior_state_hash: u64,
+    },
+    committed: struct { sequence_number: u32 },
+    aborted: struct { sequence_number: u32 },
 };
 
 pub const GameEffect = union(enum) {
-    send_proposal: LogEntry,
-    send_ack: u32,
-    send_nack: Nack,
+    /// Initiate the cluster handshake (after connect or reconnect).
+    send_hello,
+
+    /// SUBMIT a freshly-issued command to the leader. No seq yet — the leader assigns.
+    send_submit: struct {
+        command: GameCommand,
+        think_time_ms: u32,
+    },
+
+    /// VOTE on a PREPARE. Carries our predicted post-apply zobrist for the cluster's 5/7-way
+    /// cross-check.
+    send_vote: struct {
+        sequence_number: u32,
+        vote: Vote,
+        post_apply_zobrist: u64,
+        reason: ?NackReason,
+    },
+
+    /// APPLIED ack after the local apply. Carries the actual post-apply zobrist; the cluster
+    /// re-runs the hash check post-commit (stricter than the vote-time check, since divergence
+    /// here means non-deterministic apply rather than mere disagreement).
+    send_applied: struct {
+        sequence_number: u32,
+        post_apply_zobrist: u64,
+    },
+
+    /// Ask the leader to resolve an in-doubt prepared(seq) found during log replay.
+    send_status_request: struct { sequence_number: u32 },
+
+    /// Reconnect resume request. Player declares last_known_seq + last_known_zobrist; cluster
+    /// catches us up.
+    send_resume_game: struct {
+        last_known_sequence_number: u32,
+        last_known_zobrist: u64,
+    },
+
+    /// Append a record to the player's durable log. Must complete before the next outbound
+    /// message that depends on it.
+    fsync_log_record: FsyncRecord,
+
     local_rejected: struct { reason: LocalRejectionReason },
     render,
     game_ended: GameResult,
     prompt_for_promotion: struct { color: Color },
-
-    request_resync: struct {
-        last_known_sequence_number: u32,
-        peer_nack_reason: ?NackReason,
-    },
-
-    /// Starts the auto timer when the opponent disconnects. The current player is directly awarded
-    /// the win if the opponent fails to reconnect within a certain time period.
-    start_disconnect_timer: u32,
 };
 
-/// Represents the game being played. Holds the complete data of the game including players move
-/// history, game state, the log for the RSM.
+/// Represents the game being played from the local player's point of view. Holds the chess RSM
+/// state plus the player-side protocol state machine for the coordinated 2PC dance with the
+/// coordinator cluster.
 pub const Game = struct {
+    /// The cluster-assigned game id. Tagged on every wire message.
+    game_id: u64,
+
     board: Board,
 
     turn: Color,
@@ -247,7 +345,7 @@ pub const Game = struct {
     /// Required when one of the players want's to propose/claim a draw under the 50 move rule.
     halfmove_clock: u16,
 
-    state: GameState,
+    state: PlayerState,
 
     /// Pieces white has captured from black. Bounded to 15 since white can capture at most 15 of
     /// black's 16 pieces — the king is never captured.
@@ -268,41 +366,23 @@ pub const Game = struct {
     /// advance. Cleared on every move that doesn't create a new en-passant target.
     en_passant_square: ?Position,
 
-    /// Keeps track of each command fired. Includes the moves, draw offers, etc.
-    /// Can be replayed to get to the same state. Will be used to get an observer up to speed by
-    /// sending them the logs.
-    command_log: BoundedArray(LogEntry, MAX_LOG),
-
-    /// Keeps track of the number of unexpected events received, panics when they reach the threshold
-    /// of `MAX_UNEXPECTED_EVENTS` for a given iteration.
-    unexpected_event_count: u8 = 0,
+    /// Render-only mirror. Authoritative clock state lives on the cluster; refreshed from
+    /// COMMIT.post_clock_state on each apply.
+    chess_clock: ClockState,
 
     /// Upper bound on effects emitted by a single tick(). 16 leaves headroom for paths that
-    /// stack multiple effects (e.g. send_ack + apply + render + game_ended + start_*_timer).
+    /// stack multiple effects (e.g. fsync_log_record + send_vote + render + game_ended).
     pub const MAX_EFFECTS = 16;
 
-    /// Upper bound on command-log and position-hash entries. 512 is ample for a real chess
+    /// Upper bound on position-hash entries. 512 is ample for a real chess
     /// game (longest practical games run ~300 half-moves; the fifty-move rule caps growth).
     const MAX_LOG = 512;
 
-    /// Shared cap on resync attempts for a single proposal — counts any mix of ack-seq mismatches
-    /// and peer nacks. Past this we panic; recovery has failed enough times that staying live risks
-    /// compounding the divergence.
-    const MAX_RETRIES: u8 = 3;
-
-    const MAX_UNEXPECTED_EVENTS: u8 = 3;
-
-    pub fn initial_state(color: Color) GameState {
-        return switch (color) {
-            .white => GameState{ .playing = .local_turn },
-            .black => GameState{ .playing = .remote_turn },
-        };
-    }
-
-    pub fn init(self: *Game, local_color: Color) void {
+    pub fn init(self: *Game, game_id: u64, local_color: Color) void {
         self.* = .{
+            .game_id = game_id,
             .board = undefined,
-            .state = initial_state(local_color),
+            .state = .idle,
             .turn = .white,
             .halfmove_clock = 0,
             .fullmove_number = 1,
@@ -313,25 +393,14 @@ pub const Game = struct {
             .expected_sequence_number = 1,
             .castling_rights = .{},
             .en_passant_square = null,
-            .command_log = .{},
-            .unexpected_event_count = 0,
+            .chess_clock = .{
+                .white_remaining_ms = 0,
+                .black_remaining_ms = 0,
+                .running = null,
+            },
         };
         self.board.init();
         self.position_hashes.append_assume_capacity(zobrist.INITIAL_BOARD_ZOBRIST_HASH);
-    }
-
-    fn handle_unexpected_event(self: *Game, out: *BoundedArray(GameEffect, MAX_EFFECTS)) void {
-        if (self.unexpected_event_count >= MAX_UNEXPECTED_EVENTS) {
-            @panic("too many unexpected events");
-        }
-
-        self.unexpected_event_count += 1;
-        out.append_assume_capacity(.{
-            .request_resync = .{
-                .last_known_sequence_number = self.expected_sequence_number,
-                .peer_nack_reason = null,
-            },
-        });
     }
 
     /// The state machine with side effects. It reads the game event, mutates the state of the board
@@ -341,167 +410,55 @@ pub const Game = struct {
         std.debug.assert(self.position_hashes.len <= MAX_LOG);
 
         switch (self.state) {
-            .playing => |playing| switch (playing) {
-                .local_turn => switch (event) {
-                    .local_command => |payload| switch (payload.command) {
-                        .play => |play| self.handle_local_play(play, payload.think_time_ms, payload.now_ms, out),
-                        else => @panic("non-play GameCommand variants not yet implemented in tick"),
-                    },
-                    .local_promotion_choice => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .unsolicited_promotion_choice,
-                            },
-                        });
-                    },
-                    .remote_ack, .remote_nack => self.handle_unexpected_event(out),
-                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
-                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    .clock_tick => {
-                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
-                    },
-                    .peer_disconnected => {
-                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
-                    },
-                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
-                        // No-op: these only fire in paused_disconnected / proposing.
-                    },
+            .idle => switch (event) {
+                .local_command => |payload| switch (payload.command) {
+                    .play => |play| self.handle_local_play(play, payload.think_time_ms, payload.now_ms, out),
+                    // TODO: resign / offer_draw / accept_draw / decline_draw / claim_draw arms.
+                    else => @panic("non-play GameCommand variants not yet implemented in tick"),
                 },
-                .remote_turn => switch (event) {
-                    .remote_proposal => |entry| self.handle_remote_proposal(entry, out),
-                    .local_command => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .out_of_turn,
-                            },
-                        });
-                    },
-                    .local_promotion_choice => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .unsolicited_promotion_choice,
-                            },
-                        });
-                    },
-                    .remote_ack, .remote_nack => {
-                        self.handle_unexpected_event(out);
-                    },
-                    .clock_tick => {
-                        // TODO: Decrement the remote player's clock; transition to game_over{timeout} on zero.
-                    },
-                    .peer_disconnected => {
-                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
-                    },
-                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
-                        // No-op: these only fire in paused_disconnected / proposing.
-                    },
-                },
-                .proposing => |proposal| switch (event) {
-                    .remote_ack => |acked_sequence_number| self.handle_remote_ack(proposal, acked_sequence_number, out),
-                    .remote_nack => |nack| self.handle_remote_nack(proposal, nack, out),
-                    .local_command => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .already_proposing,
-                            },
-                        });
-                    },
-                    .local_promotion_choice => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .unsolicited_promotion_choice,
-                            },
-                        });
-                    },
-                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
-                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    .proposal_timeout => {
-                        // TODO: Trigger retry via request_resync, or panic when the retry budget is exhausted.
-                    },
-                    .clock_tick => {
-                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
-                    },
-                    .peer_disconnected => {
-                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
-                    },
-                    .peer_reconnected, .disconnect_timer_expired => {
-                        // No-op: these only fire in paused_disconnected.
-                    },
-                },
-                .awaiting_promotion_piece => |held| switch (event) {
-                    .local_promotion_choice => |choice| self.handle_promotion_choice(held, choice, out),
-                    .local_command => {
-                        out.append_assume_capacity(.{
-                            .local_rejected = .{
-                                .reason = .awaiting_promotion_piece,
-                            },
-                        });
-                    },
-                    .remote_ack, .remote_nack => {
-                        self.handle_unexpected_event(out);
-                    },
-                    // TODO: Replace with send_nack{state_desync} once DEC-011 (simultaneous-proposal tie-break) lands.
-                    .remote_proposal => @panic("simultaneous proposal — tie-break (DEC-011) not yet implemented"),
-                    .clock_tick => {
-                        // TODO: Decrement the local player's clock; transition to game_over{timeout} on zero.
-                    },
-                    .peer_disconnected => {
-                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
-                    },
-                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
-                        // No-op: these only fire in paused_disconnected / proposing.
-                    },
-                },
-                .awaiting_draw_response => switch (event) {
-                    .local_command, .local_promotion_choice => {
-                        // TODO: A move from the offerer withdraws the offer; from the other side declines it.
-                    },
-                    .remote_proposal => {
-                        // TODO: Opponent's move implicitly accepts/declines the offer per DEC-***.
-                    },
-                    .remote_ack, .remote_nack => {
-                        // TODO: Forward to the resync layer — these can arrive while waiting for a draw response.
-                    },
-                    .clock_tick => {
-                        // TODO: Decrement clocks; offer lapses on timeout.
-                    },
-                    .peer_disconnected => {
-                        // TODO: Snapshot current state into paused_disconnected and start the disconnect timer.
-                    },
-                    .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
-                        // No-op: these only fire in paused_disconnected / proposing.
-                    },
-                },
+                .local_promotion_choice => out.append_assume_capacity(.{
+                    .local_rejected = .{ .reason = .unsolicited_promotion_choice },
+                }),
+                // TODO: coord-driven 2PC (PREPARE → VOTE → COMMIT/ABORT/APPLIED).
+                .prepare_received, .commit_received, .abort_received => @panic("TODO: coord 2PC arms"),
+                // TODO: recovery path (STATUS, RESUME_GAME).
+                .status_reply_received, .resume_ack_received => @panic("TODO: recovery arms"),
+                // Vote-timeout-without-in-flight would be a coord bug; treat as no-op until the
+                // 2PC arms are wired up.
+                .vote_timeout => {},
+                // TODO: UI clock countdown / disconnect bookkeeping.
+                .clock_tick, .coordinator_disconnected, .coordinator_reconnected, .disconnect_timer_expired => {},
             },
+            .awaiting_promotion_piece => |held| switch (event) {
+                .local_promotion_choice => |choice| self.handle_promotion_choice(held, choice, out),
+                .local_command => out.append_assume_capacity(.{
+                    .local_rejected = .{ .reason = .awaiting_promotion_piece },
+                }),
+                // TODO: coord traffic during local promotion-piece prompt; should be rare since
+                // the coord won't issue PREPARE for our turn until we SUBMIT.
+                .prepare_received, .commit_received, .abort_received, .status_reply_received, .resume_ack_received => @panic("TODO: coord traffic in awaiting_promotion_piece"),
+                .vote_timeout, .clock_tick, .coordinator_disconnected, .coordinator_reconnected, .disconnect_timer_expired => {},
+            },
+            // TODO: in-flight transaction events. awaiting_prepare receives PREPARE (validate
+            // matches our submitted command, fsync, vote yes, transition to prepared); prepared
+            // receives COMMIT (fsync, apply via commit(), send_applied, transition to idle or
+            // game_over) or ABORT (fsync aborted, transition to idle).
+            .awaiting_prepare, .prepared => @panic("TODO: in-flight transaction arms"),
             .paused_disconnected => switch (event) {
-                .local_command, .local_promotion_choice => {
-                    out.append_assume_capacity(.{
-                        .local_rejected = .{ .reason = .game_ended },
-                    });
-                },
-                .peer_reconnected => {
-                    // TODO: Restore the snapshotted `was` state and cancel the disconnect timer.
-                },
-                .disconnect_timer_expired => {
-                    // TODO: Award the win to the connected player — transition to game_over{disconnect}.
-                },
-                .remote_proposal, .remote_ack, .remote_nack => {
-                    // TODO: Buffer or forward to the resync layer once we re-emerge from paused_disconnected.
-                },
-                .clock_tick, .peer_disconnected, .proposal_timeout => {
-                    // No-op: clocks are paused, peer can't disconnect twice, no proposal pending.
-                },
+                .local_command, .local_promotion_choice => out.append_assume_capacity(.{
+                    .local_rejected = .{ .reason = .disconnected },
+                }),
+                // TODO: reconnect handling (HELLO → RESUME_GAME → resume_ack_received → restore
+                // in_flight from durable log; disconnect_timer_expired → game_over{disconnect}).
+                .prepare_received, .commit_received, .abort_received, .status_reply_received, .resume_ack_received, .coordinator_reconnected, .disconnect_timer_expired => @panic("TODO: reconnect arms"),
+                .vote_timeout, .clock_tick, .coordinator_disconnected => {},
             },
             .game_over => switch (event) {
-                .local_command, .local_promotion_choice => {
-                    out.append_assume_capacity(.{
-                        .local_rejected = .{ .reason = .game_ended },
-                    });
-                },
-                .remote_ack, .remote_nack, .remote_proposal => self.handle_unexpected_event(out),
-                .clock_tick, .peer_disconnected, .peer_reconnected, .disconnect_timer_expired, .proposal_timeout => {
-                    // No-op: game's over, nothing to do.
-                },
+                .local_command, .local_promotion_choice => out.append_assume_capacity(.{
+                    .local_rejected = .{ .reason = .game_ended },
+                }),
+                // No-op: game's over, nothing to do.
+                else => {},
             },
         }
     }
@@ -513,6 +470,11 @@ pub const Game = struct {
         now_ms: u32,
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
+        if (self.turn != self.local_color) {
+            out.append_assume_capacity(.{ .local_rejected = .{ .reason = .out_of_turn } });
+            return;
+        }
+
         const move_effect = rules_engine.preview_move(
             &self.board,
             self.turn,
@@ -528,204 +490,53 @@ pub const Game = struct {
 
         if (move_effect == .promotion and play.promotion == null) {
             self.state = .{
-                .playing = .{
-                    .awaiting_promotion_piece = .{
-                        .pending_move = play.move,
-                        .issued_at_ms = now_ms,
-                    },
+                .awaiting_promotion_piece = .{
+                    .pending_move = play.move,
+                    .issued_at_ms = now_ms,
                 },
             };
             out.append_assume_capacity(.{ .prompt_for_promotion = .{ .color = self.local_color } });
-            self.unexpected_event_count = 0;
             return;
         }
 
-        const log_entry = LogEntry{
-            .sequence_number = self.expected_sequence_number,
-            .move_number = self.fullmove_number,
-            .issued_by = self.local_color,
-            .command = .{ .play = play },
-            .time_taken_ms = think_time_ms,
-        };
-        self.submit_proposal(log_entry, now_ms, out);
+        self.submit(.{ .play = play }, think_time_ms, now_ms, out);
     }
 
     fn handle_promotion_choice(
         self: *Game,
-        held: @FieldType(Playing, "awaiting_promotion_piece"),
+        held: @FieldType(PlayerState, "awaiting_promotion_piece"),
         choice: @FieldType(GameEvent, "local_promotion_choice"),
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
-        const log_entry = LogEntry{
-            .sequence_number = self.expected_sequence_number,
-            .move_number = self.fullmove_number,
-            .issued_by = self.local_color,
-            .command = .{
-                .play = .{
-                    .move = held.pending_move,
-                    .promotion = choice.piece,
-                },
-            },
-            .time_taken_ms = choice.think_time_ms,
-        };
-        self.submit_proposal(log_entry, held.issued_at_ms, out);
+        self.submit(
+            .{ .play = .{ .move = held.pending_move, .promotion = choice.piece } },
+            choice.think_time_ms,
+            held.issued_at_ms,
+            out,
+        );
     }
 
-    /// Arm: `playing.proposing × remote_ack`. On matching seq, re-derives the MoveEffect on
-    /// the (still unchanged) local board, commits, and transitions to `remote_turn` (or
-    /// `game_over`). On mismatched seq the proposal is alive but the peer's view drifted —
-    /// bump the retry counter and request a resync, or panic if the budget is exhausted.
-    fn handle_remote_ack(
+    /// Transitions to `awaiting_prepare` and emits send_submit. No fsync here — the first fsync
+    /// happens at PREPARE time, when the player records `prepared(seq)` before voting yes.
+    fn submit(
         self: *Game,
-        proposal: @FieldType(Playing, "proposing"),
-        acked_sequence_number: u32,
-        out: *BoundedArray(GameEffect, MAX_EFFECTS),
-    ) void {
-        if (acked_sequence_number != proposal.pending.sequence_number) {
-            if (proposal.retry_count < MAX_RETRIES) {
-                self.request_resync(proposal, null, out);
-            } else {
-                @panic("desync recovery exhausted: ack seq mismatch");
-            }
-            return;
-        }
-
-        // Pre-issue validation already accepted this move on this exact board, so preview
-        // can't refuse it now — any error here means a real invariant break, not a
-        // recoverable rejection.
-        const move_effect = rules_engine.preview_move(
-            &self.board,
-            self.turn,
-            proposal.pending.command.play.move,
-            self.castling_rights,
-            self.en_passant_square,
-        ) catch unreachable;
-
-        const verdict = self.commit(proposal.pending, move_effect);
-
-        if (verdict) |game_over| {
-            self.state = .{ .game_over = game_over };
-            out.append_assume_capacity(.render);
-            out.append_assume_capacity(.{ .game_ended = game_over.result });
-        } else {
-            self.state = .{ .playing = .remote_turn };
-            out.append_assume_capacity(.render);
-        }
-        self.unexpected_event_count = 0;
-    }
-
-    /// Arm: `playing.proposing × remote_nack`. Any nack is a divergence signal regardless of
-    /// `nack.sequence_number` — peer rejected the proposal so our state is suspect. Reuse Arm 2's
-    /// shared retry budget (any mix of seq mismatches and nacks counts toward the same
-    /// MAX_RETRIES cap), pass the peer's reason through for the wire layer to pick a
-    /// recovery strategy, or panic when the budget is exhausted.
-    fn handle_remote_nack(
-        self: *Game,
-        proposal: @FieldType(Playing, "proposing"),
-        nack: @FieldType(GameEvent, "remote_nack"),
-        out: *BoundedArray(GameEffect, MAX_EFFECTS),
-    ) void {
-        if (proposal.retry_count < MAX_RETRIES) {
-            self.request_resync(proposal, nack.reason, out);
-        } else {
-            @panic("desync recovery exhausted: peer nack");
-        }
-    }
-
-    /// Arm: `playing.remote_turn × remote_proposal`. Receive-side mirror of Arms 1+2:
-    /// validate seq, validate via the rule engine, commit, then ack and transition to
-    /// `local_turn` (or `game_over`). Commit deliberately runs BEFORE `send_ack` — local
-    /// state must be consistent before the peer is told their move landed; otherwise a
-    /// crash between ack and apply would leave the peer thinking we're ahead when we
-    /// aren't.
-    fn handle_remote_proposal(
-        self: *Game,
-        entry: LogEntry,
-        out: *BoundedArray(GameEffect, MAX_EFFECTS),
-    ) void {
-        if (entry.sequence_number != self.expected_sequence_number) {
-            out.append_assume_capacity(.{
-                .send_nack = .{
-                    .sequence_number = entry.sequence_number,
-                    .reason = .state_desync,
-                },
-            });
-            return;
-        }
-
-        const move_effect = rules_engine.preview_move(
-            &self.board,
-            self.turn,
-            entry.command.play.move,
-            self.castling_rights,
-            self.en_passant_square,
-        ) catch |err| switch (err) {
-            error.IllegalMove => {
-                out.append_assume_capacity(.{
-                    .send_nack = .{
-                        .sequence_number = entry.sequence_number,
-                        .reason = .illegal_move,
-                    },
-                });
-                return;
-            },
-        };
-
-        const verdict = self.commit(entry, move_effect);
-
-        out.append_assume_capacity(.{ .send_ack = entry.sequence_number });
-
-        if (verdict) |game_over| {
-            self.state = .{ .game_over = game_over };
-            out.append_assume_capacity(.render);
-            out.append_assume_capacity(.{ .game_ended = game_over.result });
-        } else {
-            self.state = .{ .playing = .local_turn };
-            out.append_assume_capacity(.render);
-        }
-        self.unexpected_event_count = 0;
-    }
-
-    /// Bumps the proposal's `retry_count` and emits a `request_resync` effect carrying the
-    /// peer's nack reason (null when triggered by an ack-seq mismatch instead of a nack).
-    /// Shared between Arm 2 (ack mismatch) and Arm 3 (peer nack) — they fund the same
-    /// retry budget.
-    fn request_resync(
-        self: *Game,
-        proposal: @FieldType(Playing, "proposing"),
-        peer_nack_reason: ?NackReason,
-        out: *BoundedArray(GameEffect, MAX_EFFECTS),
-    ) void {
-        self.state = .{ .playing = .{ .proposing = .{
-            .pending = proposal.pending,
-            .proposed_at_ms = proposal.proposed_at_ms,
-            .retry_count = proposal.retry_count + 1,
-        } } };
-        out.append_assume_capacity(.{ .request_resync = .{
-            .last_known_sequence_number = proposal.pending.sequence_number,
-            .peer_nack_reason = peer_nack_reason,
-        } });
-    }
-
-    /// Transitions to `playing.proposing` with the given entry and emits the `send_proposal`
-    /// effect.
-    fn submit_proposal(
-        self: *Game,
-        entry: LogEntry,
-        proposed_at_ms: u32,
+        command: GameCommand,
+        think_time_ms: u32,
+        submitted_at_ms: u32,
         out: *BoundedArray(GameEffect, MAX_EFFECTS),
     ) void {
         self.state = .{
-            .playing = .{
-                .proposing = .{
-                    .pending = entry,
-                    .proposed_at_ms = proposed_at_ms,
-                    .retry_count = 0,
-                },
+            .awaiting_prepare = .{
+                .submitted_command = command,
+                .submitted_at_ms = submitted_at_ms,
             },
         };
-        out.append_assume_capacity(.{ .send_proposal = entry });
-        self.unexpected_event_count = 0;
+        out.append_assume_capacity(.{
+            .send_submit = .{
+                .command = command,
+                .think_time_ms = think_time_ms,
+            },
+        });
     }
 
     /// Commits the effects of the move to the board, and updates the relevant fields.
@@ -837,7 +648,6 @@ pub const Game = struct {
             self.castling_rights,
             self.en_passant_square,
         ));
-        self.command_log.append_assume_capacity(log_entry);
         self.expected_sequence_number += 1;
 
         // TODO: final_sequence_number should align with the RSM seq lifecycle once it's wired end-to-end.
@@ -876,587 +686,7 @@ pub const Game = struct {
     }
 };
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
-
-const test_util = @import("rule_engine/test_util.zig");
-const test_helpers = @import("test_helpers.zig");
-
-test "initial state white returns local turn idle" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    try std.testing.expectEqual(GameState{ .playing = .local_turn }, game.state);
-}
-
-test "initial state black returns remote turn waiting" {
-    var game: Game = undefined;
-    game.init(.black);
-
-    try std.testing.expectEqual(GameState{ .playing = .remote_turn }, game.state);
-}
-
-test "init sets board state to initial board state" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    const b = game.board.squares;
-
-    // White back rank (rank 1 = index 0)
-    try std.testing.expectEqual(.white_rook, b[0][0]);
-    try std.testing.expectEqual(.white_knight, b[0][1]);
-    try std.testing.expectEqual(.white_bishop_dark, b[0][2]);
-    try std.testing.expectEqual(.white_queen, b[0][3]);
-    try std.testing.expectEqual(.white_king, b[0][4]);
-    try std.testing.expectEqual(.white_bishop_light, b[0][5]);
-    try std.testing.expectEqual(.white_knight, b[0][6]);
-    try std.testing.expectEqual(.white_rook, b[0][7]);
-
-    // White pawns (rank 2 = index 1)
-    for (b[1]) |piece| try std.testing.expectEqual(.white_pawn, piece);
-
-    // Empty middle (ranks 3–6 = indices 2–5)
-    for (b[2..6]) |rank| for (rank) |piece| try std.testing.expectEqual(.empty, piece);
-
-    // Black pawns (rank 7 = index 6)
-    for (b[6]) |piece| try std.testing.expectEqual(.black_pawn, piece);
-
-    // Black back rank (rank 8 = index 7)
-    try std.testing.expectEqual(.black_rook, b[7][0]);
-    try std.testing.expectEqual(.black_knight, b[7][1]);
-    try std.testing.expectEqual(.black_bishop_light, b[7][2]);
-    try std.testing.expectEqual(.black_queen, b[7][3]);
-    try std.testing.expectEqual(.black_king, b[7][4]);
-    try std.testing.expectEqual(.black_bishop_dark, b[7][5]);
-    try std.testing.expectEqual(.black_knight, b[7][6]);
-    try std.testing.expectEqual(.black_rook, b[7][7]);
-}
-
-test "init sets the correct seq number, captures, and position hash" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    try std.testing.expectEqual(game.expected_sequence_number, 1);
-    try std.testing.expectEqual(game.en_passant_square, null);
-    try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
-    try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
-    try std.testing.expectEqual(@as(usize, 1), game.position_hashes.len);
-    try std.testing.expectEqual(zobrist.INITIAL_BOARD_ZOBRIST_HASH, game.position_hashes.slice()[0]);
-}
-
-// Smoke tests — primarily exist to force semantic analysis of apply_move and friends. Without a
-// test-side caller, Zig skips analyzing pub fns that aren't reached, and field/signature bugs
-// can sit in the file undetected.
-
-test "apply_move applies e2-e4 from the starting position" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    const mv = Move{
-        .from = .{ .rank = 1, .file = 4 },
-        .to = .{ .rank = 3, .file = 4 },
-    };
-    try test_helpers.apply_move(&game, mv);
-
-    try std.testing.expectEqual(.empty, game.board.squares[1][4]);
-    try std.testing.expectEqual(.white_pawn, game.board.squares[3][4]);
-    try std.testing.expectEqual(Color.black, game.turn);
-    // Double push registers the passed-over square (e3) as the en-passant target.
-    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
-}
-
-test "apply_move returns IllegalMove when source square is empty" {
-    var game: Game = undefined;
-    game.init(.white);
-
-    // e4 is empty on the starting board.
-    const mv = Move{
-        .from = .{ .rank = 3, .file = 4 },
-        .to = .{ .rank = 4, .file = 4 },
-    };
-    try std.testing.expectError(error.IllegalMove, test_helpers.apply_move(&game, mv));
-}
-
-test "apply_move: black plays en-passant after white double-push, victim removed and recorded" {
-    // Minimal fixture: both kings + the two pawns involved. Goes through the full game
-    // state machine — preview_move detects en-passant, commit removes the victim
-    // and appends to captures_by_black, the trailing switch clears the ep window.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    test_util.place(&game.board, .white_pawn, .{ .rank = 1, .file = 4 }); // e2
-    test_util.place(&game.board, .black_pawn, .{ .rank = 3, .file = 3 }); // d4
-
-    // 1. e2-e4 — double push, sets ep target to e3 = (2, 4).
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
-    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
-
-    // 1... d4xe3 e.p. — black diagonal capture onto the (empty) ep target square; the
-    // victim white pawn physically sits on e4 = (3, 4) and must be cleared.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 3 }, .to = .{ .rank = 2, .file = 4 } });
-
-    try std.testing.expectEqual(Piece.empty, game.board.squares[3][4]); // e4 victim removed
-    try std.testing.expectEqual(Piece.empty, game.board.squares[3][3]); // d4 source empty
-    try std.testing.expectEqual(Piece.black_pawn, game.board.squares[2][4]); // e3 ep destination
-    try std.testing.expectEqual(@as(usize, 1), game.captures_by_black.len);
-    try std.testing.expectEqual(Piece.white_pawn, game.captures_by_black.slice()[0]);
-    try std.testing.expectEqual(@as(usize, 0), game.captures_by_white.len);
-    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
-    try std.testing.expectEqual(Color.white, game.turn);
-}
-
-test "apply_move: regular capture appends the victim to captures_by_<turn>" {
-    // Confirms the new MoveEffect.capture → Game.append_captured_piece plumbing actually
-    // populates the per-side captures list when a capturing move flows through apply_move.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    test_util.place(&game.board, .white_rook, .{ .rank = 3, .file = 4 }); // e4
-    test_util.place(&game.board, .black_pawn, .{ .rank = 5, .file = 4 }); // e6
-
-    // White rook e4 → e6, captures black pawn.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 5, .file = 4 } });
-
-    try std.testing.expectEqual(@as(usize, 1), game.captures_by_white.len);
-    try std.testing.expectEqual(Piece.black_pawn, game.captures_by_white.slice()[0]);
-    try std.testing.expectEqual(@as(usize, 0), game.captures_by_black.len);
-    try std.testing.expectEqual(Piece.white_rook, game.board.squares[5][4]);
-    try std.testing.expectEqual(Piece.empty, game.board.squares[3][4]);
-}
-
-test "apply_move: en_passant_square clears after a non-double-push reply to a double push" {
-    // Regression guard for the trailing switch in commit — drop the `else => null`
-    // arm and a stale ep target survives indefinitely. Two-move sequence (1. e4, 1... a6)
-    // proves the clear leg fires for any non-double-push effect.
-    var game: Game = undefined;
-    game.init(.white);
-
-    // 1. e4 — sets ep target to e3.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
-    try std.testing.expectEqual(Position{ .rank = 2, .file = 4 }, game.en_passant_square.?);
-
-    // 1... a6 — black single push, must clear the ep window.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 6, .file = 0 }, .to = .{ .rank = 5, .file = 0 } });
-    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
-}
-
-test "apply_move: white kingside castling moves king + rook and clears both white rights" {
-    // End-to-end: preview_move → commit (castling arm moves the rook) → castling_rights_after
-    // clears both white flags. Black rights must be untouched.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 4 });
-    test_util.place(&game.board, .white_rook, .{ .rank = 0, .file = 7 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 0 });
-
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 6 } });
-
-    try std.testing.expectEqual(Piece.white_king, game.board.squares[0][6]);
-    try std.testing.expectEqual(Piece.white_rook, game.board.squares[0][5]);
-    try std.testing.expectEqual(Piece.empty, game.board.squares[0][4]);
-    try std.testing.expectEqual(Piece.empty, game.board.squares[0][7]);
-    try std.testing.expect(!game.castling_rights.white_kingside);
-    try std.testing.expect(!game.castling_rights.white_queenside);
-    try std.testing.expect(game.castling_rights.black_kingside);
-    try std.testing.expect(game.castling_rights.black_queenside);
-    try std.testing.expectEqual(Color.black, game.turn);
-    try std.testing.expectEqual(@as(?Position, null), game.en_passant_square);
-}
-
-test "apply_move: a mating move transitions state to game_over with checkmate result" {
-    // Setup: white queen on g3 ready to deliver Qg7#. White knight on f5 defends g7, so the
-    // black king cannot capture the queen; white king on a1 keeps own king safe.
-    // After the move:
-    //   - black king h8 is in check from queen on g7 (NE diagonal one step)
-    //   - g8 attacked by queen (north one step) ⇒ no escape
-    //   - h7 occupied by friendly pawn ⇒ no escape
-    //   - g7 (capturing the queen) attacked by knight on f5 ⇒ illegal escape
-    //   - pawn h7→h6 doesn't break the diagonal check ⇒ no block
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .white_queen, .{ .rank = 2, .file = 6 });
-    test_util.place(&game.board, .white_knight, .{ .rank = 4, .file = 5 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    test_util.place(&game.board, .black_pawn, .{ .rank = 6, .file = 7 });
-    // Castling rights would mention rooks that don't exist here — flip them off so
-    // castling_rights_after's invariants stay clean.
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-
-    // Qg3-g7#: north slide by 4 ranks.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
-
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.checkmate, over.result);
-            try std.testing.expectEqual(@as(?Color, .white), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: a stalemating move transitions state to game_over with stalemate result" {
-    // Setup: classic K+Q stalemate. White king on f7 controls g7/g8; white queen on g4
-    // moves to g6 to take h7's diagonal and reinforce g6's row coverage. After Qg6:
-    //   - black king h8 is NOT in check (queen on g6 doesn't reach h8)
-    //   - g8 attacked by white king (adjacent) AND queen (file 6 north 2 steps)
-    //   - g7 attacked by white king (adjacent) AND queen (file 6 north 1 step)
-    //   - h7 attacked by queen (NE diagonal one step)
-    //   - black has no other pieces — no legal move exists
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 6, .file = 5 });
-    test_util.place(&game.board, .white_queen, .{ .rank = 3, .file = 6 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-
-    // Qg4-g6: north slide by 2 ranks.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
-
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.stalemate, over.result);
-            try std.testing.expectEqual(@as(?Color, null), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: 75-move rule auto-draws when halfmove_clock reaches 150" {
-    // Bare K vs K + bishop position; any non-pawn / non-capture move bumps the clock. Pre-set
-    // halfmove_clock to 149 so the next quiet move pushes it to 150 and triggers the auto-draw.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .white_knight, .{ .rank = 0, .file = 1 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-    game.halfmove_clock = 149;
-
-    // Nb1-a3 — quiet knight move; non-pawn, non-capture, no check, no mate, no stalemate.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
-
-    try std.testing.expectEqual(@as(u16, 150), game.halfmove_clock);
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.draw_seventy_five_moves, over.result);
-            try std.testing.expectEqual(@as(?Color, null), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: 75-move rule does NOT trigger when clock lands at 149" {
-    // Same setup but pre-set to 148 — the move bumps the clock to 149, which is one short.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .white_knight, .{ .rank = 0, .file = 1 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-    game.halfmove_clock = 148;
-
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 0 } });
-
-    try std.testing.expectEqual(@as(u16, 149), game.halfmove_clock);
-    switch (game.state) {
-        .playing => {},
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: 75-move clock resets on a pawn move even when at 149" {
-    // Tracking guard: the reset path still fires when the clock is one short of the threshold
-    // — i.e. a pawn push at clock=149 doesn't accidentally tip into draw_seventy_five_moves.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .white_pawn, .{ .rank = 1, .file = 4 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-    game.halfmove_clock = 149;
-
-    // e2-e3 — pawn single push.
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 2, .file = 4 } });
-
-    try std.testing.expectEqual(@as(u16, 0), game.halfmove_clock);
-    switch (game.state) {
-        .playing => {},
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: checkmate beats 75-move rule when both fire on the same ply" {
-    // Same Qg7# fixture as the checkmate test, but pre-set halfmove_clock to 149. The mating
-    // queen move is non-pawn / non-capture so the clock would otherwise reach 150. Result must
-    // be .checkmate, not .draw_seventy_five_moves.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .white_queen, .{ .rank = 2, .file = 6 });
-    test_util.place(&game.board, .white_knight, .{ .rank = 4, .file = 5 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    test_util.place(&game.board, .black_pawn, .{ .rank = 6, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-    game.halfmove_clock = 149;
-
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 2, .file = 6 }, .to = .{ .rank = 6, .file = 6 } });
-
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.checkmate, over.result);
-            try std.testing.expectEqual(@as(?Color, .white), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: stalemate beats 75-move rule when both fire on the same ply" {
-    // Same K+Q stalemate fixture, but pre-set halfmove_clock to 149. The stalemating queen
-    // move is non-pawn / non-capture so the clock would otherwise reach 150. Result must be
-    // .stalemate, not .draw_seventy_five_moves.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 6, .file = 5 });
-    test_util.place(&game.board, .white_queen, .{ .rank = 3, .file = 6 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    game.castling_rights = .{
-        .white_kingside = false,
-        .white_queenside = false,
-        .black_kingside = false,
-        .black_queenside = false,
-    };
-    game.halfmove_clock = 149;
-
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 3, .file = 6 }, .to = .{ .rank = 5, .file = 6 } });
-
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.stalemate, over.result);
-            try std.testing.expectEqual(@as(?Color, null), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: a non-mating move keeps the game in playing state" {
-    // Regression guard: after the mate-detection logic was added to commit, a quiet move
-    // from the starting position must NOT flip state to game_over.
-    var game: Game = undefined;
-    game.init(.white);
-
-    try test_helpers.apply_move(&game, .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } });
-
-    switch (game.state) {
-        .playing => {},
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move: replays the Immortal Game and detects Be7# as checkmate at move 45" {
-    // Anderssen vs Kieseritzky, London 1851. 44 plies in `.playing` state plus a 45th mating
-    // ply played separately. Mirrors the bench's IMMORTAL_GAME sequence. End-to-end coverage
-    // of the engine: 45 ply through preview_move + commit across captures, sacrifices,
-    // knight forks, with a real checkmate at the end that exercises the new `is_checkmate`
-    // plumbing.
-    const game_moves = [_]Move{
-        // 1. e4 e5
-        .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } },
-        .{ .from = .{ .rank = 6, .file = 4 }, .to = .{ .rank = 4, .file = 4 } },
-        // 2. f4 exf4
-        .{ .from = .{ .rank = 1, .file = 5 }, .to = .{ .rank = 3, .file = 5 } },
-        .{ .from = .{ .rank = 4, .file = 4 }, .to = .{ .rank = 3, .file = 5 } },
-        // 3. Bc4 Qh4+
-        .{ .from = .{ .rank = 0, .file = 5 }, .to = .{ .rank = 3, .file = 2 } },
-        .{ .from = .{ .rank = 7, .file = 3 }, .to = .{ .rank = 3, .file = 7 } },
-        // 4. Kf1 b5
-        .{ .from = .{ .rank = 0, .file = 4 }, .to = .{ .rank = 0, .file = 5 } },
-        .{ .from = .{ .rank = 6, .file = 1 }, .to = .{ .rank = 4, .file = 1 } },
-        // 5. Bxb5 Nf6
-        .{ .from = .{ .rank = 3, .file = 2 }, .to = .{ .rank = 4, .file = 1 } },
-        .{ .from = .{ .rank = 7, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
-        // 6. Nf3 Qh6
-        .{ .from = .{ .rank = 0, .file = 6 }, .to = .{ .rank = 2, .file = 5 } },
-        .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 5, .file = 7 } },
-        // 7. d3 Nh5
-        .{ .from = .{ .rank = 1, .file = 3 }, .to = .{ .rank = 2, .file = 3 } },
-        .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 4, .file = 7 } },
-        // 8. Nh4 Qg5
-        .{ .from = .{ .rank = 2, .file = 5 }, .to = .{ .rank = 3, .file = 7 } },
-        .{ .from = .{ .rank = 5, .file = 7 }, .to = .{ .rank = 4, .file = 6 } },
-        // 9. Nf5 c6
-        .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 4, .file = 5 } },
-        .{ .from = .{ .rank = 6, .file = 2 }, .to = .{ .rank = 5, .file = 2 } },
-        // 10. g4 Nf6
-        .{ .from = .{ .rank = 1, .file = 6 }, .to = .{ .rank = 3, .file = 6 } },
-        .{ .from = .{ .rank = 4, .file = 7 }, .to = .{ .rank = 5, .file = 5 } },
-        // 11. Rg1 cxb5
-        .{ .from = .{ .rank = 0, .file = 7 }, .to = .{ .rank = 0, .file = 6 } },
-        .{ .from = .{ .rank = 5, .file = 2 }, .to = .{ .rank = 4, .file = 1 } },
-        // 12. h4 Qg6
-        .{ .from = .{ .rank = 1, .file = 7 }, .to = .{ .rank = 3, .file = 7 } },
-        .{ .from = .{ .rank = 4, .file = 6 }, .to = .{ .rank = 5, .file = 6 } },
-        // 13. h5 Qg5
-        .{ .from = .{ .rank = 3, .file = 7 }, .to = .{ .rank = 4, .file = 7 } },
-        .{ .from = .{ .rank = 5, .file = 6 }, .to = .{ .rank = 4, .file = 6 } },
-        // 14. Qf3 Ng8
-        .{ .from = .{ .rank = 0, .file = 3 }, .to = .{ .rank = 2, .file = 5 } },
-        .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 7, .file = 6 } },
-        // 15. Bxf4 Qf6
-        .{ .from = .{ .rank = 0, .file = 2 }, .to = .{ .rank = 3, .file = 5 } },
-        .{ .from = .{ .rank = 4, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
-        // 16. Nc3 Bc5
-        .{ .from = .{ .rank = 0, .file = 1 }, .to = .{ .rank = 2, .file = 2 } },
-        .{ .from = .{ .rank = 7, .file = 5 }, .to = .{ .rank = 4, .file = 2 } },
-        // 17. Nd5 Qxb2
-        .{ .from = .{ .rank = 2, .file = 2 }, .to = .{ .rank = 4, .file = 3 } },
-        .{ .from = .{ .rank = 5, .file = 5 }, .to = .{ .rank = 1, .file = 1 } },
-        // 18. Bd6 Bxg1
-        .{ .from = .{ .rank = 3, .file = 5 }, .to = .{ .rank = 5, .file = 3 } },
-        .{ .from = .{ .rank = 4, .file = 2 }, .to = .{ .rank = 0, .file = 6 } },
-        // 19. e5 Qxa1+
-        .{ .from = .{ .rank = 3, .file = 4 }, .to = .{ .rank = 4, .file = 4 } },
-        .{ .from = .{ .rank = 1, .file = 1 }, .to = .{ .rank = 0, .file = 0 } },
-        // 20. Ke2 Na6
-        .{ .from = .{ .rank = 0, .file = 5 }, .to = .{ .rank = 1, .file = 4 } },
-        .{ .from = .{ .rank = 7, .file = 1 }, .to = .{ .rank = 5, .file = 0 } },
-        // 21. Nxg7+ Kd8
-        .{ .from = .{ .rank = 4, .file = 5 }, .to = .{ .rank = 6, .file = 6 } },
-        .{ .from = .{ .rank = 7, .file = 4 }, .to = .{ .rank = 7, .file = 3 } },
-        // 22. Qf6+ Nxf6
-        .{ .from = .{ .rank = 2, .file = 5 }, .to = .{ .rank = 5, .file = 5 } },
-        .{ .from = .{ .rank = 7, .file = 6 }, .to = .{ .rank = 5, .file = 5 } },
-        // 23. Be7# (checkmate)
-        .{ .from = .{ .rank = 5, .file = 3 }, .to = .{ .rank = 6, .file = 4 } },
-    };
-
-    var game: Game = undefined;
-    game.init(.white);
-
-    for (game_moves[0 .. game_moves.len - 1], 0..) |mv, i| {
-        // Turn BEFORE the move flips is what apply_move will mutate.
-        const turn_before: Color = if (i % 2 == 0) .white else .black;
-        try std.testing.expectEqual(turn_before, game.turn);
-        try test_helpers.apply_move(&game, mv);
-        switch (game.state) {
-            .playing => {},
-            else => try std.testing.expect(false),
-        }
-        // The engine flips the turn at the end of each commit — confirm it landed on
-        // the opponent.
-        try std.testing.expectEqual(turn_before.opponent(), game.turn);
-    }
-
-    // Final move: Be7# — engine must classify as mate.
-    try test_helpers.apply_move(&game, game_moves[game_moves.len - 1]);
-    switch (game.state) {
-        .game_over => |over| {
-            try std.testing.expectEqual(GameResult.checkmate, over.result);
-            try std.testing.expectEqual(@as(?Color, .white), over.winner);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "apply_move_with_promotion: white pawn e7-e8 promotes to queen" {
-    // End-to-end of the promotion fork: local_command → prompt_for_promotion →
-    // local_promotion_choice → send_proposal → auto-ack → commit's promotion arm
-    // swaps the pawn for the chosen piece. Black king on h8 has g7/h7 escapes from the
-    // queen on e8, so commit returns no game-over and state lands in remote_turn.
-    var game: Game = undefined;
-    game.init(.white);
-    game.board = test_util.empty_board();
-    test_util.place(&game.board, .white_king, .{ .rank = 0, .file = 0 });
-    test_util.place(&game.board, .black_king, .{ .rank = 7, .file = 7 });
-    test_util.place(&game.board, .white_pawn, .{ .rank = 6, .file = 4 }); // e7
-
-    const mv = Move{ .from = .{ .rank = 6, .file = 4 }, .to = .{ .rank = 7, .file = 4 } };
-    try test_helpers.apply_move_with_promotion(&game, mv, .queen);
-
-    try std.testing.expectEqual(Piece.empty, game.board.squares[6][4]);
-    try std.testing.expectEqual(Piece.white_queen, game.board.squares[7][4]);
-    try std.testing.expectEqual(Color.black, game.turn);
-}
-
-test "tick: local_command with legal play transitions to proposing and emits send_proposal" {
-    // Smoke test for tick — same rationale as the apply_move smoke tests above. Drives the
-    // local_turn → local_command → .play arm so Zig analyzes the body; without a caller,
-    // signature/field bugs in the arm sit undetected (e.g. a wrong GameEffect variant or a
-    // value passed where a pointer is expected won't surface until something reaches it).
-    var game: Game = undefined;
-    game.init(.white);
-
-    var out: BoundedArray(GameEffect, Game.MAX_EFFECTS) = .{};
-    const event = GameEvent{ .local_command = .{
-        .command = .{ .play = .{
-            .move = .{ .from = .{ .rank = 1, .file = 4 }, .to = .{ .rank = 3, .file = 4 } },
-            .promotion = null,
-        } },
-        .think_time_ms = 0,
-        .now_ms = 0,
-    } };
-    game.tick(event, &out);
-
-    switch (game.state) {
-        .playing => |playing| switch (playing) {
-            .proposing => |prop| {
-                try std.testing.expectEqual(@as(u32, 1), prop.pending.sequence_number);
-                try std.testing.expectEqual(Color.white, prop.pending.issued_by);
-            },
-            else => try std.testing.expect(false),
-        },
-        else => try std.testing.expect(false),
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), out.len);
-    switch (out.slice()[0]) {
-        .send_proposal => |entry| try std.testing.expectEqual(@as(u32, 1), entry.sequence_number),
-        else => try std.testing.expect(false),
-    }
-}
-
-// Pulls the whole rule engine into the test runner. A normal `@import` (see the top of this
+// Pulls the rule engine into the test runner. A normal `@import` (see the top of this
 // file) forces *analysis* but not test discovery; the `_ = @import` form inside a test block
 // is what adds a file's `test` blocks to the running binary.
 test {
@@ -1465,5 +695,4 @@ test {
     _ = @import("rule_engine/shared.zig");
     _ = @import("rule_engine/test_util.zig");
     _ = @import("rule_engine/zobrist.zig");
-    _ = @import("game_protocol_tests.zig");
 }

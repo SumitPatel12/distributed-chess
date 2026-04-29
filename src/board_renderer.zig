@@ -432,7 +432,7 @@ test "draw produces non-empty output and begins with expected ANSI prelude" {
     renderer.init(make_winsize(80, 24));
 
     var game: Game = undefined;
-    game.init(.white);
+    game.init(0, .white);
 
     const output = renderer.draw(&game);
     try testing.expect(output.len > 0);
