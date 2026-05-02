@@ -33,7 +33,7 @@ For single acceptor systems the outcome is pretty simple, whichever proposal the
 
 But with a single acceptor we have a glaring problem, if that single acceptor goes down our system comes to a screeching halt. All of our proposers end up wistfully waiting for it to come back online.
 
-![[single_acceptor.png|500]]
+<img src="../assets/single_acceptor.png" width="500">
 
 ### Multiple Acceptors
 We naturally now want to try multiple acceptors, and now we must wait until a certain number of acceptors have accepted our value before calling it chosen.
@@ -45,7 +45,7 @@ Now we've got a guideline: **If a proposal is accepted by n + 1 acceptors, given
 We'll now go through a couple of scenarios to see how the proposals can flow and what happens to our system given this single guideline, and that the acceptors accepts only the first proposal that reaches them.
 #### Scenario 1: Accept Only the First Value
 Consider a system with 5 acceptors. The system starts and none of the acceptors have yet to accept any proposals. Now 5 distinct proposals are issued. Remember that they can be delayed or lost, meaning we can end up in a situation where each of the acceptors has accepted one of the 5 proposals. In which case all acceptors have accepted a value but no majority is reached, and the system can make no further progress with the current constraints.
-![[only_first_ack.png|600]]
+<img src="../assets/only_first_ack.png" width="600">
 
 We'll loosen the constraint to: `An acceptor can accept multiple proposals`.
 
@@ -56,7 +56,7 @@ We've got 5 acceptors once again, at the start they're idle and then a proposal 
 
 Now one more proposal Pb with value v2 is issue. According to our updated constraints the acceptors can accept this proposal, and say 3 of the acceptors accept this new proposal now the chosen value is v2. This violates one of our guarantees that once a value is chosen it won't be changed.
 
-![[multiple_ack.png|600]]
+<img src="../assets/multiple_ack.png" width="600">
 
 To mitigate this we need some mechanism that would let the system remember that a value has indeed been chosen. The most common choice that comes to mind is that after a consensus is reached the acceptors should no longer accept any values. Paxos doesn't go this route, it mandates that `once a value is chosen, all further proposals must be made with the chosen value`, and that's where the non-Byzantine comes into play. Now the proposer carries the weight of correctness, if consensus is reached it's the proposers responsibility to propose with the chosen value only. If a malicious proposer comes into play the algorithm will fail.
 
@@ -83,5 +83,7 @@ If a majority of the acceptors accept the prepare request then the proposer can 
 - The proposer will keep the proposal number, and choose the value corresponding to the highest proposal number returned to it by the acceptors during the prepare phase. If no acceptors returned one, the proposer is free to choose any value.
 - The proposer now sends an accept request carrying the proposal_number, and value to all of the acceptors. (Since it passed the prepare phase the majority has agreed and we're not constrained to sending to only the acceptors that accepted the prepare request)
 	- If a majority of the acceptors accept this request consensus is reached. This holds true even if we get some rejections.
+
 The final form of the algorithm looks as below:
-![[paxos_uml_sequence.png|600]]
+
+<img src="../assets/paxos_uml_sequence.png" width="600">
