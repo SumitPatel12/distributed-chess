@@ -45,6 +45,7 @@ Now we've got a guideline: **If a proposal is accepted by n + 1 acceptors, given
 We'll now go through a couple of scenarios to see how the proposals can flow and what happens to our system given this single guideline, and that the acceptors accepts only the first proposal that reaches them.
 #### Scenario 1: Accept Only the First Value
 Consider a system with 5 acceptors. The system starts and none of the acceptors have yet to accept any proposals. Now 5 distinct proposals are issued. Remember that they can be delayed or lost, meaning we can end up in a situation where each of the acceptors has accepted one of the 5 proposals. In which case all acceptors have accepted a value but no majority is reached, and the system can make no further progress with the current constraints.
+
 <img src="../assets/only_first_ack.png" width="600">
 
 We'll loosen the constraint to: `An acceptor can accept multiple proposals`.
