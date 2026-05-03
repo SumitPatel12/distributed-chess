@@ -1,5 +1,4 @@
 const shared = @import("shared.zig");
-const bitset = @import("bitset.zig");
 const messages = @import("messages.zig");
 
 const ProposalNumber = shared.ProposalNumber;
@@ -9,7 +8,7 @@ const NodeId = shared.NodeId;
 const ClusterConfig = shared.ClusterConfig;
 const AcceptedProposal = shared.AcceptedProposal;
 const Promise = messages.Promise;
-const BitSet = bitset.BitSet;
+const NodeBitSet = shared.NodeBitSet;
 
 pub const ProposerState = struct {
     next_epoch: u64,
@@ -20,10 +19,12 @@ pub const ProposerState = struct {
 /// are rejected, this avoids scenrios where a delayed promise would otherwise interfere with the
 /// the current attempt's quorum.
 ///
-/// Additionally keeps track of the highest_accepted proposals that acceptors reply with.
+/// Additionally keeps track of the highest_accepted proposals that acceptors reply with, these
+/// if any received will dirve if the original value is kept or discarded in favor of the one that
+/// accompanied the highest accepted one.
 const PromiseQuorum = struct {
     bound_to: ProposalNumber,
-    received: BitSet,
+    received: NodeBitSet,
     highest_seen: ?AcceptedProposal,
 
     // TODO: Wire up the actual method.

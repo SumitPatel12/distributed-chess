@@ -1,3 +1,5 @@
+// The standard library likely has a better implementation than what I haev here, a serious
+// implementation would either use that or some form of SIMD I guess.
 const std = @import("std");
 
 /// A fixed-lenght BitSet. Used to represent quorum responses, each bit represents whether or not a

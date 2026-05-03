@@ -1,9 +1,16 @@
+const bitset = @import("bitset.zig");
+
+const BitSet = bitset.BitSet;
+
 // It starts to get difficult to reason about things so we're using this hack to give type aliases
 // to make the implementation more legible.
 pub const NodeId = enum(u32) { _ };
 pub const PacketId = enum(u64) { _ };
 pub const TimerId = enum(u64) { _ };
 pub const CorrelationId = enum(u64) { _ };
+pub const NodeBitSet = BitSet(u64, 64);
+
+pub const MAX_CLUSTER_SIZE = 64;
 
 pub const ClusterConfig = struct {
     /// Current Nodes Id
