@@ -1,4 +1,5 @@
 const bitset = @import("bitset.zig");
+const build_options = @import("build_options");
 
 const BitSet = bitset.BitSet;
 
@@ -8,21 +9,17 @@ pub const NodeId = enum(u32) { _ };
 pub const PacketId = enum(u64) { _ };
 pub const TimerId = enum(u64) { _ };
 pub const CorrelationId = enum(u64) { _ };
-pub const NodeBitSet = BitSet(u64, 64);
 
-pub const MAX_CLUSTER_SIZE = 64;
+const build_cluster_size: u32 = build_options.cluster_size;
+pub const NodeBitSet = BitSet(u64, build_cluster_size);
 
 pub const ClusterConfig = struct {
     /// Current Nodes Id
     id: NodeId,
 
     /// Cluster contains exactly size number of nodes, is configured when the node is brought up.
-    size: u32,
-
-    /// For the given cluster config returns the quorum size.
-    pub inline fn quorum_size(self: ClusterConfig) usize {
-        return (self.size / 2) + 1;
-    }
+    pub const cluster_size = build_cluster_size;
+    pub const quorum_size = (cluster_size / 2) + 1;
 };
 
 /// Value that the Paxos cluster is trying to reach consensus for.

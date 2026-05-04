@@ -36,8 +36,8 @@ const PromiseQuorum = struct {
         return false;
     }
 
-    fn quorum_reached(self: *const PromiseQuorum, cluster: ClusterConfig) bool {
-        return self.received.count() >= cluster.quorum_size();
+    fn quorum_reached(self: *const PromiseQuorum) bool {
+        return self.received.count() >= ClusterConfig.quorum_size;
     }
 };
 
