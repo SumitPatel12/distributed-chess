@@ -17,7 +17,7 @@ pub const AcceptorState = struct {
         incoming_proposal_number: ProposalNumber,
     ) ?AcceptedProposal {
         if (self.accepted) |accepted_proposal| {
-            if (accepted_proposal.proposal_number.is_less_than(incoming_proposal_number)) {
+            if (accepted_proposal.proposal_number < incoming_proposal_number) {
                 return accepted_proposal;
             }
         }
@@ -31,7 +31,7 @@ pub const AcceptorState = struct {
 pub fn handle_prepare(state: *AcceptorState, request: PrepareRequest) PrepareResponse {
     // TODO: Add Trace events, if required.
     if (state.highest_promised == null or
-        state.highest_promised.?.is_less_than(request.proposal_number))
+        state.highest_promised.? < request.proposal_number)
     {
         state.highest_promised = request.proposal_number;
 
@@ -47,7 +47,7 @@ pub fn handle_prepare(state: *AcceptorState, request: PrepareRequest) PrepareRes
 
     // The prior if alreads ensures that state is non null at this point.
     // If it was a duplicate request we just give it the promise.
-    if (request.proposal_number.equals(state.highest_promised.?)) {
+    if (request.proposal_number == state.highest_promised.?) {
         // No need to perist since this is a duplicate.
         return .{ .promise = .{
             .proposal_number = request.proposal_number,
@@ -66,10 +66,9 @@ pub fn handle_prepare(state: *AcceptorState, request: PrepareRequest) PrepareRes
 
 pub fn handle_accept(state: *AcceptorState, request: AcceptRequest) AcceptResponse {
     // TODO: Handle trace events if any.
-    // Accept when we've made no promise yet, or the request's proposal_number is >= our promise.
-    // `!is_less_than` gives us `>=` since proposal numbers are totally ordered.
+
     if (state.highest_promised == null or
-        !request.proposal_number.is_less_than(state.highest_promised.?))
+        request.proposal_number >= state.highest_promised.?)
     {
         state.highest_promised = request.proposal_number;
         state.accepted = .{

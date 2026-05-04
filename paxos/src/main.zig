@@ -1,6 +1,5 @@
 const std = @import("std");
 const Io = std.Io;
-
 const paxos = @import("paxos");
 const build_options = @import("build_options");
 
@@ -17,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     // Argument parsing a lot more of a pain than you'd imagine. Funny how we take things for
     // granted until we actually have to implement it.
     // I'm going for a copout, we get only the first argument and parse it as a u32.
-    const node_id: u32 = std.fmt.parseInt(u32, args[1], 10) catch {
+    const node_id: u8 = std.fmt.parseInt(u8, args[1], 10) catch {
         std.debug.print(
             "usage: {s} <node_id>",
             .{args[0]},

@@ -1,4 +1,5 @@
 const std = @import("std");
+const bitset = @import("bitset.zig");
 const shared = @import("shared.zig");
 const messages = @import("messages.zig");
 const timer = @import("timer.zig");
@@ -66,3 +67,8 @@ pub const PaxosNode = struct {
         _ = out;
     }
 };
+
+test {
+    _ = shared;
+    _ = bitset;
+}
