@@ -14,12 +14,12 @@ pub const ProposalNumber = u32;
 
 const build_cluster_size: u32 = build_options.cluster_size;
 pub const NodeBitSet = BitSet(u64, build_cluster_size);
+pub const MAX_CHOSEN_RETRIES: u32 = 256;
 
 pub const ClusterConfig = struct {
     /// Current Nodes Id
     id: NodeId,
 
-    /// Cluster contains exactly size number of nodes, is configured when the node is brought up.
     pub const cluster_size = build_cluster_size;
     pub const quorum_size = (cluster_size / 2) + 1;
 };

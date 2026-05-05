@@ -20,6 +20,7 @@ const TraceEvent = trace.TraceEvent;
 const AcceptorState = acceptor.AcceptorState;
 const ProposerState = proposer.ProposerState;
 const LearnerState = learner.LearnerState;
+const ProposalNumberHelper = shared.ProposalNumberHelper;
 
 pub const Input = union(enum) {
     client_propose: Value,
@@ -49,10 +50,34 @@ pub const NodeLifecycle = enum {
 };
 
 pub const PaxosNode = struct {
+    /// Cluster configuration carrying the cluster size, quorum size, and the node id.
     config: ClusterConfig,
     acceptor: AcceptorState,
     proposer: ProposerState,
     learner: LearnerState,
+    /// Pseudo random number generation for the DST harness. Hopefully I can get this to work.
+    prng: std.Random.DefaultPrng,
+
+    pub fn init(seed: u64, cluster_config: ClusterConfig) PaxosNode {
+        return .{
+            .config = cluster_config,
+            .acceptor = .{
+                .accepted = null,
+                .highest_promised = null,
+            },
+            .proposer = .{
+                .next_epoch = 1,
+                .active = null,
+            },
+            .learner = .{
+                .chosen = null,
+                .peers_informed = .{},
+                .chosen_retransmits_remaining = shared.MAX_CHOSEN_RETRIES,
+                .chosen_retransmit_timer = null,
+            },
+            .prng = std.Random.DefaultPrng.init(seed),
+        };
+    }
 
     pub fn on_input(self: *PaxosNode, input: Input, out: *EffectList) void {
         _ = self;

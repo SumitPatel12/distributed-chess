@@ -11,7 +11,7 @@ const Promise = messages.Promise;
 const NodeBitSet = shared.NodeBitSet;
 
 pub const ProposerState = struct {
-    next_epoch: u64,
+    next_epoch: u24,
     active: ?ActiveProposal,
 };
 

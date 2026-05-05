@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     // I'm going for a copout, we get only the first argument and parse it as a u32.
     const node_id: u8 = std.fmt.parseInt(u8, args[1], 10) catch {
         std.debug.print(
-            "usage: {s} <node_id>",
+            "usage: {s} <node_id>\n",
             .{args[0]},
         );
         std.process.exit(1);
