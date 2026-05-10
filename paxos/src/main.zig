@@ -1,6 +1,5 @@
 const std = @import("std");
 const Io = std.Io;
-const paxos = @import("paxos");
 const build_options = @import("build_options");
 
 pub fn main(init: std.process.Init) !void {
