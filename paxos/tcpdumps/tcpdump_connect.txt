@@ -1,0 +1,83 @@
+Scenario:
+- Server start-up:
+    - Creates socket
+    - bind to 3000
+    - listen
+    - Waits now doesn't call accept.
+    - Interrupt the server by pressing Ctrl + C atfer client terminates.
+- Client start-up:
+    - creates socket
+    - connects to server on 3000
+    - sends a message
+    - Immediately calls close
+    - Sleeps for 5 seconds
+    - terminates.
+
+Command Used fro the Dump: sudo tcpdump -i lo0 -nn 'tcp port 3000' -X > tcpdump_connect.txt
+
+What I'd expect is:
+-  handshake (truns out accept only takes from the kernel queue, the connection establishes as soon as the caller calls connect) So SYN -> SYN-ACK -> ACK.
+- one packet for PUSH
+- ACK the PUSH
+- FIN
+- ACK
+- RES
+
+But in here we've got:
+- SYN -> SYN-ACK -> ACK
+- PUSH: seq 1:42, ack 1
+- FIN: seq 42, ack 1
+- ACK: ack 1 (This ack doesn't seem to make sense to me)
+- ACK: ack 42
+- ACK: ack 43
+- RES: seq 1, ack 43
+
+
+Actual TCP DUMP:
+
+07:59:59.411654 IP 127.0.0.1.56281 > 127.0.0.1.3000: Flags [S], seq 1389712059, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 3220606260 ecr 0,sackOK,eol], length 0
+	0x0000:  4500 0040 0000 4000 4006 0000 7f00 0001  E..@..@.@.......
+	0x0010:  7f00 0001 dbd9 0bb8 52d5 52bb 0000 0000  ........R.R.....
+	0x0020:  b002 ffff fe34 0000 0204 3fd8 0103 0306  .....4....?.....
+	0x0030:  0101 080a bff6 8d34 0000 0000 0402 0000  .......4........
+07:59:59.411783 IP 127.0.0.1.3000 > 127.0.0.1.56281: Flags [S.], seq 1304943390, ack 1389712060, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 1162339276 ecr 3220606260,sackOK,eol], length 0
+	0x0000:  4500 0040 0000 4000 4006 0000 7f00 0001  E..@..@.@.......
+	0x0010:  7f00 0001 0bb8 dbd9 4dc7 db1e 52d5 52bc  ........M...R.R.
+	0x0020:  b012 ffff fe34 0000 0204 3fd8 0103 0306  .....4....?.....
+	0x0030:  0101 080a 4547 e3cc bff6 8d34 0402 0000  ....EG.....4....
+07:59:59.411822 IP 127.0.0.1.56281 > 127.0.0.1.3000: Flags [.], ack 1, win 6380, options [nop,nop,TS val 3220606260 ecr 1162339276], length 0
+	0x0000:  4500 0034 0000 4000 4006 0000 7f00 0001  E..4..@.@.......
+	0x0010:  7f00 0001 dbd9 0bb8 52d5 52bc 4dc7 db1f  ........R.R.M...
+	0x0020:  8010 18ec fe28 0000 0101 080a bff6 8d34  .....(.........4
+	0x0030:  4547 e3cc                                EG..
+07:59:59.411828 IP 127.0.0.1.56281 > 127.0.0.1.3000: Flags [P.], seq 1:42, ack 1, win 6380, options [nop,nop,TS val 3220606260 ecr 1162339276], length 41
+	0x0000:  4500 005d 0000 4000 4006 0000 7f00 0001  E..]..@.@.......
+	0x0010:  7f00 0001 dbd9 0bb8 52d5 52bc 4dc7 db1f  ........R.R.M...
+	0x0020:  8018 18ec fe51 0000 0101 080a bff6 8d34  .....Q.........4
+	0x0030:  4547 e3cc 5061 636b 2053 6175 6365 2028  EG..Pack.Sauce.(
+	0x0040:  5665 7279 2062 6164 2077 6f72 6420 706c  Very.bad.word.pl
+	0x0050:  6179 206f 6e20 5061 786f 7329 21         ay.on.Paxos)!
+07:59:59.411831 IP 127.0.0.1.56281 > 127.0.0.1.3000: Flags [F.], seq 42, ack 1, win 6380, options [nop,nop,TS val 3220606260 ecr 1162339276], length 0
+	0x0000:  4500 0034 0000 4000 4006 0000 7f00 0001  E..4..@.@.......
+	0x0010:  7f00 0001 dbd9 0bb8 52d5 52e5 4dc7 db1f  ........R.R.M...
+	0x0020:  8011 18ec fe28 0000 0101 080a bff6 8d34  .....(.........4
+	0x0030:  4547 e3cc                                EG..
+07:59:59.411849 IP 127.0.0.1.3000 > 127.0.0.1.56281: Flags [.], ack 1, win 6380, options [nop,nop,TS val 1162339276 ecr 3220606260], length 0
+	0x0000:  4500 0034 0000 4000 4006 0000 7f00 0001  E..4..@.@.......
+	0x0010:  7f00 0001 0bb8 dbd9 4dc7 db1f 52d5 52bc  ........M...R.R.
+	0x0020:  8010 18ec fe28 0000 0101 080a 4547 e3cc  .....(......EG..
+	0x0030:  bff6 8d34                                ...4
+07:59:59.411859 IP 127.0.0.1.3000 > 127.0.0.1.56281: Flags [.], ack 42, win 6380, options [nop,nop,TS val 1162339276 ecr 3220606260], length 0
+	0x0000:  4500 0034 0000 4000 4006 0000 7f00 0001  E..4..@.@.......
+	0x0010:  7f00 0001 0bb8 dbd9 4dc7 db1f 52d5 52e5  ........M...R.R.
+	0x0020:  8010 18ec fe28 0000 0101 080a 4547 e3cc  .....(......EG..
+	0x0030:  bff6 8d34                                ...4
+07:59:59.411868 IP 127.0.0.1.3000 > 127.0.0.1.56281: Flags [.], ack 43, win 6380, options [nop,nop,TS val 1162339276 ecr 3220606260], length 0
+	0x0000:  4500 0034 0000 4000 4006 0000 7f00 0001  E..4..@.@.......
+	0x0010:  7f00 0001 0bb8 dbd9 4dc7 db1f 52d5 52e6  ........M...R.R.
+	0x0020:  8010 18ec fe28 0000 0101 080a 4547 e3cc  .....(......EG..
+	0x0030:  bff6 8d34                                ...4
+08:00:05.897233 IP 127.0.0.1.3000 > 127.0.0.1.56281: Flags [R.], seq 1, ack 43, win 6380, length 0
+	0x0000:  4500 0028 0000 4000 4006 0000 7f00 0001  E..(..@.@.......
+	0x0010:  7f00 0001 0bb8 dbd9 4dc7 db1f 52d5 52e6  ........M...R.R.
+	0x0020:  5014 18ec fe1c 0000                      P.......

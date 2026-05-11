@@ -410,6 +410,12 @@ pub fn main(init: std.process.Init) !void {
 
         const socket = try io.open_socket_tcp(true);
         try io.listen(socket, "127.0.0.1", 3000, 128);
+
+        var stdin_buffer: [16]u8 = undefined;
+        var stdin_reader = sleep_io.File.stdin().reader(init.io, &stdin_buffer);
+        std.debug.print("Press Enter to accept\n", .{});
+        _ = try stdin_reader.interface.takeByte();
+
         var peer: c.sockaddr.in = undefined;
         const peer_conn_socket = try io.accept(socket, &peer);
 
@@ -423,7 +429,7 @@ pub fn main(init: std.process.Init) !void {
             );
             std.debug.print("Trying to Send Now.", .{});
             // Now send will fail with Broken Pipe cause the half connection is closed.
-            _ = try io.send(peer_conn_socket, "Nacksos!!! You there? Heh, you better be there", 0);
+            _ = try io.send(peer_conn_socket, "Nackxos!!! You there? Heh, you better be there", 0);
             // For TCP it means that the peer has closed his half-side of the connection. I forgot
             // to add this and it spun on till eternity.
             if (bytes_received == 0) break;
@@ -432,6 +438,9 @@ pub fn main(init: std.process.Init) !void {
     } else {
         var io: IO = .{};
         const socket = try io.open_socket_tcp(true);
+
+        // Interesting fact: The connect takes care of the handshake, accept only drives whether the
+        // connection is consumed by the listener. The connection is open at this point.
         try io.connect(socket, "127.0.0.1", 3000);
         // My humor is truly broken, don't judge me!!!
         _ = try io.send(socket, "Pack Sauce (Very bad word play on Paxos)!", 0);
