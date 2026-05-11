@@ -1,3 +1,6 @@
+//! https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/ is what I'm looking at
+//! after Beejs guide is done.
+//!
 //! For Network Programming: https://www.cs.cornell.edu/~kvikram/HTMLS/MLA/NET.PDF Beeje's Guide is
 //! what I'm looking at. 51 pages.
 //!
@@ -17,6 +20,7 @@
 const std = @import("std");
 const c = std.c;
 const socket_t = std.c.fd_t;
+const sleep_io = std.Io;
 
 // Trying to recreate a part of the posix interface that was pruned out. And boy do you find more
 // respect for such abstractions when you end up building one yourself.
@@ -396,6 +400,7 @@ const IO = struct {
 // Yeah, yeah I know, file named event_loop_async_io and we got a network that is blocking. One step
 // at a time.
 pub fn main(init: std.process.Init) !void {
+    // Args parsing is a pain. I'll just have hardcoded stuff for now.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const server = if (std.mem.eql(u8, args[1], "server")) true else false;
@@ -411,6 +416,14 @@ pub fn main(init: std.process.Init) !void {
         var buffer: [1024]u8 = undefined;
         while (true) {
             const bytes_received = try io.recv(peer_conn_socket, &buffer, 0);
+            try sleep_io.sleep(
+                init.io,
+                sleep_io.Duration.fromSeconds(5),
+                .awake,
+            );
+            std.debug.print("Trying to Send Now.", .{});
+            // Now send will fail with Broken Pipe cause the half connection is closed.
+            _ = try io.send(peer_conn_socket, "Nacksos!!! You there? Heh, you better be there", 0);
             // For TCP it means that the peer has closed his half-side of the connection. I forgot
             // to add this and it spun on till eternity.
             if (bytes_received == 0) break;
@@ -422,5 +435,17 @@ pub fn main(init: std.process.Init) !void {
         try io.connect(socket, "127.0.0.1", 3000);
         // My humor is truly broken, don't judge me!!!
         _ = try io.send(socket, "Pack Sauce (Very bad word play on Paxos)!", 0);
+
+        // var buffer: [1024]u8 = undefined;
+        // const bytes_received = try io.recv(socket, &buffer, 0);
+        // std.debug.print("recv {d} bytes: {s}\n", .{ bytes_received, buffer[0..bytes_received] });
+
+        io.close_socket(socket);
+        std.debug.print("Socket Closed Now Sleeping", .{});
+        try sleep_io.sleep(
+            init.io,
+            sleep_io.Duration.fromSeconds(5),
+            .awake,
+        );
     }
 }
