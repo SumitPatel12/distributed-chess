@@ -1,0 +1,8 @@
+The zig posix library has lost a lot of it's socket related functions in favor of the std lib it seems. Since I plan on learning the things, I'll be using the std.c to circumvent this and write my own wrappers.
+
+## So What's the Flow You Ask?
+You get a socket, bind it to the address, start listening, and then accept connection requests. To connect to the server you create a socket, and just pass the address you want to connect to, and after the peer socket accepts you're good to go. That's the very dumbed down version of things. There's a lot of nuance while creating these sockets like should it be blocking or non-blocking, what options should it have, timeouts and all the good (and the scary) stuff.
+
+The interesting thing I found was:
+- After a socket is created and it starts listening, to establish a connection i.e. for a TCP handshake to occur you don't need to accept first, any client that want's to connect with this socket can call the `connect` method with the right address and the kernel will take care of the TCP handshake, establish the connection, and queue it up in the accept buffer. When the server calls `accept` they only take the data from the aforementioned buffer, and open a dedicated fd for that connection, the connection was already established, we just said yeah, I'm ready to communicate with you now.
+- Writes ofcourse don't happen atomically when you send data over the connection the protocol is free to send howermany bytes they want, so a 100 byte message can range from 1 to 100 packets. So, you have to have some **message scheme** that would let you distinguish message boundaries.

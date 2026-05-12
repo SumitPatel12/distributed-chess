@@ -22,9 +22,9 @@ And now if you make a move say d2 -> d4, then you have two options:
 1. Calculate the whole hash anew.
 2. XOR with the pawn's hash at d2 then XOR with pawns hash at d4. This works because XOR is it's own inverse, XORing with itself negates, so by XORing with both the old and the new position we negated that piece's last hash and added in the new one.
  
-**DISCLAMAIR: The following paragraph is what I suspect I've not seen the stockfish or an open engines code to verify this, and is my opinion. Feel free to correct me if I'm wrong.**
+**DISCLAIMER: The following paragraph is what I suspect I've not seen the stockfish or an open engines code to verify this, and is my opinion. Feel free to correct me if I'm wrong.**
 The first one is mostly useful if you're trying to create a chess engine which has to calculate thousands if not millions of positions in a single second, and remember the positions as well, because for a chess engine you'd be searching a variety of positions and finding the best move for it. If you've seen the same position before and you can detect it (Zobrist hash again) you don't need to redo your calculations, and the same position can be reached by a veriety of different moves so that does come in handy. 
-**DISCLAMAIR END**
+**DISCLAIMER END**
 
 For normal chess games (the ones between humans), you don't need to do this since the amount of time it takes to walk a board and calculate the hash is in the nano-second to single digit microseconds range (from my calculations and benchmarks, it may differ for you, but it's still well out of the human cognition range), quite unnoticeable for the timescale at which humans are going to play over the board. 
 

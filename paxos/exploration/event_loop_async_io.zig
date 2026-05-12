@@ -20,7 +20,6 @@
 const std = @import("std");
 const c = std.c;
 const socket_t = std.c.fd_t;
-const sleep_io = std.Io;
 
 // Trying to recreate a part of the posix interface that was pruned out. And boy do you find more
 // respect for such abstractions when you end up building one yourself.
@@ -411,25 +410,14 @@ pub fn main(init: std.process.Init) !void {
         const socket = try io.open_socket_tcp(true);
         try io.listen(socket, "127.0.0.1", 3000, 128);
 
-        var stdin_buffer: [16]u8 = undefined;
-        var stdin_reader = sleep_io.File.stdin().reader(init.io, &stdin_buffer);
-        std.debug.print("Press Enter to accept\n", .{});
-        _ = try stdin_reader.interface.takeByte();
-
         var peer: c.sockaddr.in = undefined;
         const peer_conn_socket = try io.accept(socket, &peer);
 
         var buffer: [1024]u8 = undefined;
         while (true) {
             const bytes_received = try io.recv(peer_conn_socket, &buffer, 0);
-            try sleep_io.sleep(
-                init.io,
-                sleep_io.Duration.fromSeconds(5),
-                .awake,
-            );
-            std.debug.print("Trying to Send Now.", .{});
-            // Now send will fail with Broken Pipe cause the half connection is closed.
             _ = try io.send(peer_conn_socket, "Nackxos!!! You there? Heh, you better be there", 0);
+
             // For TCP it means that the peer has closed his half-side of the connection. I forgot
             // to add this and it spun on till eternity.
             if (bytes_received == 0) break;
@@ -445,16 +433,10 @@ pub fn main(init: std.process.Init) !void {
         // My humor is truly broken, don't judge me!!!
         _ = try io.send(socket, "Pack Sauce (Very bad word play on Paxos)!", 0);
 
-        // var buffer: [1024]u8 = undefined;
-        // const bytes_received = try io.recv(socket, &buffer, 0);
-        // std.debug.print("recv {d} bytes: {s}\n", .{ bytes_received, buffer[0..bytes_received] });
+        var buffer: [1024]u8 = undefined;
+        const bytes_received = try io.recv(socket, &buffer, 0);
+        std.debug.print("recv {d} bytes: {s}\n", .{ bytes_received, buffer[0..bytes_received] });
 
         io.close_socket(socket);
-        std.debug.print("Socket Closed Now Sleeping", .{});
-        try sleep_io.sleep(
-            init.io,
-            sleep_io.Duration.fromSeconds(5),
-            .awake,
-        );
     }
 }
