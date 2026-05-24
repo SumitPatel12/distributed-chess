@@ -41,6 +41,12 @@ extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 // And because I need to create from the c api, man pages it is. There's a man page for everything,
 // I got a headache reading and comprehending all of them, hats off to the Linux people, maintaining
 // such a comprehensive doc system, must have been a lot of work.
+//
+// TODO: I think unreachable in the error is not a really great idea, if I miss something and that
+// pops up, the system crashes with unreachable, we want the system to crash, we just don't want to
+// lose data just because I marked it as unreachable. Likely make it some kind of unexpected error
+// and log out it's error no, that would be the best idea imo.
+
 /// Network IO for macos.
 const IO = struct {
     const IOError = error{
@@ -262,9 +268,9 @@ const IO = struct {
         }
     }
 
-    pub fn accept(self: *IO, listen_socket: socket_t, peer: *c.sockaddr.in) IOError!socket_t {
-        _ = self;
-
+    /// Returns the dedicated socket for that connection. That socket would then be used to read and
+    /// write for that TCP connecton.
+    pub fn accept(self: *IO, listen_socket: socket_t, peer: *c.sockaddr.in, blocking: bool) IOError!socket_t {
         var len: c.socklen_t = @sizeOf(@TypeOf(peer.*));
         // Write the peer's info the the peer, and writes how many bytes it wrote to peer in the len
         // field.
@@ -285,12 +291,18 @@ const IO = struct {
                 else => unreachable,
             };
         }
+        errdefer self.close_socket(new_socket);
+
+        if (!blocking) {
+            try set_nonblock(new_socket);
+        }
 
         return new_socket;
     }
 
     // Once again we're using u31 because send returns a signed int and well negative numbers are
     // errors so the effective range of bytes written to is u31.
+    /// Returns the number of bytes written/sent and returns an IOError in case of an error.
     fn send(self: *IO, socket: socket_t, message: []const u8, flags: u32) IOError!u31 {
         _ = self;
 
@@ -326,6 +338,7 @@ const IO = struct {
         return @as(u31, @intCast(send_res));
     }
 
+    /// Returns the number of bytes read.
     fn recv(self: *IO, socket: socket_t, buffer: []u8, flags: u32) IOError!u31 {
         _ = self;
 
@@ -411,7 +424,7 @@ pub fn main(init: std.process.Init) !void {
         try io.listen(socket, "127.0.0.1", 3000, 128);
 
         var peer: c.sockaddr.in = undefined;
-        const peer_conn_socket = try io.accept(socket, &peer);
+        const peer_conn_socket = try io.accept(socket, &peer, true);
 
         var buffer: [1024]u8 = undefined;
         while (true) {

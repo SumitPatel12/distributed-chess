@@ -28,6 +28,7 @@ But in here we've got:
 - PUSH: seq 1:42, ack 1
 - FIN: seq 42, ack 1
 - ACK: ack 1 (This ack doesn't seem to make sense to me)
+    - Update it's a tcp window update ack, if you use wireshark you'll see that. It is send when the receiver acknowledges that they have more window space, if you see then before that during the handshake there was 65535, and later it becomes 6308 which actually means 6308 x 64. Honestly I didn't even know something like this existed for tcp.
 - ACK: ack 42
 - ACK: ack 43
 - RES: seq 1, ack 43
