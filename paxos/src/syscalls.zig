@@ -20,6 +20,7 @@
 const std = @import("std");
 const c = std.c;
 const socket_t = std.c.fd_t;
+const max_retires = 8;
 
 pub const SetNonblockError = error{
     SocketFileDescriptorInvalid,
@@ -75,7 +76,6 @@ pub const ConnectError = error{
     AddressNotAccessible,
     HostUnreachable,
     ConnectionInProgress,
-    InterruptedBySignal,
     InvalidArgument,
     SocketAlreadyConnected,
     NetworkDown,
@@ -98,7 +98,6 @@ pub const AcceptError = error{
     SocketFileDescriptorInvalid,
     ConnectionAborted,
     AddressNotAccessible,
-    InterruptedBySignal,
     SocketNotListening,
     ProcessFdLimitExceeded,
     SystemFdLimitExceeded,
@@ -117,7 +116,6 @@ pub const SendError = error{
     AddressIsNull,
     AddressNotAccessible,
     HostUnreachable,
-    InterruptedBySignal,
     MessageTooLarge,
     NetworkDown,
     NetworkUnreachable,
@@ -133,7 +131,6 @@ pub const RecvError = error{
     SocketFileDescriptorInvalid,
     ConnectionResetByPeer,
     AddressNotAccessible,
-    InterruptedBySignal,
     InvalidArgument,
     InsufficientSystemResources,
     SocketNotConnected,
@@ -300,39 +297,44 @@ pub fn connect(socket: socket_t, addr: [*:0]const u8, port: u16) ConnectError!vo
         .port = std.mem.nativeToBig(u16, port),
     };
 
-    const connect_res = c.connect(socket, @ptrCast(&address), @sizeOf(@TypeOf(address)));
-    if (connect_res < 0) {
-        return switch (c.errno(connect_res)) {
-            .ACCES => error.PermissionDenied,
-            .ADDRINUSE => error.AddressAlreadyInUse,
-            .ADDRNOTAVAIL => error.AddressNotAvailable,
-            .AFNOSUPPORT => error.AddressFamilyMismatch,
-            .ALREADY => error.ConnectionAlreadyInProgress,
-            .BADF => error.SocketFileDescriptorInvalid,
-            .CONNREFUSED => error.ConnectionRefused,
-            .FAULT => error.AddressNotAccessible,
-            .HOSTUNREACH => error.HostUnreachable,
-            .INPROGRESS => error.ConnectionInProgress,
-            .INTR => error.InterruptedBySignal,
-            .INVAL => error.InvalidArgument,
-            .ISCONN => error.SocketAlreadyConnected,
-            .NETDOWN => error.NetworkDown,
-            .NETUNREACH => error.NetworkUnreachable,
-            .NOBUFS => error.InsufficientSystemResources,
-            .NOTSOCK => error.NotASocket,
-            .OPNOTSUPP => error.OperationNotSupported,
-            .PROTOTYPE => error.AddressTypeMismatch,
-            .TIMEDOUT => error.ConnectionTimedOut,
-            .CONNRESET => error.ConnectionResetByPeer,
+    for (0..max_retires) |_| {
+        const connect_res = c.connect(socket, @ptrCast(&address), @sizeOf(@TypeOf(address)));
+        if (connect_res >= 0) {
+            return;
+        }
+        switch (c.errno(connect_res)) {
+            // Retry the interrupted call; after max_retires interruptions we give up and panic.
+            .INTR => continue,
+            .ACCES => return error.PermissionDenied,
+            .ADDRINUSE => return error.AddressAlreadyInUse,
+            .ADDRNOTAVAIL => return error.AddressNotAvailable,
+            .AFNOSUPPORT => return error.AddressFamilyMismatch,
+            .ALREADY => return error.ConnectionAlreadyInProgress,
+            .BADF => return error.SocketFileDescriptorInvalid,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .FAULT => return error.AddressNotAccessible,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .INPROGRESS => return error.ConnectionInProgress,
+            .INVAL => return error.InvalidArgument,
+            .ISCONN => return error.SocketAlreadyConnected,
+            .NETDOWN => return error.NetworkDown,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOBUFS => return error.InsufficientSystemResources,
+            .NOTSOCK => return error.NotASocket,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .PROTOTYPE => return error.AddressTypeMismatch,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .CONNRESET => return error.ConnectionResetByPeer,
             // UNIX domain ones
-            .IO => error.FileSystemIoError,
-            .LOOP => error.AddressLoopBack,
-            .NAMETOOLONG => error.AddressTooLong,
-            .NOENT => error.NamedSocketNotFound,
-            .NOTDIR => error.NotADirectory,
+            .IO => return error.FileSystemIoError,
+            .LOOP => return error.AddressLoopBack,
+            .NAMETOOLONG => return error.AddressTooLong,
+            .NOENT => return error.NamedSocketNotFound,
+            .NOTDIR => return error.NotADirectory,
             else => |e| unexpected_errno("connect", e),
-        };
+        }
     }
+    @panic("connect: exhausted EINTR retries");
 }
 
 /// Returns the dedicated socket for that connection. That socket would then be used to read and
@@ -341,30 +343,34 @@ pub fn accept(listen_socket: socket_t, peer: *c.sockaddr.in, blocking: bool) Acc
     var len: c.socklen_t = @sizeOf(@TypeOf(peer.*));
     // Write the peer's info the the peer, and writes how many bytes it wrote to peer in the len
     // field.
-    const new_socket = c.accept(listen_socket, @ptrCast(peer), &len);
-    if (new_socket < 0) {
-        return switch (c.errno(new_socket)) {
-            .BADF => error.SocketFileDescriptorInvalid,
-            .CONNABORTED => error.ConnectionAborted,
-            .FAULT => error.AddressNotAccessible,
-            .INTR => error.InterruptedBySignal,
-            .INVAL => error.SocketNotListening,
-            .MFILE => error.ProcessFdLimitExceeded,
-            .NFILE => error.SystemFdLimitExceeded,
-            .NOMEM => error.InsufficientSystemResources,
-            .NOTSOCK => error.NotASocket,
-            .OPNOTSUPP => error.OperationNotSupported,
-            .AGAIN => error.WouldBlock,
+    for (0..max_retires) |_| {
+        const new_socket = c.accept(listen_socket, @ptrCast(peer), &len);
+        if (new_socket >= 0) {
+            errdefer close_socket(new_socket);
+
+            if (!blocking) {
+                try set_nonblock(new_socket);
+            }
+
+            return new_socket;
+        }
+        switch (c.errno(new_socket)) {
+            // Retry the interrupted call; after max_retires interruptions we give up and panic.
+            .INTR => continue,
+            .BADF => return error.SocketFileDescriptorInvalid,
+            .CONNABORTED => return error.ConnectionAborted,
+            .FAULT => return error.AddressNotAccessible,
+            .INVAL => return error.SocketNotListening,
+            .MFILE => return error.ProcessFdLimitExceeded,
+            .NFILE => return error.SystemFdLimitExceeded,
+            .NOMEM => return error.InsufficientSystemResources,
+            .NOTSOCK => return error.NotASocket,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .AGAIN => return error.WouldBlock,
             else => |e| unexpected_errno("accept", e),
-        };
+        }
     }
-    errdefer close_socket(new_socket);
-
-    if (!blocking) {
-        try set_nonblock(new_socket);
-    }
-
-    return new_socket;
+    @panic("accept: exhausted EINTR retries");
 }
 
 // Once again we're using u31 because send returns a signed int and well negative numbers are
@@ -377,52 +383,60 @@ pub fn send(socket: socket_t, message: []const u8, flags: u32) SendError!u31 {
     // None of which are required for us, so most of the time we'll be sending 0.
     //
     // For tcp `send` can send only some of the data, so keep an eye out for that.
-    const send_res = c.send(socket, message.ptr, message.len, flags);
-    if (send_res < 0) {
-        return switch (c.errno(send_res)) {
-            .ACCES => error.PermissionDenied,
-            .ADDRNOTAVAIL => error.AddressNotAvailable,
-            .AGAIN => error.WouldBlock,
-            .BADF => error.SocketFileDescriptorInvalid,
-            .CONNRESET => error.ConnectionResetByPeer,
-            .DESTADDRREQ => error.AddressIsNull,
-            .FAULT => error.AddressNotAccessible,
-            .HOSTUNREACH => error.HostUnreachable,
-            .INTR => error.InterruptedBySignal,
-            .MSGSIZE => error.MessageTooLarge,
-            .NETDOWN => error.NetworkDown,
-            .NETUNREACH => error.NetworkUnreachable,
-            .NOBUFS => error.InsufficientSystemResources,
-            .NOTCONN => error.SocketNotConnected,
-            .NOTSOCK => error.NotASocket,
-            .OPNOTSUPP => error.OperationNotSupported,
-            .PIPE => error.BrokenPipe,
+    for (0..max_retires) |_| {
+        const send_res = c.send(socket, message.ptr, message.len, flags);
+        if (send_res >= 0) {
+            return @as(u31, @intCast(send_res));
+        }
+        switch (c.errno(send_res)) {
+            // Retry the interrupted call; after max_retires interruptions we give up and panic.
+            .INTR => continue,
+            .ACCES => return error.PermissionDenied,
+            .ADDRNOTAVAIL => return error.AddressNotAvailable,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.SocketFileDescriptorInvalid,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .DESTADDRREQ => return error.AddressIsNull,
+            .FAULT => return error.AddressNotAccessible,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .MSGSIZE => return error.MessageTooLarge,
+            .NETDOWN => return error.NetworkDown,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOBUFS => return error.InsufficientSystemResources,
+            .NOTCONN => return error.SocketNotConnected,
+            .NOTSOCK => return error.NotASocket,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .PIPE => return error.BrokenPipe,
             else => |e| unexpected_errno("send", e),
-        };
+        }
     }
-    return @as(u31, @intCast(send_res));
+    @panic("send: exhausted EINTR retries");
 }
 
 /// Returns the number of bytes read.
 pub fn recv(socket: socket_t, buffer: []u8, flags: u32) RecvError!u31 {
-    const recv_res = c.recv(socket, buffer.ptr, buffer.len, @as(c_int, @intCast(flags)));
-    if (recv_res < 0) {
-        return switch (c.errno(recv_res)) {
-            .AGAIN => error.WouldBlock,
-            .BADF => error.SocketFileDescriptorInvalid,
-            .CONNRESET => error.ConnectionResetByPeer,
-            .FAULT => error.AddressNotAccessible,
-            .INTR => error.InterruptedBySignal,
-            .INVAL => error.InvalidArgument,
-            .NOBUFS => error.InsufficientSystemResources,
-            .NOTCONN => error.SocketNotConnected,
-            .NOTSOCK => error.NotASocket,
-            .OPNOTSUPP => error.OperationNotSupported,
-            .TIMEDOUT => error.ConnectionTimedOut,
+    for (0..max_retires) |_| {
+        const recv_res = c.recv(socket, buffer.ptr, buffer.len, @as(c_int, @intCast(flags)));
+        if (recv_res >= 0) {
+            return @as(u31, @intCast(recv_res));
+        }
+        switch (c.errno(recv_res)) {
+            // After max_retires for interruptions we give up and panic.
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.SocketFileDescriptorInvalid,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .FAULT => return error.AddressNotAccessible,
+            .INVAL => return error.InvalidArgument,
+            .NOBUFS => return error.InsufficientSystemResources,
+            .NOTCONN => return error.SocketNotConnected,
+            .NOTSOCK => return error.NotASocket,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .TIMEDOUT => return error.ConnectionTimedOut,
             else => |e| unexpected_errno("recv", e),
-        };
+        }
     }
-    return @as(u31, @intCast(recv_res));
+    @panic("recv: exhausted EINTR retries");
 }
 
 fn set_nonblock(socket: socket_t) SetNonblockError!void {
