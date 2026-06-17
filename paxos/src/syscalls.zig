@@ -19,124 +19,145 @@
 
 const std = @import("std");
 const c = std.c;
+const fd_t = std.c.fd_t;
 const socket_t = std.c.fd_t;
 const max_retires = 8;
+const assert = std.debug.assert;
 
 pub const SetNonblockError = error{
     SocketFileDescriptorInvalid,
 };
 
-pub const SetSockOptError = error{
-    SocketFileDescriptorInvalid,
-    OptionValueOutOfBounds,
-    AddressNotAccessible,
-    InvalidArgument,
-    SocketAlreadyConnected,
+pub const KqueueError = error{
     InsufficientSystemResources,
-    NotSupported,
+    ProcessFdLimitExceeded,
+    SystemFdLimitExceeded,
+};
+
+pub const KeventError = error{
+    AddressNotAccessible,
+    EventNotFoundOrIsUneditable,
+    FileDescriptorInvalid,
+    InsufficientSystemResources,
+    InvalidArgument,
+    PermissionDenied,
+    TargetProcessDoesNotExist,
+};
+
+pub const SetSockOptError = error{
+    AddressNotAccessible,
+    InsufficientSystemResources,
+    InvalidArgument,
     NotASocket,
+    NotSupported,
+    OptionValueOutOfBounds,
+    SocketAlreadyConnected,
+    SocketFileDescriptorInvalid,
 };
 
 pub const OpenSocketError = error{
-    PermissionDenied,
-    ProtocolNotSupported,
-    ProcessFdLimitExceeded,
-    SystemFdLimitExceeded,
     InsufficientSystemResources,
+    PermissionDenied,
+    ProcessFdLimitExceeded,
+    ProtocolNotSupported,
+    SystemFdLimitExceeded,
 } || SetNonblockError;
 
 pub const ListenError = error{
-    PermissionDenied,
     AddressAlreadyInUse,
-    AddressNotLocal,
     AddressFamilyMismatch,
-    SocketFileDescriptorInvalid,
     AddressIsNull,
+    AddressLoopBack,
     AddressNotAccessible,
-    SocketAlreadyBound,
+    AddressNotDirectory,
+    AddressNotFound,
+    AddressNotLocal,
+    AddressReadOnly,
+    AddressTooLong,
     NotASocket,
     OperationNotSupported,
-    AddressLoopBack,
-    AddressTooLong,
-    AddressNotFound,
-    AddressNotDirectory,
-    AddressReadOnly,
-    SocketNotBound,
+    PermissionDenied,
+    SocketAlreadyBound,
     SocketAlreadyConnected,
-} || SetSockOptError;
+    SocketFileDescriptorInvalid,
+    SocketNotBound,
+} || SetSockOptError || ParseAddressError;
 
 pub const ConnectError = error{
-    PermissionDenied,
     AddressAlreadyInUse,
-    AddressNotAvailable,
     AddressFamilyMismatch,
-    ConnectionAlreadyInProgress,
-    SocketFileDescriptorInvalid,
-    ConnectionRefused,
+    AddressLoopBack,
     AddressNotAccessible,
+    AddressNotAvailable,
+    AddressTooLong,
+    AddressTypeMismatch,
+    ConnectionAlreadyInProgress,
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    FileSystemIoError,
     HostUnreachable,
-    ConnectionInProgress,
+    InsufficientSystemResources,
     InvalidArgument,
-    SocketAlreadyConnected,
+    NamedSocketNotFound,
     NetworkDown,
     NetworkUnreachable,
-    InsufficientSystemResources,
+    NotADirectory,
     NotASocket,
     OperationNotSupported,
-    AddressTypeMismatch,
-    ConnectionTimedOut,
-    ConnectionResetByPeer,
-    FileSystemIoError,
-    AddressLoopBack,
-    AddressTooLong,
-    NamedSocketNotFound,
-    NotADirectory,
-    AddressNotLocal,
+    PermissionDenied,
+    SocketAlreadyConnected,
+    SocketFileDescriptorInvalid,
+    WouldBlock,
 };
 
 pub const AcceptError = error{
-    SocketFileDescriptorInvalid,
-    ConnectionAborted,
     AddressNotAccessible,
-    SocketNotListening,
-    ProcessFdLimitExceeded,
-    SystemFdLimitExceeded,
+    ConnectionAborted,
     InsufficientSystemResources,
     NotASocket,
     OperationNotSupported,
+    ProcessFdLimitExceeded,
+    SocketFileDescriptorInvalid,
+    SocketNotListening,
+    SystemFdLimitExceeded,
     WouldBlock,
 } || SetNonblockError;
 
 pub const SendError = error{
-    PermissionDenied,
-    AddressNotAvailable,
-    WouldBlock,
-    SocketFileDescriptorInvalid,
-    ConnectionResetByPeer,
     AddressIsNull,
     AddressNotAccessible,
+    AddressNotAvailable,
+    BrokenPipe,
+    ConnectionResetByPeer,
     HostUnreachable,
+    InsufficientSystemResources,
     MessageTooLarge,
     NetworkDown,
     NetworkUnreachable,
-    InsufficientSystemResources,
-    SocketNotConnected,
     NotASocket,
     OperationNotSupported,
-    BrokenPipe,
+    PermissionDenied,
+    SocketFileDescriptorInvalid,
+    SocketNotConnected,
+    WouldBlock,
 };
 
 pub const RecvError = error{
-    WouldBlock,
-    SocketFileDescriptorInvalid,
-    ConnectionResetByPeer,
     AddressNotAccessible,
-    InvalidArgument,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
     InsufficientSystemResources,
-    SocketNotConnected,
+    InvalidArgument,
     NotASocket,
     OperationNotSupported,
-    ConnectionTimedOut,
+    SocketFileDescriptorInvalid,
+    SocketNotConnected,
+    WouldBlock,
+};
+
+pub const ParseAddressError = error{
+    InvalidAddress,
 };
 
 fn unexpected_errno(label: []const u8, err: c.E) noreturn {
@@ -156,6 +177,22 @@ fn unexpected_errno(label: []const u8, err: c.E) noreturn {
 //        know such a keyword existed :)
 // Trivia: It's read as Internet presentation to network.
 extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
+
+// Build the network-order sockaddr.in from a IPv4 string
+pub fn parse_address(addr: [*:0]const u8, port: u16) ParseAddressError!c.sockaddr.in {
+    var addr_network_byte_order: u32 = undefined;
+    const pton_res = inet_pton(c.AF.INET, addr, &addr_network_byte_order);
+    if (pton_res != 1) {
+        return error.InvalidAddress;
+    }
+
+    return .{
+        .family = c.AF.INET,
+        .zero = @splat(0),
+        .addr = addr_network_byte_order,
+        .port = std.mem.nativeToBig(u16, port),
+    };
+}
 
 // Since socket is removed from posix and I want to write an event loop for the learning and
 // understanding of it, I'll just plug in the c methods and write my own wrapper around them. That
@@ -190,7 +227,7 @@ fn open_socket(domain: u32, socket_type: u32, protocol: u32, blocking: bool) Ope
             else => |e| unexpected_errno("open_socket", e),
         };
     }
-    errdefer close_socket(socket);
+    errdefer close(socket);
 
     // For async-io we need the socket to be non-blocking.
     if (!blocking) {
@@ -200,10 +237,10 @@ fn open_socket(domain: u32, socket_type: u32, protocol: u32, blocking: bool) Ope
     return socket;
 }
 
-pub fn close_socket(socket: socket_t) void {
+pub fn close(fd: fd_t) void {
     // Fire and forget for now, I don't know if it's possible to handle these errors? From what
     // I see over the internet this seems like a safe bet.
-    _ = c.close(socket);
+    _ = c.close(fd);
 }
 
 // The actual backlog is an i32 for some reason. The backlog length being negative doesn't make
@@ -224,20 +261,8 @@ pub fn listen(socket: socket_t, addr: [*:0]const u8, port: u16, backlog: u31) Li
     // bring up the same socket again.
     try setsockopt(socket, c.SOL.SOCKET, c.SO.REUSEADDR, 1);
 
-    var addr_network_byte_order: u32 = undefined;
-    const pton_res = inet_pton(c.AF.INET, addr, &addr_network_byte_order);
-    // Returns only a single error called EAFNOTSUPPORT meaning the address is not supported.
-    if (pton_res != 1) {
-        return error.AddressNotLocal;
-    }
-
-    const address: c.sockaddr.in = .{
-        // family and zero default to these values but we're just being safe.
-        .family = c.AF.INET,
-        .zero = @splat(0),
-        .addr = addr_network_byte_order,
-        .port = std.mem.nativeToBig(u16, port),
-    };
+    // TODO: Check if we need to directly accept the sockaddr.in here as well.
+    const address = try parse_address(addr, port);
 
     // All ports under 1024 are reserved and shouldn't be used, if you're dead set on using them
     // you need to be the super user. The program could check the port and shortcircuit early
@@ -283,22 +308,9 @@ pub fn listen(socket: socket_t, addr: [*:0]const u8, port: u16, backlog: u31) Li
     }
 }
 
-pub fn connect(socket: socket_t, addr: [*:0]const u8, port: u16) ConnectError!void {
-    var addr_network_byte_order: u32 = undefined;
-    const pton_res = inet_pton(c.AF.INET, addr, &addr_network_byte_order);
-    if (pton_res != 1) {
-        return error.AddressNotLocal;
-    }
-
-    const address: c.sockaddr.in = .{
-        .family = c.AF.INET,
-        .zero = @splat(0),
-        .addr = addr_network_byte_order,
-        .port = std.mem.nativeToBig(u16, port),
-    };
-
+pub fn connect(socket: socket_t, address: *const c.sockaddr.in) ConnectError!void {
     for (0..max_retires) |_| {
-        const connect_res = c.connect(socket, @ptrCast(&address), @sizeOf(@TypeOf(address)));
+        const connect_res = c.connect(socket, @ptrCast(address), @sizeOf(c.sockaddr.in));
         if (connect_res >= 0) {
             return;
         }
@@ -314,7 +326,9 @@ pub fn connect(socket: socket_t, addr: [*:0]const u8, port: u16) ConnectError!vo
             .CONNREFUSED => return error.ConnectionRefused,
             .FAULT => return error.AddressNotAccessible,
             .HOSTUNREACH => return error.HostUnreachable,
-            .INPROGRESS => return error.ConnectionInProgress,
+            // WouldBlock to facilitate the IO loop to correctly categorize this as blocking and
+            // park it.
+            .INPROGRESS => return error.WouldBlock,
             .INVAL => return error.InvalidArgument,
             .ISCONN => return error.SocketAlreadyConnected,
             .NETDOWN => return error.NetworkDown,
@@ -337,16 +351,55 @@ pub fn connect(socket: socket_t, addr: [*:0]const u8, port: u16) ConnectError!vo
     @panic("connect: exhausted EINTR retries");
 }
 
+pub fn get_socket_error(socket: socket_t) ConnectError!void {
+    var sock_err: c_int = undefined;
+    var sock_err_len: c.socklen_t = @sizeOf(c_int);
+    const res = c.getsockopt(socket, c.SOL.SOCKET, c.SO.ERROR, &sock_err, &sock_err_len);
+    if (res < 0) {
+        return switch (c.errno(res)) {
+            .BADF => error.SocketFileDescriptorInvalid,
+            .FAULT => error.AddressNotAccessible,
+            .INVAL => error.InvalidArgument,
+            .NOTSOCK => error.NotASocket,
+            else => |e| unexpected_errno("getsockopt", e),
+        };
+    }
+
+    if (sock_err == 0) {
+        return;
+    }
+
+    assert(sock_err >= 0 and sock_err <= std.math.maxInt(u16));
+
+    return switch (@as(c.E, @enumFromInt(sock_err))) {
+        .ACCES => error.PermissionDenied,
+        .ADDRINUSE => error.AddressAlreadyInUse,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
+        .AFNOSUPPORT => error.AddressFamilyMismatch,
+        .ALREADY => error.ConnectionAlreadyInProgress,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .INVAL => error.InvalidArgument,
+        .ISCONN => error.SocketAlreadyConnected,
+        .NETDOWN => error.NetworkDown,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NOBUFS => error.InsufficientSystemResources,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        else => |e| unexpected_errno("getsockopt SO_ERROR", e),
+    };
+}
+
 /// Returns the dedicated socket for that connection. That socket would then be used to read and
 /// write for that TCP connecton.
-pub fn accept(listen_socket: socket_t, peer: *c.sockaddr.in, blocking: bool) AcceptError!socket_t {
-    var len: c.socklen_t = @sizeOf(@TypeOf(peer.*));
+pub fn accept(listen_socket: socket_t, peer: ?*c.sockaddr.in, blocking: bool) AcceptError!socket_t {
+    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
     // Write the peer's info the the peer, and writes how many bytes it wrote to peer in the len
-    // field.
+    // field. When no peer is requested addrlen must be null too, per the man page.
     for (0..max_retires) |_| {
-        const new_socket = c.accept(listen_socket, @ptrCast(peer), &len);
+        const new_socket = c.accept(listen_socket, @ptrCast(peer), if (peer == null) null else &len);
         if (new_socket >= 0) {
-            errdefer close_socket(new_socket);
+            errdefer close(new_socket);
 
             if (!blocking) {
                 try set_nonblock(new_socket);
@@ -485,13 +538,28 @@ fn setsockopt(socket: socket_t, level: i32, option: u32, value: c_int) SetSockOp
     }
 }
 
+pub fn kqueue() KqueueError!fd_t {
+    const kq_res = c.kqueue();
+
+    if (kq_res < 0) {
+        return switch (c.errno(kq_res)) {
+            .NOMEM => error.InsufficientSystemResources,
+            .MFILE => error.ProcessFdLimitExceeded,
+            .NFILE => error.SystemFdLimitExceeded,
+            else => |e| unexpected_errno("kqueue", e),
+        };
+    }
+
+    return kq_res;
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
 
 test "open_socket_tcp: returns a usable socket we can close" {
     const socket = try open_socket_tcp(false);
-    defer close_socket(socket);
+    defer close(socket);
     try std.testing.expect(socket >= 0);
 }
 
@@ -507,8 +575,8 @@ test "send: a bad file descriptor maps to SocketFileDescriptorInvalid" {
 test "send/recv: bytes round trip over a connected socket pair" {
     var fds: [2]socket_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
-    defer close_socket(fds[0]);
-    defer close_socket(fds[1]);
+    defer close(fds[0]);
+    defer close(fds[1]);
 
     const payload = "ping";
     const wrote = try send(fds[0], payload, 0);

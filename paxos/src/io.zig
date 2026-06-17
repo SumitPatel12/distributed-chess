@@ -1,17 +1,14 @@
-//! Completion-shaped, single-threaded kqueue event loop for macOS/Darwin.
-//!
-//! Design spec: tmp/specs/kqueue-event-loop-design.html
-//! Plan:        tmp/plans/kqueue-event-loop.md
-//!
-//! Production-only: the DST seam is the MessageBus, which is swapped wholesale
-//! in simulation — this loop is never mocked. Zig 0.16, std.c raw externs only.
-
 const std = @import("std");
+const syscalls = @import("syscalls.zig");
 const Clock = @import("clock.zig").Clock;
 const Queue = @import("queue.zig").Queue;
 const c = std.c;
 const socket_t = std.c.fd_t;
+const assert = std.debug.assert;
 
+// This will end up looking very similar to what TigerBeetle has since I'm learning off of what they
+// did. And, boy, is it difficult, especially the submit and other opertaion functions, it making
+// it's own closure type things, using kevent udata to piggyback context and all. ['']/
 pub const IO = struct {
     /// The kequeue fd. -1 implies not initiated.
     kq: i32 = -1,
@@ -19,9 +16,13 @@ pub const IO = struct {
     io_inflight: u32 = 0,
     stats: Stats = .{},
 
+    /// Holds the completions that are ready to run during the next flush.
     completed: Queue(Completion) = .{},
+    /// Holds the completions that would have blocked.
     io_pending: Queue(Completion) = .{},
     timeouts: Queue(Completion) = .{},
+
+    const Self = @This();
 
     pub const Stats = struct {
         ops_submitted: u32 = 0,
@@ -42,11 +43,15 @@ pub const IO = struct {
             address: c.sockaddr.in,
             initiated: bool,
         },
-        recv: struct { socket: socket_t, buf: [*]u8, length: u32 },
+        recv: struct {
+            socket: socket_t,
+            buffer: [*]u8,
+            len: u32,
+        },
         send: struct {
             socket: socket_t,
-            buf: [*]const u8,
-            length: u32,
+            buffer: [*]const u8,
+            len: u32,
         },
         timeout: struct { expire_ns: u64 },
         close: struct { fd: c.fd_t },
@@ -66,6 +71,246 @@ pub const IO = struct {
         /// The operation for which the completion was fired.
         operation: Operation,
     };
+
+    pub fn init(self: *Self, clock: Clock) !void {
+        assert(self.kq == -1);
+        const kq = try syscalls.kqueue();
+
+        self.* = .{
+            .kq = kq,
+            .clock = clock,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        std.debug.assert(self.kq != -1);
+        syscalls.close(self.kq);
+        self.kq = -1;
+    }
+
+    fn submit(
+        self: *Self,
+        // Kinda seems like we're trying to write our own closure or something.
+        /// Pointer to the caller's state erased to ?*anyopaque when stored in the Completion. The
+        /// callback casts it back to mutate that state once the op completes.
+        context: anytype,
+        // The context casting works here because callback is comptime known and we therefore know
+        // what to cast the context back to during runtime. Tryly a piece of work here by
+        // TigerBeetle
+        /// Function called on completion (be it success or error). If it would be blocked we park
+        /// it instead of calling this function.
+        comptime callback: anytype,
+        /// Caller allocated completion that will be populated with callback, context, and operation
+        completion: *Completion,
+        /// The operation that is to be performed one of the Operation tagged union
+        comptime operation_tag: std.meta.Tag(Operation),
+        /// The payload of that operation as specified in the tagged union
+        operation_data: @FieldType(Operation, @tagName(operation_tag)),
+        /// Carries the do_operation function that does the actual syscall for the operation
+        comptime OperationImpl: type,
+    ) void {
+        assert(self.kq != -1);
+
+        const on_complete_fn = struct {
+            /// Perform the operation and run the callback. Parks in io_pending if the operation
+            /// return a WouldBlock.
+            fn on_complete(io: *IO, _completion: *Completion) void {
+                // Restore the operation's type and perform that operation. operation_tag is
+                // comptime known is the reason why we can do it like this.
+                const operation = &@field(_completion.operation, @tagName(operation_tag));
+                const result = OperationImpl.do_operation(operation);
+
+                // Park the action if it would block
+                switch (operation_tag) {
+                    .accept, .connect, .recv, .send => {
+                        _ = result catch |err| switch (err) {
+                            error.WouldBlock => {
+                                io.stats.parks += 1;
+                                _completion.link = .{};
+                                io.io_pending.push(_completion);
+                                return;
+                            },
+                            else => {},
+                        };
+                    },
+                    else => {},
+                }
+
+                // Everything was all right so we proceed with the callback, and pass the result as
+                // well, since result could be an error other than WouldBlock.
+                return callback(@ptrCast(@alignCast(_completion.context)), _completion, result);
+            }
+        }.on_complete;
+
+        completion.* = .{
+            .link = .{},
+            .context = context,
+            .callback = on_complete_fn,
+            .operation = @unionInit(Operation, @tagName(operation_tag), operation_data),
+        };
+
+        self.stats.ops_submitted += 1;
+        switch (operation_tag) {
+            .timeout => self.timeouts.push(completion),
+            else => self.completed.push(completion),
+        }
+    }
+
+    pub fn recv(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.RecvError!u31) void,
+        completion: *Completion,
+        socket: socket_t,
+        buffer: []u8,
+    ) void {
+        assert(buffer.len <= std.math.maxInt(u32));
+
+        self.submit(
+            context,
+            callback,
+            completion,
+            .recv,
+            .{ .socket = socket, .buffer = buffer.ptr, .len = @intCast(buffer.len) },
+            struct {
+                pub fn do_operation(op: anytype) syscalls.RecvError!u31 {
+                    return syscalls.recv(op.socket, op.buffer[0..op.len], 0);
+                }
+            },
+        );
+    }
+
+    pub fn send(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.SendError!u31) void,
+        completion: *Completion,
+        socket: socket_t,
+        buffer: []const u8,
+    ) void {
+        assert(buffer.len <= std.math.maxInt(u32));
+
+        self.submit(
+            context,
+            callback,
+            completion,
+            .send,
+            .{ .socket = socket, .buffer = buffer.ptr, .len = @intCast(buffer.len) },
+            struct {
+                pub fn do_operation(op: anytype) syscalls.SendError!u31 {
+                    return syscalls.send(op.socket, op.buffer[0..op.len], 0);
+                }
+            },
+        );
+    }
+
+    pub fn close(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, void) void,
+        completion: *Completion,
+        fd: c.fd_t,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .close,
+            .{ .fd = fd },
+            struct {
+                pub fn do_operation(op: anytype) void {
+                    return syscalls.close(op.fd);
+                }
+            },
+        );
+    }
+
+    pub fn connect(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.ConnectError!void) void,
+        completion: *Completion,
+        socket: socket_t,
+        address: c.sockaddr.in,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .connect,
+            .{ .socket = socket, .address = address, .initiated = false },
+            struct {
+                pub fn do_operation(op: anytype) syscalls.ConnectError!void {
+                    const result = switch (op.initiated) {
+                        // For the first time we call connect and all other times we check it's gone
+                        // through or not. get_socket_error checks for that.
+                        false => syscalls.connect(op.socket, &op.address),
+                        true => syscalls.get_socket_error(op.socket),
+                    };
+
+                    // Once we're through here, the first pass is guaranteed done, so we always set
+                    // the initiated to true.
+                    op.initiated = true;
+                    return result;
+                }
+            },
+        );
+    }
+
+    pub fn accept(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.AcceptError!socket_t) void,
+        completion: *Completion,
+        socket: socket_t,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .accept,
+            .{ .socket = socket },
+            struct {
+                // The peer address should already be known via some config so we're free to ignore
+                // it.
+                pub fn do_operation(op: anytype) syscalls.AcceptError!socket_t {
+                    return syscalls.accept(op.socket, null, false);
+                }
+            },
+        );
+    }
+
+    pub fn timeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, void) void,
+        completion: *Completion,
+        duration: u64,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .timeout,
+            // The consumers only need to provide the duration for which the timeout needs to last,
+            // we'll stamp it to the actual deadline. Makes things easier and we don't need to dump
+            // clock everywhere.
+            .{ .expire_ns = self.clock.monotonic_ns() + duration },
+            struct {
+                // Timeout just needs to queue this operation in the timeouts queue, so the
+                // do_operation is a no-op.
+                pub fn do_operation(op: anytype) void {
+                    _ = op;
+                }
+            },
+        );
+    }
 };
 
 test {
