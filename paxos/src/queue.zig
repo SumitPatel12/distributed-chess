@@ -12,6 +12,7 @@ pub fn Queue(comptime T: type) type {
     return struct {
         head: ?*QueueLink = null,
         tail: ?*QueueLink = null,
+        count: usize = 0,
 
         const Self = @This();
 
@@ -27,11 +28,13 @@ pub fn Queue(comptime T: type) type {
         pub fn reset(self: *Self) void {
             self.head = null;
             self.tail = null;
+            self.count = 0;
         }
 
         /// Push an element to the end of the queue.
         pub fn push(self: *Self, element: *T) void {
             assert(element.link.next == null);
+            self.count += 1;
 
             if (self.head == null) {
                 assert(self.tail == null);
@@ -48,6 +51,7 @@ pub fn Queue(comptime T: type) type {
         /// Pop an element from the start of the queue. If the queue is empty returns null.
         pub fn pop(self: *Self) ?*T {
             const link = self.head orelse return null;
+            self.count -= 1;
             self.head = link.next;
             if (self.head == null) {
                 self.tail = null;

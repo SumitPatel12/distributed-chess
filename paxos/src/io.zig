@@ -1,6 +1,8 @@
 const std = @import("std");
 const syscalls = @import("syscalls.zig");
-const Clock = @import("clock.zig").Clock;
+const clock_lib = @import("clock.zig");
+const Clock = clock_lib.Clock;
+const FakeClock = clock_lib.FakeClock;
 const Queue = @import("queue.zig").Queue;
 const c = std.c;
 const socket_t = std.c.fd_t;
@@ -311,8 +313,92 @@ pub const IO = struct {
             },
         );
     }
+
+    /// Queues any expired timeouts to completed queue, removes them from the timeouts queue and
+    /// returns the min_time in ns required to wait for the next timeouts completion. If no more
+    /// timeouts are present, then it returns `null`.
+    pub fn flush_timeouts(self: *Self) ?u64 {
+        var min_remaining: ?u64 = null;
+        const now = self.clock.monotonic_ns();
+        // TODO: There's likely a better method to do this than creating another queue, likely
+        // something inplace.
+        var live_timeouts: Queue(Completion) = .{};
+
+        while (self.timeouts.pop()) |completion| {
+            const expire_ns = completion.operation.timeout.expire_ns;
+            completion.link = .{};
+            if (expire_ns <= now) {
+                self.stats.timeouts_expired += 1;
+                self.completed.push(completion);
+            } else {
+                const remaining = expire_ns - now;
+                min_remaining = if (min_remaining) |min_remaining_ns| @min(min_remaining_ns, remaining) else remaining;
+                live_timeouts.push(completion);
+            }
+        }
+        self.timeouts = live_timeouts;
+
+        return min_remaining;
+    }
 };
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "flush_timeouts: completion flush over timeperiod" {
+    var fake_clock: FakeClock = .{};
+    const clock: Clock = .{ .fake = &fake_clock };
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    const no_op = struct {
+        fn no_op(_: ?*anyopaque, _: *IO.Completion, _: void) void {}
+    }.no_op;
+
+    // Undefined cause the submit call overwrites the whole thing anyways. No need to wire up mocks
+    // which get overwritten.
+    var completion_1: IO.Completion = undefined;
+    var completion_2: IO.Completion = undefined;
+
+    io.timeout(?*anyopaque, null, no_op, &completion_1, 100);
+    io.timeout(?*anyopaque, null, no_op, &completion_2, 200);
+
+    var next = io.flush_timeouts();
+    try std.testing.expectEqual(next, 100);
+    try std.testing.expectEqual(@as(usize, 2), io.timeouts.count);
+
+    clock.advance_ns(150);
+    next = io.flush_timeouts();
+    try std.testing.expectEqual(next, 50);
+    try std.testing.expectEqual(io.stats.timeouts_expired, 1);
+    try std.testing.expectEqual(@as(usize, 1), io.timeouts.count);
+}
+
+test "flush_timeouts: a zero-duration timeout is immediately ready" {
+    var fake_clock: FakeClock = .{};
+    const clock: Clock = .{ .fake = &fake_clock };
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    const no_op = struct {
+        fn no_op(_: ?*anyopaque, _: *IO.Completion, _: void) void {}
+    }.no_op;
+
+    var completion: IO.Completion = undefined;
+    io.timeout(?*anyopaque, null, no_op, &completion, 0);
+
+    // No special-casing in timeout(): a zero duration is stamped expire_ns == now and queued like
+    // any other timer.
+    try std.testing.expectEqual(@as(usize, 1), io.timeouts.count);
+
+    // The very first flush sees expire_ns (0) <= now (0), so it is already expired: it moves to
+    // completed, nothing remains pending, and there is no min-remaining to wait on.
+    const next = io.flush_timeouts();
+    try std.testing.expectEqual(@as(?u64, null), next);
+    try std.testing.expectEqual(@as(usize, 0), io.timeouts.count);
+    try std.testing.expectEqual(@as(usize, 1), io.completed.count);
+    try std.testing.expectEqual(@as(u32, 1), io.stats.timeouts_expired);
 }
