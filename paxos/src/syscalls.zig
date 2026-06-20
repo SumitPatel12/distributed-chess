@@ -295,6 +295,7 @@ pub fn listen(socket: socket_t, addr: [*:0]const u8, port: u16, backlog: u31) Li
     }
 
     const listen_res = c.listen(socket, backlog);
+
     if (listen_res < 0) {
         return switch (c.errno(listen_res)) {
             .ACCES => error.PermissionDenied,
@@ -311,9 +312,11 @@ pub fn listen(socket: socket_t, addr: [*:0]const u8, port: u16, backlog: u31) Li
 pub fn connect(socket: socket_t, address: *const c.sockaddr.in) ConnectError!void {
     for (0..max_retires) |_| {
         const connect_res = c.connect(socket, @ptrCast(address), @sizeOf(c.sockaddr.in));
+
         if (connect_res >= 0) {
             return;
         }
+
         switch (c.errno(connect_res)) {
             // Retry the interrupted call; after max_retires interruptions we give up and panic.
             .INTR => continue,
@@ -355,6 +358,7 @@ pub fn get_socket_error(socket: socket_t) ConnectError!void {
     var sock_err: c_int = undefined;
     var sock_err_len: c.socklen_t = @sizeOf(c_int);
     const res = c.getsockopt(socket, c.SOL.SOCKET, c.SO.ERROR, &sock_err, &sock_err_len);
+
     if (res < 0) {
         return switch (c.errno(res)) {
             .BADF => error.SocketFileDescriptorInvalid,
@@ -398,6 +402,7 @@ pub fn accept(listen_socket: socket_t, peer: ?*c.sockaddr.in, blocking: bool) Ac
     // field. When no peer is requested addrlen must be null too, per the man page.
     for (0..max_retires) |_| {
         const new_socket = c.accept(listen_socket, @ptrCast(peer), if (peer == null) null else &len);
+
         if (new_socket >= 0) {
             errdefer close(new_socket);
 
@@ -407,6 +412,7 @@ pub fn accept(listen_socket: socket_t, peer: ?*c.sockaddr.in, blocking: bool) Ac
 
             return new_socket;
         }
+
         switch (c.errno(new_socket)) {
             // Retry the interrupted call; after max_retires interruptions we give up and panic.
             .INTR => continue,
@@ -438,9 +444,11 @@ pub fn send(socket: socket_t, message: []const u8, flags: u32) SendError!u31 {
     // For tcp `send` can send only some of the data, so keep an eye out for that.
     for (0..max_retires) |_| {
         const send_res = c.send(socket, message.ptr, message.len, flags);
+
         if (send_res >= 0) {
             return @as(u31, @intCast(send_res));
         }
+
         switch (c.errno(send_res)) {
             // Retry the interrupted call; after max_retires interruptions we give up and panic.
             .INTR => continue,
@@ -470,9 +478,11 @@ pub fn send(socket: socket_t, message: []const u8, flags: u32) SendError!u31 {
 pub fn recv(socket: socket_t, buffer: []u8, flags: u32) RecvError!u31 {
     for (0..max_retires) |_| {
         const recv_res = c.recv(socket, buffer.ptr, buffer.len, @as(c_int, @intCast(flags)));
+
         if (recv_res >= 0) {
             return @as(u31, @intCast(recv_res));
         }
+
         switch (c.errno(recv_res)) {
             // After max_retires for interruptions we give up and panic.
             .INTR => continue,
@@ -492,7 +502,7 @@ pub fn recv(socket: socket_t, buffer: []u8, flags: u32) RecvError!u31 {
     @panic("recv: exhausted EINTR retries");
 }
 
-fn set_nonblock(socket: socket_t) SetNonblockError!void {
+pub fn set_nonblock(socket: socket_t) SetNonblockError!void {
     const get_res = c.fcntl(socket, c.F.GETFL, @as(c_int, 0));
     if (get_res < 0) {
         return switch (c.errno(get_res)) {
@@ -551,6 +561,43 @@ pub fn kqueue() KqueueError!fd_t {
     }
 
     return kq_res;
+}
+
+/// Returns the number of events that are ready.
+pub fn kevent(
+    kq: fd_t,
+    changelist: []const c.Kevent,
+    eventlist: []c.Kevent,
+    timeout: ?*const c.timespec,
+) KeventError!usize {
+    for (0..max_retires) |_| {
+        const kevent_res = c.kevent(
+            kq,
+            changelist.ptr,
+            @intCast(changelist.len),
+            eventlist.ptr,
+            @intCast(eventlist.len),
+            timeout,
+        );
+
+        if (kevent_res >= 0) {
+            return @intCast(kevent_res);
+        }
+
+        switch (c.errno(kevent_res)) {
+            // The changelist was already applied before the wait so this is safe.
+            .INTR => continue,
+            .ACCES => return error.PermissionDenied,
+            .BADF => return error.FileDescriptorInvalid,
+            .FAULT => return error.AddressNotAccessible,
+            .INVAL => return error.InvalidArgument,
+            .NOENT => return error.EventNotFoundOrIsUneditable,
+            .NOMEM => return error.InsufficientSystemResources,
+            .SRCH => return error.TargetProcessDoesNotExist,
+            else => |e| unexpected_errno("kevent", e),
+        }
+    }
+    @panic("kevent: exhausted EINTR retries");
 }
 
 test {
