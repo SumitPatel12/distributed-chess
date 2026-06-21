@@ -371,6 +371,7 @@ pub const IO = struct {
     }
 
     pub fn flush(self: *Self, wait_for_completion: bool) !void {
+        assert(self.kq != -1);
         var events: [256]c.Kevent = undefined;
 
         const next_timeout = self.flush_timeouts();
@@ -675,4 +676,28 @@ test "TCP sockets listen, accept, recv, and send" {
     try std.testing.expectEqual(recv_context.bytes_received, peer_message.len);
     try std.testing.expectEqualSlices(u8, peer_message, recv_context.bytes[0..recv_context.bytes_received]);
     try std.testing.expectEqual(send_context.bytes_sent, server_message.len);
+}
+
+// The fake clock never advances on its own, so the self-timeout in run_for_ns would never
+// expire — this path can only be exercised with the real clock.
+test "run_for_ns: real clock fires the deadline and the loop returns" {
+    var real_clock: clock_lib.RealClock = .{};
+    const clock: Clock = .{ .real = &real_clock };
+
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    const duration_ns: u64 = 2 * std.time.ns_per_ms;
+
+    const start = clock.monotonic_ns();
+    try io.run_for_ns(duration_ns);
+    const elapsed = clock.monotonic_ns() - start;
+
+    // kevent waits at least the deadline (it never returns early with no events registered),
+    // so the wall clock must have advanced by at least the requested duration.
+    try std.testing.expect(elapsed >= duration_ns);
+    // The self-timeout was submitted once and expired exactly once.
+    try std.testing.expectEqual(@as(u64, 1), io.stats.ops_submitted);
+    try std.testing.expectEqual(@as(u64, 1), io.stats.timeouts_expired);
 }
