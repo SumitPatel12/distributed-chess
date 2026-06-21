@@ -333,7 +333,10 @@ pub const IO = struct {
                 self.completed.push(completion);
             } else {
                 const remaining = expire_ns - now;
-                min_remaining = if (min_remaining) |min_remaining_ns| @min(min_remaining_ns, remaining) else remaining;
+                min_remaining = if (min_remaining) |min_remaining_ns| @min(
+                    min_remaining_ns,
+                    remaining,
+                ) else remaining;
                 live_timeouts.push(completion);
             }
         }
@@ -386,7 +389,8 @@ pub const IO = struct {
             // kevents or just return early because we have nothing to do.
             if (change_events_count == 0 and self.completed.empty()) {
                 if (wait_for_completion) {
-                    const timeout_ns = next_timeout orelse @panic("kevent would block indefinitely.");
+                    const timeout_ns = next_timeout orelse
+                        @panic("kevent would block indefinitely.");
                     ts.sec = @intCast(timeout_ns / std.time.ns_per_s);
                     ts.nsec = @intCast(timeout_ns % std.time.ns_per_s);
                 } else if (self.io_inflight == 0) {
