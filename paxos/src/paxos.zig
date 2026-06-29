@@ -9,4 +9,7 @@ test {
     _ = @import("queue.zig");
     _ = @import("clock.zig");
     _ = @import("syscalls.zig");
+    _ = @import("message_bus.zig");
+    _ = @import("ring_buffer.zig");
+    _ = @import("message.zig");
 }

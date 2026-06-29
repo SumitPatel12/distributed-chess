@@ -50,6 +50,23 @@ pub fn build(b: *std.Build) !void {
     const echo_step = b.step("echo", "Run the echo server (port 3000)");
     echo_step.dependOn(&echo_run.step);
 
+    const message_bus_exe = b.addExecutable(.{
+        .name = "message_bus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/message_bus.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "paxos", .module = paxos_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
+        }),
+    });
+    b.installArtifact(message_bus_exe);
+    const message_bus_run = b.addRunArtifact(message_bus_exe);
+    const message_bus_step = b.step("message_bus", "Run a MessageBus node");
+    message_bus_step.dependOn(&message_bus_run.step);
+
     const tests = b.addTest(.{ .root_module = paxos_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
