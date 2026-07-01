@@ -32,9 +32,12 @@ pub const Message = struct {
 
     const Self = @This();
 
-    pub fn init(message_type: MessageType, body: []const u8) Self {
+    pub fn init(message_type: MessageType, body: []const u8, sender: u16) Self {
         std.debug.assert(body.len <= body_size);
-        var message: Self = .{ .message_type = message_type, .sender = undefined };
+        var message: Self = .{
+            .message_type = message_type,
+            .sender = sender,
+        };
 
         @memcpy(message.body[0..body.len], body);
         return message;
@@ -86,6 +89,31 @@ test "Message: encode/decode round-trips" {
     try std.testing.expectEqual(MessageType.promise, decoded.message_type);
     try std.testing.expectEqual(@as(u16, 3), decoded.sender);
     try std.testing.expectEqualSlices(u8, &body, &decoded.body);
+}
+
+test "Message: init sets fields and round-trips" {
+    var body: [Message.body_size]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    const msg = Message.init(.accepted, &body, 9);
+
+    try std.testing.expectEqual(MessageType.accepted, msg.message_type);
+    try std.testing.expectEqual(@as(u16, 9), msg.sender);
+    try std.testing.expectEqualSlices(u8, &body, &msg.body);
+
+    var wire: [Message.size]u8 = undefined;
+    msg.encode(&wire);
+    const decoded = try Message.decode(&wire);
+    try std.testing.expectEqual(MessageType.accepted, decoded.message_type);
+    try std.testing.expectEqual(@as(u16, 9), decoded.sender);
+    try std.testing.expectEqualSlices(u8, &body, &decoded.body);
+}
+
+test "Message: init zero-pads a short body" {
+    const partial = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const msg = Message.init(.prepare, &partial, 1);
+
+    try std.testing.expectEqualSlices(u8, &partial, msg.body[0..partial.len]);
+    for (msg.body[partial.len..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
 test "crc32c matches the standard check value" {
