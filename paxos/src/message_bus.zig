@@ -9,7 +9,6 @@ const RingBuffer = @import("ring_buffer.zig").RingBuffer;
 const IO = io_lib.IO;
 const Completion = io_lib.IO.Completion;
 const socket_t = std.c.fd_t;
-const Clock = @import("clock.zig").Clock;
 const assert = std.debug.assert;
 
 pub const MessageBus = struct {
@@ -30,6 +29,8 @@ pub const MessageBus = struct {
 
     /// The accept syscall completion that keeps getting re-armed on the current nodes socket.
     accept_completion: Completion = undefined,
+
+    accept_connection: ?*Connection = null,
 
     /// Stores the self votes for the Paxos alignment
     loopback: RingBuffer(Message, 16) = .{},
@@ -81,7 +82,7 @@ pub const MessageBus = struct {
         total_sent: u8 = 0,
 
         /// Current state of the connection.
-        state: enum { free, connecting, connected, terminating } = .free,
+        state: enum { free, accepting, connecting, connected, terminating } = .free,
     };
 
     /// Inline initialze the `MessageBus`. Opens the socket in non-blocking mode.
@@ -103,32 +104,106 @@ pub const MessageBus = struct {
         };
     }
 
-    pub fn start(self: *Self) !void {
-        self.io.accept(*Self, self, on_accept, &self.accept_completion, self.socket);
+    pub fn deinit(bus: *Self) void {
+        bus.io.close_socket(bus.socket);
 
-        // TODO: Add a run_for_ns or just run in an infinite while loop.
+        for (&bus.connections) |*connection| {
+            if (connection.socket != -1) {
+                bus.io.close_socket(connection.socket);
+            }
+        }
     }
 
-    fn handle_terminate_connection(bus: *Self, connection: *Connection) void {
-        connection.state = .terminating;
-
-        if (connection.recv_submitted == false and connection.send_submitted == false) {
-            if (connection.peer) |peer_id| {
-                if (bus.nodes[peer_id] == connection) {
-                    bus.nodes[peer_id] = null;
+    pub fn tick(bus: *Self) void {
+        if (bus.accept_connection == null) {
+            const reserved: ?*Connection = for (&bus.connections) |*conn| {
+                if (conn.state == .free) {
+                    break conn;
                 }
-            }
+            } else null;
 
-            assert(connection.socket != -1);
-            syscalls.close(connection.socket);
-            connection.* = .{};
+            if (reserved) |conn| {
+                conn.state = .accepting;
+                bus.accept_connection = conn;
+                bus.io.accept(
+                    *Self,
+                    bus,
+                    on_accept,
+                    &bus.accept_completion,
+                    bus.socket,
+                );
+            }
         }
+
+        for (bus.config.node_id + 1..cluster_size) |id| {
+            if (bus.nodes[id] == null) {
+                bus.connect(@intCast(id));
+            }
+        }
+    }
+
+    fn terminate(bus: *Self, connection: *Connection) void {
+        if (connection.state == .terminating) {
+            return;
+        }
+
+        connection.state = .terminating;
+        bus.terminate_join(connection);
+    }
+
+    fn terminate_join(bus: *Self, connection: *Connection) void {
+        assert(connection.state == .terminating);
+
+        // There's still some operatoins on this socket we wait until those are done
+        if (connection.recv_submitted or connection.send_submitted) {
+            return;
+        }
+
+        bus.terminate_close(connection);
+    }
+
+    fn terminate_close(bus: *MessageBus, connection: *Connection) void {
+        assert(connection.state == .terminating);
+        assert(connection.recv_submitted == false and connection.send_submitted == false);
+
+        connection.send_submitted = true;
+        const fd = connection.socket;
+        connection.socket = -1;
+        bus.io.close(
+            *MessageBus,
+            bus,
+            close_callback,
+            &connection.send_completion,
+            fd,
+        );
+    }
+
+    fn close_callback(bus: *MessageBus, completion: *Completion, _: void) void {
+        const connection: *Connection = @fieldParentPtr("send_completion", completion);
+        assert(connection.state == .terminating);
+
+        if (connection.peer) |peer_id| {
+            if (bus.nodes[peer_id] == connection) {
+                bus.nodes[peer_id] = null;
+            }
+        }
+
+        connection.* = .{};
     }
 
     fn connect(bus: *Self, peer_node_id: u16) void {
         // A node only initiates connections with nodes of higher id, that way we don't open two
         // connection between a pair.
         assert(bus.config.node_id < peer_node_id);
+        assert(bus.nodes[peer_node_id] == null);
+
+        const address = syscalls.parse_address(
+            bus.config.address,
+            bus.config.base_port + peer_node_id,
+        ) catch {
+            // TODO: Maybe log?
+            return;
+        };
 
         const connection: ?*Connection = for (&bus.connections) |*conn| {
             if (conn.state == .free) {
@@ -144,11 +219,7 @@ pub const MessageBus = struct {
                 return;
             };
             conn.peer = peer_node_id;
-
-            const address = syscalls.parse_address(
-                bus.config.address,
-                bus.config.base_port + peer_node_id,
-            );
+            bus.nodes[peer_node_id] = conn;
 
             assert(!conn.recv_submitted);
             conn.recv_submitted = true;
@@ -176,48 +247,41 @@ pub const MessageBus = struct {
         );
         connection.recv_submitted = false;
 
+        if (connection.state == .terminating) {
+            bus.terminate_join(connection);
+            return;
+        }
+
         if (result) |_| {
             assert(connection.peer != null);
             connection.state = .connected;
-            bus.nodes[connection.peer.?] = connection;
 
             bus.recv(connection);
-        } else {
-            bus.handle_terminate_connection(connection);
+            bus.send(connection);
+        } else |_| {
+            bus.terminate(connection);
         }
     }
 
     fn on_accept(
         bus: *MessageBus,
-        completion: *Completion,
+        _: *Completion,
         result: syscalls.AcceptError!socket_t,
     ) void {
+        assert(bus.accept_connection != null);
+        const connection: *Connection = bus.accept_connection.?;
+        bus.accept_connection = null;
+        assert(connection.state == .accepting);
+
         if (result) |connection_socket| {
-            const peer_connection: ?*Connection = for (&bus.connections) |*connection| {
-                if (connection.state == .free) {
-                    break connection;
-                }
-            } else null;
+            connection.state = .connected;
+            connection.socket = connection_socket;
 
-            if (peer_connection) |conn| {
-                conn.state = .connected;
-                conn.socket = connection_socket;
-
-                bus.recv(conn);
-            }
+            bus.recv(connection);
         } else |_| {
             // TODO: Log failure.
+            connection.* = .{};
         }
-
-        // The accept needs to be re-armed every time because nodes can crash and try to
-        // reconnect, and we should be ready to accept those connections.
-        bus.io.accept(
-            *MessageBus,
-            bus,
-            on_accept,
-            completion,
-            bus.socket,
-        );
     }
 
     fn recv(bus: *Self, connection: *Connection) void {
@@ -248,10 +312,15 @@ pub const MessageBus = struct {
         const connection: *Connection = @fieldParentPtr("recv_completion", completion);
         connection.recv_submitted = false;
 
+        if (connection.state == .terminating) {
+            bus.terminate_join(connection);
+            return;
+        }
+
         if (result) |bytes_read| {
             // Connection closed by the peer.
             if (bytes_read == 0) {
-                bus.handle_terminate_connection(connection);
+                bus.terminate(connection);
                 return;
             }
 
@@ -261,13 +330,26 @@ pub const MessageBus = struct {
             if (connection.total_recv == Message.size) {
                 // Parse the message and send it to the owner of the message bus.
                 const message: Message = Message.decode(&connection.recv_buffer) catch {
-                    bus.handle_terminate_connection(connection);
+                    bus.terminate(connection);
                     return;
                 };
 
                 if (connection.peer == null) {
+                    if (message.sender >= cluster_size or message.sender == bus.config.node_id) {
+                        bus.terminate(connection);
+                        return;
+                    }
+
+                    // There's an open connection that's for the current sender so we close it,
+                    // and mark the current connection as the new one.
+                    if (bus.nodes[message.sender]) |old| {
+                        if (old != connection and old.state != .terminating) {
+                            bus.terminate(old);
+                        }
+                    }
+
                     connection.peer = message.sender;
-                    bus.nodes[connection.peer.?] = connection;
+                    bus.nodes[message.sender] = connection;
                 }
 
                 bus.on_message(bus, message);
@@ -278,25 +360,43 @@ pub const MessageBus = struct {
             bus.recv(connection);
         } else |_| {
             // TODO: Better error handling
-            bus.handle_terminate_connection(connection);
+            bus.terminate(connection);
         }
     }
 
-    fn send_to(bus: *Self, message: *Message, peer: u16) void {
-        // We're not gonna send to ourselves, it'll directly go the `bus.loopback`.
+    fn send_to(bus: *Self, message: *const Message, peer: u16) void {
         assert(peer != bus.config.node_id);
-
-        // If the connection is not established yet return early, no need to crash. Depending on the
-        // algorithm driving this, the message will either be dropped entirely or retried.
         const connection = bus.nodes[peer] orelse return;
-        message.encode(&connection.send_message);
 
-        bus.send(connection);
+        if (connection.state == .terminating) {
+            return;
+        }
+
+        connection.send_buffer.push(message.*) catch {
+            return;
+        };
+
+        // We queue the message but it fires only after state is .connected.
+        if (connection.state == .connecting) {
+            return;
+        }
+
+        assert(connection.state == .connected);
+        if (!connection.send_submitted) {
+            bus.send(connection);
+        }
     }
 
     fn send(bus: *Self, connection: *Connection) void {
         assert(connection.state == .connected);
         assert(connection.send_submitted == false);
+
+        // If the buffer is empty we return early.
+        const message = connection.send_buffer.peek() orelse return;
+
+        if (connection.total_sent == 0) {
+            message.encode(&connection.send_message);
+        }
 
         connection.send_submitted = true;
 
@@ -318,16 +418,23 @@ pub const MessageBus = struct {
         const connection: *Connection = @fieldParentPtr("send_completion", completion);
         connection.send_submitted = false;
 
+        if (connection.state == .terminating) {
+            bus.terminate_join(connection);
+            return;
+        }
+
         if (result) |bytes_sent| {
             connection.total_sent += @intCast(bytes_sent);
+            assert(connection.total_sent <= Message.size);
 
             if (connection.total_sent == Message.size) {
+                _ = connection.send_buffer.pop();
                 connection.total_sent = 0;
-            } else {
-                bus.send(connection);
             }
+
+            bus.send(connection);
         } else |_| {
-            bus.handle_terminate_connection(connection);
+            bus.terminate(connection);
         }
     }
 };

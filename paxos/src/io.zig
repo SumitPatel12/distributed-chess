@@ -230,6 +230,11 @@ pub const IO = struct {
         );
     }
 
+    pub fn close_socket(self: *IO, fd: c.fd_t) void {
+        _ = self;
+        syscalls.close(fd);
+    }
+
     pub fn connect(
         self: *IO,
         comptime Context: type,
