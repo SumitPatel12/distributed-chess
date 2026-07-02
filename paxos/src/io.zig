@@ -582,6 +582,7 @@ test "TCP sockets listen, accept, recv, and send" {
     defer io.deinit();
 
     const server = try syscalls.open_socket_tcp(false);
+    defer syscalls.close(server);
     try syscalls.listen(server, "127.0.0.1", 3000, 64);
 
     var completion: IO.Completion = undefined;
@@ -603,6 +604,7 @@ test "TCP sockets listen, accept, recv, and send" {
 
     const peer_address = try syscalls.parse_address("127.0.0.1", 3000);
     const peer_socket: socket_t = try syscalls.open_socket_tcp(true);
+    defer syscalls.close(peer_socket);
     try syscalls.connect(peer_socket, &peer_address);
 
     // Drive the loop until the accept actually lands. A single run isn't guaranteed to have
@@ -612,6 +614,7 @@ test "TCP sockets listen, accept, recv, and send" {
         try io.run();
     }
     try std.testing.expect(connection.connection_socket >= 0);
+    defer syscalls.close(connection.connection_socket);
 
     const server_message = "This is a server message!?";
     const peer_message = "Well met, server. I'm the Master NOW!!";

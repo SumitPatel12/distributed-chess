@@ -1,7 +1,8 @@
 const std = @import("std");
 const io_lib = @import("io.zig");
-const cluster_size = @import("build_options").cluster_size;
+const cluster_size_max = @import("build_options").cluster_size_max;
 const syscalls = @import("syscalls.zig");
+const clock_lib = @import("clock.zig");
 
 const Config = @import("config.zig").Config;
 const Message = @import("message.zig").Message;
@@ -10,6 +11,8 @@ const IO = io_lib.IO;
 const Completion = io_lib.IO.Completion;
 const socket_t = std.c.fd_t;
 const assert = std.debug.assert;
+const RealClock = clock_lib.RealClock;
+const Clock = clock_lib.Clock;
 
 pub const MessageBus = struct {
     io: *IO,
@@ -18,11 +21,11 @@ pub const MessageBus = struct {
 
     /// Represents the connection for the cluster. Each node is connected to every other node in the
     /// cluster.
-    connections: [cluster_size]Connection = @splat(.{}),
+    connections: [cluster_size_max]Connection = @splat(.{}),
 
     /// To keep indexing easy each node is indexed by it's id, and the current node's connection
     /// remains null.
-    nodes: [cluster_size]?*Connection = @splat(null),
+    nodes: [cluster_size_max]?*Connection = @splat(null),
 
     /// Current node's listening socket.
     socket: socket_t,
@@ -88,12 +91,14 @@ pub const MessageBus = struct {
     /// Inline initialze the `MessageBus`. Opens the socket in non-blocking mode.
     /// Doesn't start listening yet.
     pub fn init(self: *Self, io: *IO, config: Config, on_message: *const fn (*MessageBus, Message) void) !void {
+        assert(config.cluster_size <= cluster_size_max);
+
         const socket = try syscalls.open_socket_tcp(false);
         try syscalls.listen(
             socket,
             config.address,
             config.base_port + config.node_id,
-            cluster_size - 1,
+            config.cluster_size - 1,
         );
 
         self.* = .{
@@ -135,7 +140,7 @@ pub const MessageBus = struct {
             }
         }
 
-        for (bus.config.node_id + 1..cluster_size) |id| {
+        for (bus.config.node_id + 1..bus.config.cluster_size) |id| {
             if (bus.nodes[id] == null) {
                 bus.connect(@intCast(id));
             }
@@ -335,7 +340,7 @@ pub const MessageBus = struct {
                 };
 
                 if (connection.peer == null) {
-                    if (message.sender >= cluster_size or message.sender == bus.config.node_id) {
+                    if (message.sender >= bus.config.cluster_size or message.sender == bus.config.node_id) {
                         bus.terminate(connection);
                         return;
                     }
@@ -441,6 +446,75 @@ pub const MessageBus = struct {
 
 pub fn main() void {}
 
-test {
-    std.testing.refAllDecls(MessageBus);
+test "Two nodes: send, recv, accept, and connect" {
+    var real_clock: RealClock = .{};
+    const clock: Clock = .{ .real = &real_clock };
+    const TestNode = struct {
+        bus: MessageBus,
+        message: ?Message = null,
+    };
+
+    const on_message = struct {
+        fn on_message(bus: *MessageBus, message: Message) void {
+            const node: *TestNode = @fieldParentPtr("bus", bus);
+            node.message = message;
+        }
+    }.on_message;
+
+    var io1: IO = .{ .clock = undefined };
+    var io2: IO = .{ .clock = undefined };
+    try io1.init(clock);
+    try io2.init(clock);
+    defer io1.deinit();
+    defer io2.deinit();
+
+    const config1: Config = .{
+        .address = "127.0.0.1",
+        .base_port = 4000,
+        .node_id = 0,
+        .cluster_size = 2,
+    };
+    const config2: Config = .{
+        .address = "127.0.0.1",
+        .base_port = 4000,
+        .node_id = 1,
+        .cluster_size = 2,
+    };
+
+    var node_1: TestNode = .{ .bus = undefined };
+    var node_2: TestNode = .{ .bus = undefined };
+    try node_1.bus.init(&io1, config1, on_message);
+    try node_2.bus.init(&io2, config2, on_message);
+    defer node_1.bus.deinit();
+    defer node_2.bus.deinit();
+
+    var sent_msg = false;
+    var sent_reply = false;
+    var ticks: u32 = 0;
+    while (node_1.message == null or node_2.message == null) : (ticks += 1) {
+        if (ticks > 1000) {
+            return error.Timeout;
+        }
+
+        if (node_1.bus.nodes[1] != null and !sent_msg) {
+            const msg_a = Message.init(.prepare, "Message from Node 1", 0);
+            node_1.bus.send_to(&msg_a, 1);
+            sent_msg = true;
+        }
+
+        if (node_2.message != null and !sent_reply) {
+            const msg_b = Message.init(.promise, "Message from Node 2", 1);
+            node_2.bus.send_to(&msg_b, 0);
+            sent_reply = true;
+        }
+
+        node_1.bus.tick();
+        node_2.bus.tick();
+
+        try node_1.bus.io.run_for_ns(std.time.ns_per_ms * 25);
+        try node_2.bus.io.run_for_ns(std.time.ns_per_ms * 25);
+    }
+
+    try std.testing.expectEqual(@as(u16, 1), node_1.message.?.sender);
+    try std.testing.expectEqual(@as(u16, 0), node_2.message.?.sender);
 }

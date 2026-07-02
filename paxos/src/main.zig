@@ -23,17 +23,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    if (node_id > build_options.cluster_size) {
+    if (node_id > build_options.cluster_size_max) {
         std.debug.print(
             "node_id must be an integer from 0 to {d}\n",
-            .{build_options.cluster_size},
+            .{build_options.cluster_size_max},
         );
         std.process.exit(1);
     }
 
     try stdout.print(
-        "paxos node {d} of {d}-node cluster\n",
-        .{ node_id, build_options.cluster_size },
+        "paxos node {d} of up-to-{d}-node cluster\n",
+        .{ node_id, build_options.cluster_size_max },
     );
     try stdout.flush();
 }
