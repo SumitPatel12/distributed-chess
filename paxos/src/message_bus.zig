@@ -48,6 +48,8 @@ pub const MessageBus = struct {
 
     const Self = @This();
 
+    const SEND_RING_CAPACITY = 16;
+
     const Connection = struct {
         /// The peer node's id. Is null until a message is actually first received on the
         /// connection. Accept grabs the first empty connection and on the first message recv we'll
@@ -59,7 +61,7 @@ pub const MessageBus = struct {
         socket: socket_t = -1,
 
         /// Queue of messages to be sent to this connection. Send will keep dequeuing off of this.
-        send_buffer: RingBuffer(Message, 16) = .{},
+        send_buffer: RingBuffer(Message, SEND_RING_CAPACITY) = .{},
 
         /// Tracks if there is any active recv parked. Used to indicate that there is some event in
         /// the IO loop which will come back and try to access this connection thus this connection
@@ -517,4 +519,72 @@ test "Two nodes: send, recv, accept, and connect" {
 
     try std.testing.expectEqual(@as(u16, 1), node_1.message.?.sender);
     try std.testing.expectEqual(@as(u16, 0), node_2.message.?.sender);
+}
+
+test "send ring: in-order delivery and overflow past capacity is dropped" {
+    var real_clock: RealClock = .{};
+    const clock: Clock = .{ .real = &real_clock };
+
+    const ring_capacity = MessageBus.SEND_RING_CAPACITY;
+    const send_count = ring_capacity + 4;
+
+    const TestNode = struct {
+        bus: MessageBus,
+        received: [send_count]Message = undefined,
+        count: usize = 0,
+    };
+
+    const on_message = struct {
+        fn on_message(bus: *MessageBus, message: Message) void {
+            const node: *TestNode = @fieldParentPtr("bus", bus);
+            node.received[node.count] = message;
+            node.count += 1;
+        }
+    }.on_message;
+
+    var io1: IO = .{ .clock = undefined };
+    var io2: IO = .{ .clock = undefined };
+    try io1.init(clock);
+    try io2.init(clock);
+    defer io1.deinit();
+    defer io2.deinit();
+
+    const config1: Config = .{ .address = "127.0.0.1", .base_port = 4100, .node_id = 0, .cluster_size = 2 };
+    const config2: Config = .{ .address = "127.0.0.1", .base_port = 4100, .node_id = 1, .cluster_size = 2 };
+
+    var node_1: TestNode = .{ .bus = undefined };
+    var node_2: TestNode = .{ .bus = undefined };
+    try node_1.bus.init(&io1, config1, on_message);
+    try node_2.bus.init(&io2, config2, on_message);
+    defer node_1.bus.deinit();
+    defer node_2.bus.deinit();
+
+    node_1.bus.tick();
+    try std.testing.expect(node_1.bus.nodes[1].?.state == .connecting);
+
+    var i: u8 = 0;
+    while (i < send_count) : (i += 1) {
+        const body = [_]u8{i};
+        const msg = Message.init(.prepare, &body, 0);
+        node_1.bus.send_to(&msg, 1);
+    }
+
+    var ticks: u32 = 0;
+    while (node_2.count < ring_capacity) : (ticks += 1) {
+        if (ticks > 1000) return error.Timeout;
+
+        node_1.bus.tick();
+        node_2.bus.tick();
+
+        try io1.run_for_ns(std.time.ns_per_ms * 25);
+        try io2.run_for_ns(std.time.ns_per_ms * 25);
+    }
+
+    try std.testing.expectEqual(@as(usize, ring_capacity), node_2.count);
+
+    var j: u8 = 0;
+    while (j < ring_capacity) : (j += 1) {
+        try std.testing.expectEqual(j, node_2.received[j].body[0]);
+        try std.testing.expectEqual(@as(u16, 0), node_2.received[j].sender);
+    }
 }
