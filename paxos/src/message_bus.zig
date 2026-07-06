@@ -121,6 +121,12 @@ pub const MessageBus = struct {
         }
     }
 
+    pub fn broadcast(bus: *Self, message: *const Message) void {
+        for (0..bus.config.cluster_size) |peer_id| {
+            bus.send_to(message, peer_id);
+        }
+    }
+
     pub fn tick(bus: *Self) void {
         if (bus.accept_connection == null) {
             const reserved: ?*Connection = for (&bus.connections) |*conn| {
@@ -146,6 +152,13 @@ pub const MessageBus = struct {
             if (bus.nodes[id] == null) {
                 bus.connect(@intCast(id));
             }
+        }
+
+        // on_message can potentially add to the loopback, to avoid infinite loops, we'll snapshot
+        // the current message count and only consume that many.
+        var n = bus.loopback.count;
+        while (n > 0) : (n -= 1) {
+            bus.on_message(bus, bus.loopback.pop().?);
         }
     }
 
@@ -372,7 +385,14 @@ pub const MessageBus = struct {
     }
 
     fn send_to(bus: *Self, message: *const Message, peer: u16) void {
-        assert(peer != bus.config.node_id);
+        // If message to self, queue on the loopback and return, the next tick will take care of
+        // handling it.
+        if (peer == bus.config.node_id) {
+            bus.loopback.push(message.*) catch {};
+            return;
+        }
+
+        // Only connecting, connected, and terminating have the nodes array connection set.
         const connection = bus.nodes[peer] orelse return;
 
         if (connection.state == .terminating) {
