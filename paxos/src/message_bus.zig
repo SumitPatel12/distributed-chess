@@ -35,16 +35,13 @@ pub const MessageBus = struct {
 
     accept_connection: ?*Connection = null,
 
-    /// Stores the self votes for the Paxos alignment
-    loopback: RingBuffer(Message, 16) = .{},
-
     // We could do something like passing the ?*anyopaque like in the io but that was because we
     // didn't have the info, for bus we do have it available so no need to go that route.
     //
     /// The function to be called when the bus receives a message from a node. The bus pointer is
     /// passed to recover the node using `fieldParentPointer`; the messge bus is embedded in the
     /// node itself.
-    on_message: *const fn (*MessageBus, Message) void,
+    on_message_callback: *const fn (*MessageBus, Message) void,
 
     const Self = @This();
 
@@ -92,7 +89,7 @@ pub const MessageBus = struct {
 
     /// Inline initialze the `MessageBus`. Opens the socket in non-blocking mode.
     /// Doesn't start listening yet.
-    pub fn init(self: *Self, io: *IO, config: Config, on_message: *const fn (*MessageBus, Message) void) !void {
+    pub fn init(self: *Self, io: *IO, config: Config, on_message_callback: *const fn (*MessageBus, Message) void) !void {
         assert(config.cluster_size <= cluster_size_max);
 
         const socket = try syscalls.open_socket_tcp(false);
@@ -107,7 +104,7 @@ pub const MessageBus = struct {
             .io = io,
             .config = config,
             .socket = socket,
-            .on_message = on_message,
+            .on_message_callback = on_message_callback,
         };
     }
 
@@ -118,12 +115,6 @@ pub const MessageBus = struct {
             if (connection.socket != -1) {
                 bus.io.close_socket(connection.socket);
             }
-        }
-    }
-
-    pub fn broadcast(bus: *Self, message: *const Message) void {
-        for (0..bus.config.cluster_size) |peer_id| {
-            bus.send_to(message, peer_id);
         }
     }
 
@@ -152,13 +143,6 @@ pub const MessageBus = struct {
             if (bus.nodes[id] == null) {
                 bus.connect(@intCast(id));
             }
-        }
-
-        // on_message can potentially add to the loopback, to avoid infinite loops, we'll snapshot
-        // the current message count and only consume that many.
-        var n = bus.loopback.count;
-        while (n > 0) : (n -= 1) {
-            bus.on_message(bus, bus.loopback.pop().?);
         }
     }
 
@@ -372,7 +356,7 @@ pub const MessageBus = struct {
                     bus.nodes[message.sender] = connection;
                 }
 
-                bus.on_message(bus, message);
+                bus.on_message_callback(bus, message);
                 connection.total_recv = 0;
             }
 
@@ -384,14 +368,8 @@ pub const MessageBus = struct {
         }
     }
 
-    fn send_to(bus: *Self, message: *const Message, peer: u16) void {
-        // If message to self, queue on the loopback and return, the next tick will take care of
-        // handling it.
-        if (peer == bus.config.node_id) {
-            bus.loopback.push(message.*) catch {};
-            return;
-        }
-
+    pub fn send_to(bus: *Self, peer: u16, message: *const Message) void {
+        assert(peer != bus.config.node_id);
         // Only connecting, connected, and terminating have the nodes array connection set.
         const connection = bus.nodes[peer] orelse return;
 
@@ -520,13 +498,13 @@ test "Two nodes: send, recv, accept, and connect" {
 
         if (node_1.bus.nodes[1] != null and !sent_msg) {
             const msg_a = Message.init(.prepare, "Message from Node 1", 0);
-            node_1.bus.send_to(&msg_a, 1);
+            node_1.bus.send_to(1, &msg_a);
             sent_msg = true;
         }
 
         if (node_2.message != null and !sent_reply) {
             const msg_b = Message.init(.promise, "Message from Node 2", 1);
-            node_2.bus.send_to(&msg_b, 0);
+            node_2.bus.send_to(0, &msg_b);
             sent_reply = true;
         }
 
@@ -569,8 +547,18 @@ test "send ring: in-order delivery and overflow past capacity is dropped" {
     defer io1.deinit();
     defer io2.deinit();
 
-    const config1: Config = .{ .address = "127.0.0.1", .base_port = 4100, .node_id = 0, .cluster_size = 2 };
-    const config2: Config = .{ .address = "127.0.0.1", .base_port = 4100, .node_id = 1, .cluster_size = 2 };
+    const config1: Config = .{
+        .address = "127.0.0.1",
+        .base_port = 4100,
+        .node_id = 0,
+        .cluster_size = 2,
+    };
+    const config2: Config = .{
+        .address = "127.0.0.1",
+        .base_port = 4100,
+        .node_id = 1,
+        .cluster_size = 2,
+    };
 
     var node_1: TestNode = .{ .bus = undefined };
     var node_2: TestNode = .{ .bus = undefined };
@@ -586,7 +574,7 @@ test "send ring: in-order delivery and overflow past capacity is dropped" {
     while (i < send_count) : (i += 1) {
         const body = [_]u8{i};
         const msg = Message.init(.prepare, &body, 0);
-        node_1.bus.send_to(&msg, 1);
+        node_1.bus.send_to(1, &msg);
     }
 
     var ticks: u32 = 0;

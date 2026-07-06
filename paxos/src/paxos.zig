@@ -12,4 +12,5 @@ test {
     _ = @import("message_bus.zig");
     _ = @import("ring_buffer.zig");
     _ = @import("message.zig");
+    _ = @import("node.zig");
 }
