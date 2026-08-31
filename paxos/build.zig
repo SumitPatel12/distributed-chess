@@ -4,10 +4,10 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "") orelse .ReleaseSafe;
 
-    const cluster_size_max = b.option(u32, "cluster_size_max", "Maximum nodes the cluster can hold; sizes static storage. Defaults to 64") orelse 64;
+    const cluster_size_max = b.option(u8, "cluster_size_max", "Maximum nodes the cluster can hold; sizes static storage. Defaults to 64") orelse 64;
 
     const options = b.addOptions();
-    options.addOption(u32, "cluster_size_max", cluster_size_max);
+    options.addOption(u8, "cluster_size_max", cluster_size_max);
     const build_options_mod = options.createModule();
 
     const paxos_mod = b.addModule("paxos", .{

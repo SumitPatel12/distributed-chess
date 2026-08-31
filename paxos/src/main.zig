@@ -14,26 +14,50 @@ pub fn main(init: std.process.Init) !void {
 
     // Argument parsing a lot more of a pain than you'd imagine. Funny how we take things for
     // granted until we actually have to implement it.
-    // I'm going for a copout, we get only the first argument and parse it as a u32.
+    // I'm going for a copout, we get two positional arguments and parse them as u8.
+    if (args.len != 3) {
+        std.debug.print(
+            "usage: {s} <node_id> <cluster_size>\n",
+            .{args[0]},
+        );
+        std.process.exit(1);
+    }
+
     const node_id: u8 = std.fmt.parseInt(u8, args[1], 10) catch {
         std.debug.print(
-            "usage: {s} <node_id>\n",
+            "usage: {s} <node_id> <cluster_size>\n",
             .{args[0]},
         );
         std.process.exit(1);
     };
 
-    if (node_id > build_options.cluster_size_max) {
+    const cluster_size: u8 = std.fmt.parseInt(u8, args[2], 10) catch {
         std.debug.print(
-            "node_id must be an integer from 0 to {d}\n",
+            "usage: {s} <node_id> <cluster_size>\n",
+            .{args[0]},
+        );
+        std.process.exit(1);
+    };
+
+    if (cluster_size == 0 or cluster_size > build_options.cluster_size_max) {
+        std.debug.print(
+            "cluster_size must be an integer from 1 to {d}\n",
             .{build_options.cluster_size_max},
         );
         std.process.exit(1);
     }
 
+    if (node_id >= cluster_size) {
+        std.debug.print(
+            "node_id must be an integer from 0 to {d}\n",
+            .{cluster_size - 1},
+        );
+        std.process.exit(1);
+    }
+
     try stdout.print(
-        "paxos node {d} of up-to-{d}-node cluster\n",
-        .{ node_id, build_options.cluster_size_max },
+        "paxos node {d} of {d}-node cluster\n",
+        .{ node_id, cluster_size },
     );
     try stdout.flush();
 }

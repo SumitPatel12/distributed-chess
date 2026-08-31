@@ -52,7 +52,7 @@ pub const MessageBus = struct {
         /// connection. Accept grabs the first empty connection and on the first message recv we'll
         /// populate it to the correct position in the nodes array, OR, if this node is initiating
         /// the connection it'll set the peer's id correctly from the config.
-        peer: ?u16 = null,
+        peer: ?u8 = null,
 
         /// Socket over which the communication will be happening for this connection.
         socket: socket_t = -1,
@@ -91,6 +91,7 @@ pub const MessageBus = struct {
     /// Doesn't start listening yet.
     pub fn init(self: *Self, io: *IO, config: Config, on_message_callback: *const fn (*MessageBus, Message) void) !void {
         assert(config.cluster_size <= cluster_size_max);
+        assert(config.node_id < config.cluster_size);
 
         const socket = try syscalls.open_socket_tcp(false);
         try syscalls.listen(
@@ -195,7 +196,7 @@ pub const MessageBus = struct {
         connection.* = .{};
     }
 
-    fn connect(bus: *Self, peer_node_id: u16) void {
+    fn connect(bus: *Self, peer_node_id: u8) void {
         // A node only initiates connections with nodes of higher id, that way we don't open two
         // connection between a pair.
         assert(bus.config.node_id < peer_node_id);
@@ -344,16 +345,19 @@ pub const MessageBus = struct {
                         return;
                     }
 
+                    // Bounds-checked above, so the wire's u16 sender fits a u8 node id.
+                    const sender: u8 = @intCast(message.sender);
+
                     // There's an open connection that's for the current sender so we close it,
                     // and mark the current connection as the new one.
-                    if (bus.nodes[message.sender]) |old| {
+                    if (bus.nodes[sender]) |old| {
                         if (old != connection and old.state != .terminating) {
                             bus.terminate(old);
                         }
                     }
 
-                    connection.peer = message.sender;
-                    bus.nodes[message.sender] = connection;
+                    connection.peer = sender;
+                    bus.nodes[sender] = connection;
                 }
 
                 bus.on_message_callback(bus, message);
@@ -368,7 +372,7 @@ pub const MessageBus = struct {
         }
     }
 
-    pub fn send_to(bus: *Self, peer: u16, message: *const Message) void {
+    pub fn send_to(bus: *Self, peer: u8, message: *const Message) void {
         assert(peer != bus.config.node_id);
         // Only connecting, connected, and terminating have the nodes array connection set.
         const connection = bus.nodes[peer] orelse return;

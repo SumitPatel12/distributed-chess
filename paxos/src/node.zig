@@ -25,8 +25,7 @@ pub const Node = struct {
     pub fn init(
         self: *Self,
         clock: Clock,
-        node_id: u16,
-        cluster_size: u16,
+        config: Config,
     ) !void {
         self.bus = .{
             .io = undefined,
@@ -35,13 +34,7 @@ pub const Node = struct {
             .on_message_callback = undefined,
         };
 
-        self.config = .{
-            .address = "127.0.0.1",
-            .base_port = 4000,
-            .cluster_size = cluster_size,
-            .node_id = node_id,
-        };
-
+        self.config = config;
         self.io = .{ .clock = undefined };
 
         self.loopback = null;
@@ -76,7 +69,9 @@ pub const Node = struct {
         }
     }
 
-    pub fn send_to_node(self: *Self, peer: u16, message: *const Message) void {
+    pub fn send_to_node(self: *Self, peer: u8, message: *const Message) void {
+        assert(peer < self.config.cluster_size);
+
         if (peer == self.config.node_id) {
             assert(self.loopback == null);
             self.loopback = message.*;
@@ -104,7 +99,14 @@ test "loopback test" {
         .config = undefined,
     };
 
-    try node.init(clock, 0, 1);
+    const config: Config = .{
+        .node_id = 0,
+        .cluster_size = 1,
+        .base_port = 4000,
+        .address = "127.0.0.1",
+    };
+
+    try node.init(clock, config);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Some Message", 0);
@@ -127,7 +129,14 @@ test "broadcast routes a self-message through the loopback" {
         .config = undefined,
     };
 
-    try node.init(clock, 0, 1);
+    const config: Config = .{
+        .node_id = 0,
+        .cluster_size = 1,
+        .base_port = 4000,
+        .address = "127.0.0.1",
+    };
+
+    try node.init(clock, config);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Broadcast Message", 0);
