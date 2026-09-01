@@ -11,10 +11,11 @@ const assert = std.debug.assert;
 
 pub const NodeStats = struct {
     self_messages: u64 = 0,
+    messages_received: u64 = 0,
 };
 
 pub const Node = struct {
-    io: IO,
+    io: *IO,
     bus: MessageBus,
     config: Config,
     loopback: ?Message = null,
@@ -24,7 +25,7 @@ pub const Node = struct {
 
     pub fn init(
         self: *Self,
-        clock: Clock,
+        io: *IO,
         config: Config,
     ) !void {
         self.bus = .{
@@ -35,26 +36,28 @@ pub const Node = struct {
         };
 
         self.config = config;
-        self.io = .{ .clock = undefined };
+        self.io = io;
 
         self.loopback = null;
 
-        try self.io.init(clock);
-        errdefer self.io.deinit();
-
-        try self.bus.init(&self.io, self.config, Self.on_message);
+        try self.bus.init(self.io, self.config, Self.on_message_from_bus);
         errdefer self.bus.deinit();
     }
 
     pub fn deinit(self: *Self) void {
         self.bus.deinit();
-        self.io.deinit();
     }
 
-    pub fn on_message(bus: *MessageBus, message: Message) void {
-        _ = message;
+    fn on_message_from_bus(bus: *MessageBus, message: Message) void {
         const self: *Self = @fieldParentPtr("bus", bus);
-        self.stats.self_messages += 1;
+        self.stats.messages_received += 1;
+        self.on_message(message);
+    }
+
+    fn on_message(self: *Self, message: Message) void {
+        // TODO: Pass to Paxos layer once it's in place.
+        _ = message;
+        _ = self;
     }
 
     pub fn tick(self: *Self) void {
@@ -82,8 +85,9 @@ pub const Node = struct {
 
     fn flush_loopback(self: *Self) void {
         if (self.loopback) |message| {
+            self.stats.self_messages += 1;
             self.loopback = null;
-            Self.on_message(&self.bus, message);
+            self.on_message(message);
         }
         assert(self.loopback == null);
     }
@@ -92,6 +96,11 @@ pub const Node = struct {
 test "loopback test" {
     var real_clock: RealClock = .{};
     const clock: Clock = .{ .real = &real_clock };
+
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    // Declared first so it runs last: the node's teardown closes sockets through the IO.
+    defer io.deinit();
 
     var node: Node = .{
         .io = undefined,
@@ -106,7 +115,7 @@ test "loopback test" {
         .address = "127.0.0.1",
     };
 
-    try node.init(clock, config);
+    try node.init(&io, config);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Some Message", 0);
@@ -117,11 +126,17 @@ test "loopback test" {
     node.flush_loopback();
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
+    try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);
 }
 
 test "broadcast routes a self-message through the loopback" {
     var real_clock: RealClock = .{};
     const clock: Clock = .{ .real = &real_clock };
+
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    // Declared first so it runs last: the node's teardown closes sockets through the IO.
+    defer io.deinit();
 
     var node: Node = .{
         .io = undefined,
@@ -136,7 +151,7 @@ test "broadcast routes a self-message through the loopback" {
         .address = "127.0.0.1",
     };
 
-    try node.init(clock, config);
+    try node.init(&io, config);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Broadcast Message", 0);
@@ -147,4 +162,5 @@ test "broadcast routes a self-message through the loopback" {
     node.flush_loopback();
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
+    try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);
 }

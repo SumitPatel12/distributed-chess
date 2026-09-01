@@ -1,13 +1,20 @@
 const std = @import("std");
-const Io = std.Io;
+const stdIo = std.Io;
 const build_options = @import("build_options");
+const IO = @import("io.zig").IO;
+const Node = @import("node.zig").Node;
+const Config = @import("config.zig").Config;
+const _clock = @import("clock.zig");
+
+const Clock = _clock.Clock;
+const RealClock = _clock.RealClock;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
 
     var stdout_buffer: [512]u8 = undefined;
-    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+    var stdout_writer = stdIo.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
@@ -60,4 +67,31 @@ pub fn main(init: std.process.Init) !void {
         .{ node_id, cluster_size },
     );
     try stdout.flush();
+
+    const config: Config = .{
+        .address = "127.0.0.1",
+        .base_port = 3000,
+        .cluster_size = cluster_size,
+        .node_id = node_id,
+    };
+
+    try start_node(config);
+}
+
+fn start_node(config: Config) !void {
+    var real_clock: RealClock = .{};
+    const clock: Clock = .{ .real = &real_clock };
+
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    var node: Node = undefined;
+    try node.init(&io, config);
+    defer node.deinit();
+
+    while (true) {
+        node.tick();
+        try io.run_for_ns(10 * std.time.ns_per_ms);
+    }
 }
