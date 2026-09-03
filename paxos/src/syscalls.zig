@@ -21,7 +21,6 @@ const std = @import("std");
 const c = std.c;
 const fd_t = std.c.fd_t;
 const socket_t = std.c.fd_t;
-const max_retires = 8;
 const assert = std.debug.assert;
 
 pub const SetNonblockError = error{
@@ -158,6 +157,33 @@ pub const RecvError = error{
 
 pub const ParseAddressError = error{
     InvalidAddress,
+};
+
+pub const ReadError = error{
+    AddressNotAccessible,
+    FileDescriptorInvalid,
+    IOError,
+    InsufficientSystemResources,
+    InvalidArgument,
+    IsADirectory,
+    IsPipeSocketOrFifo,
+    NoSuchDeviceOrAddress,
+    StaleNetworkFileHandle,
+    TimedOut,
+    WouldBlock,
+};
+
+pub const WriteError = error{
+    AddressNotAccessible,
+    DiskQuotaExhausted,
+    FileDescriptorInvalid,
+    FileTooBig,
+    IOError,
+    InvalidArgument,
+    IsPipeSocketOrFifo,
+    NoSpaceLeftOnDevice,
+    NoSuchDeviceOrAddress,
+    WouldBlock,
 };
 
 fn unexpected_errno(label: []const u8, err: c.E) noreturn {
@@ -310,48 +336,45 @@ pub fn listen(socket: socket_t, addr: [*:0]const u8, port: u16, backlog: u31) Li
 }
 
 pub fn connect(socket: socket_t, address: *const c.sockaddr.in) ConnectError!void {
-    for (0..max_retires) |_| {
-        const connect_res = c.connect(socket, @ptrCast(address), @sizeOf(c.sockaddr.in));
+    const connect_res = c.connect(socket, @ptrCast(address), @sizeOf(c.sockaddr.in));
 
-        if (connect_res >= 0) {
-            return;
-        }
-
-        switch (c.errno(connect_res)) {
-            // Retry the interrupted call; after max_retires interruptions we give up and panic.
-            .INTR => continue,
-            .ACCES => return error.PermissionDenied,
-            .ADDRINUSE => return error.AddressAlreadyInUse,
-            .ADDRNOTAVAIL => return error.AddressNotAvailable,
-            .AFNOSUPPORT => return error.AddressFamilyMismatch,
-            .ALREADY => return error.ConnectionAlreadyInProgress,
-            .BADF => return error.SocketFileDescriptorInvalid,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .FAULT => return error.AddressNotAccessible,
-            .HOSTUNREACH => return error.HostUnreachable,
-            // WouldBlock to facilitate the IO loop to correctly categorize this as blocking and
-            // park it.
-            .INPROGRESS => return error.WouldBlock,
-            .INVAL => return error.InvalidArgument,
-            .ISCONN => return error.SocketAlreadyConnected,
-            .NETDOWN => return error.NetworkDown,
-            .NETUNREACH => return error.NetworkUnreachable,
-            .NOBUFS => return error.InsufficientSystemResources,
-            .NOTSOCK => return error.NotASocket,
-            .OPNOTSUPP => return error.OperationNotSupported,
-            .PROTOTYPE => return error.AddressTypeMismatch,
-            .TIMEDOUT => return error.ConnectionTimedOut,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            // UNIX domain ones
-            .IO => return error.FileSystemIoError,
-            .LOOP => return error.AddressLoopBack,
-            .NAMETOOLONG => return error.AddressTooLong,
-            .NOENT => return error.NamedSocketNotFound,
-            .NOTDIR => return error.NotADirectory,
-            else => |e| unexpected_errno("connect", e),
-        }
+    if (connect_res >= 0) {
+        return;
     }
-    @panic("connect: exhausted EINTR retries");
+
+    switch (c.errno(connect_res)) {
+        // Sockets are opened in non-blocking mode, so INTR is not possible for these.
+        .INTR => unreachable,
+        .ACCES => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressAlreadyInUse,
+        .ADDRNOTAVAIL => return error.AddressNotAvailable,
+        .AFNOSUPPORT => return error.AddressFamilyMismatch,
+        .ALREADY => return error.ConnectionAlreadyInProgress,
+        .BADF => return error.SocketFileDescriptorInvalid,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .FAULT => return error.AddressNotAccessible,
+        .HOSTUNREACH => return error.HostUnreachable,
+        // WouldBlock to facilitate the IO loop to correctly categorize this as blocking and
+        // park it.
+        .INPROGRESS => return error.WouldBlock,
+        .INVAL => return error.InvalidArgument,
+        .ISCONN => return error.SocketAlreadyConnected,
+        .NETDOWN => return error.NetworkDown,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOBUFS => return error.InsufficientSystemResources,
+        .NOTSOCK => return error.NotASocket,
+        .OPNOTSUPP => return error.OperationNotSupported,
+        .PROTOTYPE => return error.AddressTypeMismatch,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        // UNIX domain ones
+        .IO => return error.FileSystemIoError,
+        .LOOP => return error.AddressLoopBack,
+        .NAMETOOLONG => return error.AddressTooLong,
+        .NOENT => return error.NamedSocketNotFound,
+        .NOTDIR => return error.NotADirectory,
+        else => |e| unexpected_errno("connect", e),
+    }
 }
 
 pub fn get_socket_error(socket: socket_t) ConnectError!void {
@@ -400,36 +423,33 @@ pub fn accept(listen_socket: socket_t, peer: ?*c.sockaddr.in, blocking: bool) Ac
     var len: c.socklen_t = @sizeOf(c.sockaddr.in);
     // Write the peer's info the the peer, and writes how many bytes it wrote to peer in the len
     // field. When no peer is requested addrlen must be null too, per the man page.
-    for (0..max_retires) |_| {
-        const new_socket = c.accept(listen_socket, @ptrCast(peer), if (peer == null) null else &len);
+    const new_socket = c.accept(listen_socket, @ptrCast(peer), if (peer == null) null else &len);
 
-        if (new_socket >= 0) {
-            errdefer close(new_socket);
+    if (new_socket >= 0) {
+        errdefer close(new_socket);
 
-            if (!blocking) {
-                try set_nonblock(new_socket);
-            }
-
-            return new_socket;
+        if (!blocking) {
+            try set_nonblock(new_socket);
         }
 
-        switch (c.errno(new_socket)) {
-            // Retry the interrupted call; after max_retires interruptions we give up and panic.
-            .INTR => continue,
-            .BADF => return error.SocketFileDescriptorInvalid,
-            .CONNABORTED => return error.ConnectionAborted,
-            .FAULT => return error.AddressNotAccessible,
-            .INVAL => return error.SocketNotListening,
-            .MFILE => return error.ProcessFdLimitExceeded,
-            .NFILE => return error.SystemFdLimitExceeded,
-            .NOMEM => return error.InsufficientSystemResources,
-            .NOTSOCK => return error.NotASocket,
-            .OPNOTSUPP => return error.OperationNotSupported,
-            .AGAIN => return error.WouldBlock,
-            else => |e| unexpected_errno("accept", e),
-        }
+        return new_socket;
     }
-    @panic("accept: exhausted EINTR retries");
+
+    switch (c.errno(new_socket)) {
+        // Sockets are opened in non-blocking mode, so INTR is not possible for these.
+        .INTR => unreachable,
+        .BADF => return error.SocketFileDescriptorInvalid,
+        .CONNABORTED => return error.ConnectionAborted,
+        .FAULT => return error.AddressNotAccessible,
+        .INVAL => return error.SocketNotListening,
+        .MFILE => return error.ProcessFdLimitExceeded,
+        .NFILE => return error.SystemFdLimitExceeded,
+        .NOMEM => return error.InsufficientSystemResources,
+        .NOTSOCK => return error.NotASocket,
+        .OPNOTSUPP => return error.OperationNotSupported,
+        .AGAIN => return error.WouldBlock,
+        else => |e| unexpected_errno("accept", e),
+    }
 }
 
 // Once again we're using u31 because send returns a signed int and well negative numbers are
@@ -442,64 +462,58 @@ pub fn send(socket: socket_t, message: []const u8, flags: u32) SendError!u31 {
     // None of which are required for us, so most of the time we'll be sending 0.
     //
     // For tcp `send` can send only some of the data, so keep an eye out for that.
-    for (0..max_retires) |_| {
-        const send_res = c.send(socket, message.ptr, message.len, flags);
+    const send_res = c.send(socket, message.ptr, message.len, flags);
 
-        if (send_res >= 0) {
-            return @as(u31, @intCast(send_res));
-        }
-
-        switch (c.errno(send_res)) {
-            // Retry the interrupted call; after max_retires interruptions we give up and panic.
-            .INTR => continue,
-            .ACCES => return error.PermissionDenied,
-            .ADDRNOTAVAIL => return error.AddressNotAvailable,
-            .AGAIN => return error.WouldBlock,
-            .BADF => return error.SocketFileDescriptorInvalid,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .DESTADDRREQ => return error.AddressIsNull,
-            .FAULT => return error.AddressNotAccessible,
-            .HOSTUNREACH => return error.HostUnreachable,
-            .MSGSIZE => return error.MessageTooLarge,
-            .NETDOWN => return error.NetworkDown,
-            .NETUNREACH => return error.NetworkUnreachable,
-            .NOBUFS => return error.InsufficientSystemResources,
-            .NOTCONN => return error.SocketNotConnected,
-            .NOTSOCK => return error.NotASocket,
-            .OPNOTSUPP => return error.OperationNotSupported,
-            .PIPE => return error.BrokenPipe,
-            else => |e| unexpected_errno("send", e),
-        }
+    if (send_res >= 0) {
+        return @as(u31, @intCast(send_res));
     }
-    @panic("send: exhausted EINTR retries");
+
+    switch (c.errno(send_res)) {
+        // Sockets are opened in non-blocking mode, so INTR is not possible for these.
+        .INTR => unreachable,
+        .ACCES => return error.PermissionDenied,
+        .ADDRNOTAVAIL => return error.AddressNotAvailable,
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.SocketFileDescriptorInvalid,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .DESTADDRREQ => return error.AddressIsNull,
+        .FAULT => return error.AddressNotAccessible,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .MSGSIZE => return error.MessageTooLarge,
+        .NETDOWN => return error.NetworkDown,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOBUFS => return error.InsufficientSystemResources,
+        .NOTCONN => return error.SocketNotConnected,
+        .NOTSOCK => return error.NotASocket,
+        .OPNOTSUPP => return error.OperationNotSupported,
+        .PIPE => return error.BrokenPipe,
+        else => |e| unexpected_errno("send", e),
+    }
 }
 
 /// Returns the number of bytes read.
 pub fn recv(socket: socket_t, buffer: []u8, flags: u32) RecvError!u31 {
-    for (0..max_retires) |_| {
-        const recv_res = c.recv(socket, buffer.ptr, buffer.len, @as(c_int, @intCast(flags)));
+    const recv_res = c.recv(socket, buffer.ptr, buffer.len, @as(c_int, @intCast(flags)));
 
-        if (recv_res >= 0) {
-            return @as(u31, @intCast(recv_res));
-        }
-
-        switch (c.errno(recv_res)) {
-            // After max_retires for interruptions we give up and panic.
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .BADF => return error.SocketFileDescriptorInvalid,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .FAULT => return error.AddressNotAccessible,
-            .INVAL => return error.InvalidArgument,
-            .NOBUFS => return error.InsufficientSystemResources,
-            .NOTCONN => return error.SocketNotConnected,
-            .NOTSOCK => return error.NotASocket,
-            .OPNOTSUPP => return error.OperationNotSupported,
-            .TIMEDOUT => return error.ConnectionTimedOut,
-            else => |e| unexpected_errno("recv", e),
-        }
+    if (recv_res >= 0) {
+        return @as(u31, @intCast(recv_res));
     }
-    @panic("recv: exhausted EINTR retries");
+
+    switch (c.errno(recv_res)) {
+        // Sockets are opened in non-blocking mode, so INTR is not possible for these.
+        .INTR => unreachable,
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.SocketFileDescriptorInvalid,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .FAULT => return error.AddressNotAccessible,
+        .INVAL => return error.InvalidArgument,
+        .NOBUFS => return error.InsufficientSystemResources,
+        .NOTCONN => return error.SocketNotConnected,
+        .NOTSOCK => return error.NotASocket,
+        .OPNOTSUPP => return error.OperationNotSupported,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |e| unexpected_errno("recv", e),
+    }
 }
 
 pub fn set_nonblock(socket: socket_t) SetNonblockError!void {
@@ -565,12 +579,15 @@ pub fn kqueue() KqueueError!fd_t {
 
 /// Returns the number of events that are ready.
 pub fn kevent(
+    /// File Descriptor to the kequeue
     kq: fd_t,
+    /// Events that have changed, deleted or are to be registered.
     changelist: []const c.Kevent,
+    /// Array that the kernel will populate the ready events with.
     eventlist: []c.Kevent,
     timeout: ?*const c.timespec,
 ) KeventError!usize {
-    for (0..max_retires) |_| {
+    while (true) {
         const kevent_res = c.kevent(
             kq,
             changelist.ptr,
@@ -597,7 +614,80 @@ pub fn kevent(
             else => |e| unexpected_errno("kevent", e),
         }
     }
-    @panic("kevent: exhausted EINTR retries");
+}
+
+/// Returns the number of bytes read. Return value of 0 means offset was set to the EOF.
+pub fn pread(
+    fd: fd_t,
+    buffer: []u8,
+    offset: u63,
+) ReadError!usize {
+    while (true) {
+        // Once again off_t on mac results in an i64 and I cna't for the life of me understand why
+        // you'd need a negative offset, so we're going for a u63. Going for u64 would result in
+        // loss of the original value when converting to i64.
+        //
+        // P.S. If you're using a value for offset big enough the it'd require a u64, and hear me
+        // out here, you should reconsider your life choices. Just saying.
+        const result = c.pread(fd, buffer.ptr, buffer.len, @intCast(offset));
+
+        if (result >= 0) {
+            return @intCast(result);
+        }
+
+        switch (c.errno(result)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.FileDescriptorInvalid,
+            .FAULT => return error.AddressNotAccessible,
+            // Negative fd and invalid offset both result in this error code hencewhy the generic
+            // name.
+            .INVAL => return error.InvalidArgument,
+            .IO => return error.IOError,
+            .ISDIR => return error.IsADirectory,
+            .NOBUFS, .NOMEM => return error.InsufficientSystemResources,
+            .NXIO => return error.NoSuchDeviceOrAddress,
+            // pread cannot seek on those particular ones.
+            .SPIPE => return error.IsPipeSocketOrFifo,
+            .STALE => return error.StaleNetworkFileHandle,
+            .TIMEDOUT => return error.TimedOut,
+            else => |e| unexpected_errno("pread", e),
+        }
+    }
+}
+
+/// Returns the number of bytes written. In case fewer bytes were written the user needs to re-try.
+pub fn pwrite(
+    fd: fd_t,
+    buffer: []const u8,
+    offset: u63,
+) WriteError!usize {
+    while (true) {
+        // u63 spans exactly off_t's non-negative range, so this cast can never fail.
+        const result = c.pwrite(fd, buffer.ptr, buffer.len, @intCast(offset));
+
+        if (result >= 0) {
+            return @intCast(result);
+        }
+
+        switch (c.errno(result)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.FileDescriptorInvalid,
+            .DQUOT => return error.DiskQuotaExhausted,
+            .FAULT => return error.AddressNotAccessible,
+            // Exceeds the process's file size limit, or the descriptor's offset maximum.
+            .FBIG => return error.FileTooBig,
+            // Covers a negative fd value, an invalid file offset, and nbyte above INT_MAX.
+            .INVAL => return error.InvalidArgument,
+            .IO => return error.IOError,
+            .NOSPC => return error.NoSpaceLeftOnDevice,
+            .NXIO => return error.NoSuchDeviceOrAddress,
+            // pwrite cannot seek on these, unlike write.
+            .SPIPE => return error.IsPipeSocketOrFifo,
+            else => |e| unexpected_errno("pwrite", e),
+        }
+    }
 }
 
 test {
@@ -630,6 +720,6 @@ test "send/recv: bytes round trip over a connected socket pair" {
     try std.testing.expectEqual(@as(u31, payload.len), wrote);
 
     var buffer: [16]u8 = undefined;
-    const read = try recv(fds[1], &buffer, 0);
-    try std.testing.expectEqualStrings(payload, buffer[0..read]);
+    const bytes_read = try recv(fds[1], &buffer, 0);
+    try std.testing.expectEqualStrings(payload, buffer[0..bytes_read]);
 }

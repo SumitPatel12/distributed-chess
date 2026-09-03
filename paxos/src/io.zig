@@ -6,6 +6,7 @@ const FakeClock = clock_lib.FakeClock;
 const Queue = @import("queue.zig").Queue;
 const c = std.c;
 const socket_t = std.c.fd_t;
+const fd_t = std.c.fd_t;
 const assert = std.debug.assert;
 
 // This will end up looking very similar to what TigerBeetle has since I'm learning off of what they
@@ -56,7 +57,9 @@ pub const IO = struct {
             len: u32,
         },
         timeout: struct { expire_ns: u64 },
-        close: struct { fd: c.fd_t },
+        close: struct { fd: fd_t },
+        read: struct { fd: fd_t, buffer: []u8, offset: u63 },
+        write: struct { fd: fd_t, buffer: []const u8, offset: u63 },
     };
 
     pub const Completion = struct {
@@ -214,7 +217,7 @@ pub const IO = struct {
         context: Context,
         comptime callback: fn (Context, *Completion, void) void,
         completion: *Completion,
-        fd: c.fd_t,
+        fd: fd_t,
     ) void {
         self.submit(
             context,
@@ -230,7 +233,7 @@ pub const IO = struct {
         );
     }
 
-    pub fn close_socket(self: *IO, fd: c.fd_t) void {
+    pub fn close_socket(self: *IO, fd: fd_t) void {
         _ = self;
         syscalls.close(fd);
     }
@@ -315,6 +318,54 @@ pub const IO = struct {
                 // do_operation is a no-op.
                 pub fn do_operation(op: anytype) void {
                     _ = op;
+                }
+            },
+        );
+    }
+
+    pub fn pread(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.ReadError!usize) void,
+        completion: *Completion,
+        fd: fd_t,
+        buffer: []u8,
+        offset: u63,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .read,
+            .{ .fd = fd, .buffer = buffer, .offset = offset },
+            struct {
+                pub fn do_operation(op: anytype) syscalls.ReadError!usize {
+                    return try syscalls.pread(op.fd, op.buffer, op.offset);
+                }
+            },
+        );
+    }
+
+    pub fn pwrite(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, syscalls.WriteError!usize) void,
+        completion: *Completion,
+        fd: fd_t,
+        buffer: []const u8,
+        offset: u63,
+    ) void {
+        self.submit(
+            context,
+            callback,
+            completion,
+            .write,
+            .{ .fd = fd, .buffer = buffer, .offset = offset },
+            struct {
+                pub fn do_operation(op: anytype) syscalls.WriteError!usize {
+                    return try syscalls.pwrite(op.fd, op.buffer, op.offset);
                 }
             },
         );
@@ -571,6 +622,56 @@ test "recv parks on WouldBlock, then resumes via kqueue and delivers bytes" {
     try std.testing.expectEqual(@as(?usize, 4), result.got);
     try std.testing.expectEqual(@as(u32, 0), io.io_inflight);
     try std.testing.expectEqual(@as(u64, 1), io.stats.events_received);
+}
+
+test "pread reports a byte-count result to its callback" {
+    var fake_clock: FakeClock = .{};
+    const clock: Clock = .{ .fake = &fake_clock };
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    const Result = struct { got: ?syscalls.ReadError!usize = null };
+    var result: Result = .{};
+    const on_read = struct {
+        fn on_read(res: *Result, _: *IO.Completion, read_result: syscalls.ReadError!usize) void {
+            res.got = read_result;
+        }
+    }.on_read;
+
+    var buffer: [8]u8 = undefined;
+    var completion: IO.Completion = undefined;
+    io.pread(*Result, &result, on_read, &completion, -1, &buffer, 0);
+
+    try io.run();
+
+    try std.testing.expect(result.got != null);
+    try std.testing.expectError(error.FileDescriptorInvalid, result.got.?);
+}
+
+test "pwrite reports a byte-count result to its callback" {
+    var fake_clock: FakeClock = .{};
+    const clock: Clock = .{ .fake = &fake_clock };
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    defer io.deinit();
+
+    const Result = struct { got: ?syscalls.WriteError!usize = null };
+    var result: Result = .{};
+    const on_write = struct {
+        fn on_write(res: *Result, _: *IO.Completion, write_result: syscalls.WriteError!usize) void {
+            res.got = write_result;
+        }
+    }.on_write;
+
+    const buffer = [_]u8{ 1, 2, 3, 4 };
+    var completion: IO.Completion = undefined;
+    io.pwrite(*Result, &result, on_write, &completion, -1, &buffer, 0);
+
+    try io.run();
+
+    try std.testing.expect(result.got != null);
+    try std.testing.expectError(error.FileDescriptorInvalid, result.got.?);
 }
 
 test "TCP sockets listen, accept, recv, and send" {

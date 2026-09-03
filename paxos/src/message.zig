@@ -13,11 +13,10 @@ pub const MessageType = enum(u8) {
 /// smaller than 24 bytes, it'll be padded with zeros.
 /// Header:
 ///  - 4 byte CRC32-C checksum
-///  - 2 byte SenderId (So current nodes id)
+///  - 2 byte SenderId
 ///  - 1 byte MyssageType
 ///  - 1 byte Version
-/// Body will be decided by message type and is of no consequence here, this is only for sending
-/// over the wire.
+///  - Body will be decided by message type
 pub const Message = struct {
     message_type: MessageType,
     body: [body_size]u8 = std.mem.zeroes([body_size]u8),
