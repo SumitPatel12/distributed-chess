@@ -28,20 +28,15 @@ pub const Node = struct {
         io: *IO,
         config: Config,
     ) !void {
-        self.bus = .{
-            .io = undefined,
-            .config = undefined,
-            .socket = -1,
-            .on_message_callback = undefined,
+        self.* = .{
+            .io = io,
+            .config = config,
+            .bus = undefined,
+            .loopback = null,
+            .stats = .{},
         };
 
-        self.config = config;
-        self.io = io;
-
-        self.loopback = null;
-
         try self.bus.init(self.io, self.config, Self.on_message_from_bus);
-        errdefer self.bus.deinit();
     }
 
     pub fn deinit(self: *Self) void {
@@ -92,6 +87,32 @@ pub const Node = struct {
         assert(self.loopback == null);
     }
 };
+
+test "Node init" {
+    var real_clock: RealClock = .{};
+    const clock: Clock = .{ .real = &real_clock };
+
+    var io: IO = .{ .clock = undefined };
+    try io.init(clock);
+    // Declared first so it runs last: the node's teardown closes sockets through the IO.
+    defer io.deinit();
+
+    var node: Node = undefined;
+
+    const config: Config = .{
+        .node_id = 0,
+        .cluster_size = 1,
+        .base_port = 4000,
+        .address = "127.0.0.1",
+    };
+
+    try node.init(&io, config);
+    defer node.deinit();
+
+    try std.testing.expectEqual(node.stats.messages_received, 0);
+    try std.testing.expectEqual(node.stats.self_messages, 0);
+    try std.testing.expect(node.loopback == null);
+}
 
 test "loopback test" {
     var real_clock: RealClock = .{};
