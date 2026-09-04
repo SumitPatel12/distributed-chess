@@ -54,15 +54,16 @@ pub const Node = struct {
 
     fn on_message(self: *Self, message: Message) void {
         // TODO: Pass to Paxos layer once it's in place.
+        // TODO: Also get rid of the nullable thing. Callback will be mandatory.
         if (self.callback) |hook| {
             hook(self, message);
         }
     }
 
     pub fn tick(self: *Self) void {
-        assert(self.loopback == null);
+        self.assert_loopback_empty("tick entry");
         self.bus.tick();
-        assert(self.loopback == null);
+        self.assert_loopback_empty("tick exit");
     }
 
     pub fn broadcast(self: *Self, message: *const Message) void {
@@ -82,13 +83,23 @@ pub const Node = struct {
         }
     }
 
-    fn flush_loopback(self: *Self) void {
-        if (self.loopback) |message| {
+    fn drain_loopback(self: *Self) void {
+        while (self.loopback) |message| {
             self.stats.self_messages += 1;
             self.loopback = null;
             self.on_message(message);
         }
         assert(self.loopback == null);
+    }
+
+    fn assert_loopback_empty(self: *const Self, comptime site: []const u8) void {
+        if (self.loopback) |message| {
+            // TODO: Replace with logger.
+            std.debug.print(site ++ ": undelivered {s} loopback message\n", .{
+                @tagName(message.message_type),
+            });
+            @panic("loopback message with no drain");
+        }
     }
 };
 
@@ -162,7 +173,7 @@ test "loopback test" {
     try std.testing.expect(node.loopback != null);
     try std.testing.expect(node.loopback.?.message_type == .prepare);
 
-    node.flush_loopback();
+    node.drain_loopback();
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
     try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);
@@ -201,7 +212,7 @@ test "broadcast routes a self-message through the loopback" {
     try std.testing.expect(node.loopback != null);
     try std.testing.expect(node.loopback.?.message_type == .prepare);
 
-    node.flush_loopback();
+    node.drain_loopback();
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
     try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);

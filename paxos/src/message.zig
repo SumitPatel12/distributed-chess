@@ -3,6 +3,12 @@ const crc32c = @import("crc32_c.zig").crc32c;
 
 pub const MessageType = enum(u8) {
     prepare,
+    // promise and promise_accepted need to be different due to how zig handles nullabel types (?T).
+    // A nullable type would require one more byte to store and with padding that would make the
+    // total go from 24 to 32 (24 bytes + 1 byte + 7 bytes padding), leading message_size going from
+    // 32 to 64 (it'd be 40 but the next alignment window would be 64). Which would be a monumental
+    // waste of space considering that the message size is 32 at this moment with 8 byte header and
+    // 24 bytes body, and of those 24 quite a few get padded with 0s for other variants.
     promise,
     promise_accepted,
     accept,
