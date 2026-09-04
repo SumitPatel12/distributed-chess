@@ -65,7 +65,7 @@ pub const MessageBus = struct {
         /// cannot be terminated directly.
         recv_submitted: bool = false,
         recv_completion: Completion = undefined,
-        recv_buffer: [Message.size]u8 = undefined,
+        recv_buffer: [Message.SIZE]u8 = undefined,
 
         /// Tracks if there is any active send parked. Used to indicate that there is some event in
         /// the IO loop which will come back and try to access this connection thus this connection
@@ -330,9 +330,9 @@ pub const MessageBus = struct {
             }
 
             connection.total_recv += @intCast(bytes_read);
-            assert(connection.total_recv <= Message.size);
+            assert(connection.total_recv <= Message.SIZE);
 
-            if (connection.total_recv == Message.size) {
+            if (connection.total_recv == Message.SIZE) {
                 // Parse the message and send it to the owner of the message bus.
                 const message: Message = Message.decode(&connection.recv_buffer) catch {
                     bus.terminate(connection);
@@ -345,8 +345,7 @@ pub const MessageBus = struct {
                         return;
                     }
 
-                    // Bounds-checked above, so the wire's u16 sender fits a u8 node id.
-                    const sender: u8 = @intCast(message.sender);
+                    const sender = message.sender;
 
                     // There's an open connection that's for the current sender so we close it,
                     // and mark the current connection as the new one.
@@ -434,9 +433,9 @@ pub const MessageBus = struct {
 
         if (result) |bytes_sent| {
             connection.total_sent += @intCast(bytes_sent);
-            assert(connection.total_sent <= Message.size);
+            assert(connection.total_sent <= Message.SIZE);
 
-            if (connection.total_sent == Message.size) {
+            if (connection.total_sent == Message.SIZE) {
                 _ = connection.send_buffer.pop();
                 connection.total_sent = 0;
             }
