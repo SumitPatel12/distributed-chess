@@ -82,7 +82,7 @@ pub const Node = struct {
         }
     }
 
-    pub fn flush_loopback(self: *Self) void {
+    fn flush_loopback(self: *Self) void {
         if (self.loopback) |message| {
             self.stats.self_messages += 1;
             self.loopback = null;
