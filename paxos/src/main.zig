@@ -2,12 +2,40 @@ const std = @import("std");
 const stdIo = std.Io;
 const build_options = @import("build_options");
 const IO = @import("io.zig").IO;
-const Node = @import("node.zig").Node;
+const node_lib = @import("node.zig");
 const Config = @import("config.zig").Config;
 const _clock = @import("clock.zig");
+const message_lib = @import("message.zig");
 
+const Node = node_lib.Node;
+const Message = message_lib.Message;
+const MessageType = message_lib.MessageType;
 const Clock = _clock.Clock;
 const RealClock = _clock.RealClock;
+
+var interrupted: std.atomic.Value(bool) = .init(false);
+
+fn handle_sigint(_: std.c.SIG) callconv(.c) void {
+    interrupted.store(true, .release);
+}
+
+const NodeRunner = struct {
+    const CAPACITY = 1024;
+
+    node: Node,
+    messages: [CAPACITY]Message = undefined,
+    count: usize = 0,
+
+    fn on_message(node: *Node, message: Message) void {
+        const self: *NodeRunner = @fieldParentPtr("node", node);
+        if (self.count == CAPACITY) {
+            return;
+        }
+
+        self.messages[self.count] = message;
+        self.count += 1;
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -75,6 +103,17 @@ pub fn main(init: std.process.Init) !void {
         .node_id = node_id,
     };
 
+    var mask: std.c.sigset_t = undefined;
+    _ = std.c.sigemptyset(&mask);
+
+    const action: std.c.Sigaction = .{
+        .mask = mask,
+        .handler = .{ .handler = handle_sigint },
+        .flags = 0,
+    };
+
+    _ = std.c.sigaction(std.c.SIG.INT, &action, null);
+
     try start_node(config);
 }
 
@@ -86,12 +125,52 @@ fn start_node(config: Config) !void {
     try io.init(clock);
     defer io.deinit();
 
-    var node: Node = undefined;
-    try node.init(&io, config);
+    var runner: NodeRunner = .{ .node = undefined };
+    const node = &runner.node;
+    try node.init(&io, config, NodeRunner.on_message);
     defer node.deinit();
 
-    while (true) {
+    var iteration: u48 = 0;
+    const message_send_modulo: u48 = switch (config.node_id) {
+        0 => 3,
+        1 => 5,
+        2 => 7,
+        else => unreachable,
+    };
+
+    while (!interrupted.load(.acquire)) : (iteration += 1) {
+        if (iteration % message_send_modulo == 0) {
+            const epoch: u64 = (@as(u64, iteration) << 8) | config.node_id;
+            var body: [8]u8 = undefined;
+            std.mem.writeInt(u64, &body, epoch, .little);
+            const message = Message.init(.prepare, &body, config.node_id);
+            node.broadcast(&message);
+            node.flush_loopback();
+        }
+
         node.tick();
         try io.run_for_ns(10 * std.time.ns_per_ms);
+    }
+
+    std.debug.print(
+        "Node: {d} Received: {d} Self: {d}\n",
+        .{
+            config.node_id,
+            node.stats.messages_received,
+            node.stats.self_messages,
+        },
+    );
+
+    for (runner.messages[0..runner.count]) |*message| {
+        const epoch = std.mem.readInt(u64, message.body[0..8], .little);
+        std.debug.print(
+            "From: {d} Message Type: {s} Iteration: {d} Node: {d}\n",
+            .{
+                message.sender,
+                @tagName(message.message_type),
+                epoch >> 8,
+                @as(u8, @truncate(epoch)),
+            },
+        );
     }
 }

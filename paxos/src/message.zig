@@ -18,8 +18,10 @@ pub const MessageType = enum(u8) {
 ///  - 1 byte Version
 ///  - Body will be decided by message type
 pub const Message = struct {
+    // TODO: The epoch number will carry the sender_id as well to make the comparisions easy and
+    // direct. Check if we still need to send the duplicate sender through the header.
     message_type: MessageType,
-    body: [body_size]u8 = std.mem.zeroes([body_size]u8),
+    body: [BODY_SIZE]u8 = std.mem.zeroes([BODY_SIZE]u8),
     sender: u16,
 
     pub const protocol_version: u8 = 1;
@@ -27,12 +29,12 @@ pub const Message = struct {
     pub const header_size: usize = 8;
     // You could use max_body size, but this one here is fixed, body will always be 24 if the actual
     // payload is smaller we pad it. So, body_size remains the better option, imo.
-    pub const body_size: usize = 24;
+    pub const BODY_SIZE: usize = 24;
 
     const Self = @This();
 
     pub fn init(message_type: MessageType, body: []const u8, sender: u16) Self {
-        std.debug.assert(body.len <= body_size);
+        std.debug.assert(body.len <= BODY_SIZE);
         var message: Self = .{
             .message_type = message_type,
             .sender = sender,
@@ -75,7 +77,7 @@ pub const Message = struct {
 };
 
 test "Message: encode/decode round-trips" {
-    var body: [Message.body_size]u8 = undefined;
+    var body: [Message.BODY_SIZE]u8 = undefined;
     for (&body, 0..) |*b, i| b.* = @intCast(i & 0xff);
     const msg: Message = .{ .message_type = .promise, .sender = 3, .body = body };
 
@@ -91,7 +93,7 @@ test "Message: encode/decode round-trips" {
 }
 
 test "Message: init sets fields and round-trips" {
-    var body: [Message.body_size]u8 = undefined;
+    var body: [Message.BODY_SIZE]u8 = undefined;
     for (&body, 0..) |*b, i| b.* = @intCast(i & 0xff);
     const msg = Message.init(.accepted, &body, 9);
 
@@ -138,7 +140,7 @@ test "Message: decode rejects an unsupported version" {
 }
 
 test "Message: decode rejects a corrupted frame" {
-    const body: [Message.body_size]u8 = @splat(0);
+    const body: [Message.BODY_SIZE]u8 = @splat(0);
     const msg: Message = .{ .message_type = .accept, .sender = 7, .body = body };
     var wire: [Message.size]u8 = undefined;
     msg.encode(&wire);

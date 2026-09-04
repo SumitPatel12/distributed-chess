@@ -152,6 +152,11 @@ pub const MessageBus = struct {
             return;
         }
 
+        std.debug.print("Node {d}: peer {?d} disconnected\n", .{
+            bus.config.node_id,
+            connection.peer,
+        });
+
         connection.state = .terminating;
         bus.terminate_join(connection);
     }

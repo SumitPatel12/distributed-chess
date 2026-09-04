@@ -20,6 +20,7 @@ pub const Node = struct {
     config: Config,
     loopback: ?Message = null,
     stats: NodeStats = .{},
+    callback: ?*const fn (node: *Node, message: Message) void = null,
 
     const Self = @This();
 
@@ -27,6 +28,7 @@ pub const Node = struct {
         self: *Self,
         io: *IO,
         config: Config,
+        callback: ?*const fn (node: *Node, message: Message) void,
     ) !void {
         self.* = .{
             .io = io,
@@ -34,6 +36,7 @@ pub const Node = struct {
             .bus = undefined,
             .loopback = null,
             .stats = .{},
+            .callback = callback,
         };
 
         try self.bus.init(self.io, self.config, Self.on_message_from_bus);
@@ -51,8 +54,9 @@ pub const Node = struct {
 
     fn on_message(self: *Self, message: Message) void {
         // TODO: Pass to Paxos layer once it's in place.
-        _ = message;
-        _ = self;
+        if (self.callback) |hook| {
+            hook(self, message);
+        }
     }
 
     pub fn tick(self: *Self) void {
@@ -78,13 +82,28 @@ pub const Node = struct {
         }
     }
 
-    fn flush_loopback(self: *Self) void {
+    pub fn flush_loopback(self: *Self) void {
         if (self.loopback) |message| {
             self.stats.self_messages += 1;
             self.loopback = null;
             self.on_message(message);
         }
         assert(self.loopback == null);
+    }
+};
+
+const TestHarness = struct {
+    const CAPACITY = 8;
+
+    node: Node,
+    messages: [CAPACITY]Message = undefined,
+    count: usize = 0,
+
+    fn on_message(node: *Node, message: Message) void {
+        const self: *TestHarness = @fieldParentPtr("node", node);
+        assert(self.count < CAPACITY);
+        self.messages[self.count] = message;
+        self.count += 1;
     }
 };
 
@@ -97,7 +116,8 @@ test "Node init" {
     // Declared first so it runs last: the node's teardown closes sockets through the IO.
     defer io.deinit();
 
-    var node: Node = undefined;
+    var harness: TestHarness = .{ .node = undefined };
+    const node = &harness.node;
 
     const config: Config = .{
         .node_id = 0,
@@ -106,12 +126,13 @@ test "Node init" {
         .address = "127.0.0.1",
     };
 
-    try node.init(&io, config);
+    try node.init(&io, config, TestHarness.on_message);
     defer node.deinit();
 
     try std.testing.expectEqual(node.stats.messages_received, 0);
     try std.testing.expectEqual(node.stats.self_messages, 0);
     try std.testing.expect(node.loopback == null);
+    try std.testing.expectEqual(@as(usize, 0), harness.count);
 }
 
 test "loopback test" {
@@ -123,11 +144,8 @@ test "loopback test" {
     // Declared first so it runs last: the node's teardown closes sockets through the IO.
     defer io.deinit();
 
-    var node: Node = .{
-        .io = undefined,
-        .bus = undefined,
-        .config = undefined,
-    };
+    var harness: TestHarness = .{ .node = undefined };
+    const node = &harness.node;
 
     const config: Config = .{
         .node_id = 0,
@@ -136,7 +154,7 @@ test "loopback test" {
         .address = "127.0.0.1",
     };
 
-    try node.init(&io, config);
+    try node.init(&io, config, TestHarness.on_message);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Some Message", 0);
@@ -148,6 +166,12 @@ test "loopback test" {
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
     try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);
+
+    // The callback saw exactly the message that went in — body included.
+    try std.testing.expectEqual(@as(usize, 1), harness.count);
+    try std.testing.expect(harness.messages[0].message_type == .prepare);
+    try std.testing.expectEqual(@as(u16, 0), harness.messages[0].sender);
+    try std.testing.expectEqualSlices(u8, &message.body, &harness.messages[0].body);
 }
 
 test "broadcast routes a self-message through the loopback" {
@@ -159,11 +183,8 @@ test "broadcast routes a self-message through the loopback" {
     // Declared first so it runs last: the node's teardown closes sockets through the IO.
     defer io.deinit();
 
-    var node: Node = .{
-        .io = undefined,
-        .bus = undefined,
-        .config = undefined,
-    };
+    var harness: TestHarness = .{ .node = undefined };
+    const node = &harness.node;
 
     const config: Config = .{
         .node_id = 0,
@@ -172,7 +193,7 @@ test "broadcast routes a self-message through the loopback" {
         .address = "127.0.0.1",
     };
 
-    try node.init(&io, config);
+    try node.init(&io, config, TestHarness.on_message);
     defer node.deinit();
 
     const message: Message = Message.init(.prepare, "Broadcast Message", 0);
@@ -184,4 +205,10 @@ test "broadcast routes a self-message through the loopback" {
     try std.testing.expect(node.loopback == null);
     try std.testing.expectEqual(@as(u64, 1), node.stats.self_messages);
     try std.testing.expectEqual(@as(u64, 0), node.stats.messages_received);
+
+    // The callback saw exactly the message that went in — body included.
+    try std.testing.expectEqual(@as(usize, 1), harness.count);
+    try std.testing.expect(harness.messages[0].message_type == .prepare);
+    try std.testing.expectEqual(@as(u16, 0), harness.messages[0].sender);
+    try std.testing.expectEqualSlices(u8, &message.body, &harness.messages[0].body);
 }
